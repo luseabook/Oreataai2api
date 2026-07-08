@@ -212,7 +212,7 @@ class GatewayHardeningTests(unittest.TestCase):
 
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
-            patch.object(server.CLIENT, "create_chat", return_value={"data": {"chatId": "chat-invalid"}}) as create_chat,
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-invalid"}) as create_chat,
         ):
             response = self.client.post(
                 "/v1/generate",
@@ -232,13 +232,274 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "INVALID_RESOLUTION")
         create_chat.assert_not_called()
 
+    def test_stream_generation_builds_web_image_payload(self):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def iter_lines(self, decode_unicode=True):
+                return iter([
+                    'data: {"event":"start","data":{}}',
+                    'data: {"event":"end","data":{}}',
+                ])
+
+        class FakeSession:
+            def __init__(self):
+                self.cookies = {"OUID": "ouid-secret", "__bid_n": "bid-secret"}
+                self.last_url = ""
+                self.last_json = {}
+
+            def post(self, url, **kwargs):
+                self.last_url = url
+                self.last_json = kwargs["json"]
+                return FakeResponse()
+
+        fake = FakeSession()
+        client = server.OreateClient()
+        result = client.stream_generation(
+            fake,
+            chat_id="chat-img",
+            focus_id="focus-img",
+            chat_type="aiImage",
+            prompt="hello",
+            image_config={"modelName": "Google Nano Banana 2", "ratio": "16:9", "resolution": "4K"},
+            jt="test-jt",
+        )
+
+        self.assertTrue(fake.last_url.endswith("/oreate/sse/stream"))
+        self.assertEqual(fake.last_json["chatId"], "chat-img")
+        self.assertEqual(fake.last_json["focusId"], "focus-img")
+        self.assertEqual(fake.last_json["messages"][0]["content"], "hello")
+        self.assertEqual(fake.last_json["imageConfig"]["modelName"], "Google Nano Banana 2")
+        self.assertEqual(fake.last_json["jt"], "test-jt")
+        self.assertEqual(fake.last_json["js_env"], "h5")
+        self.assertEqual(result["events"][-1]["event"], "end")
+
+    def test_stream_generation_carries_banti_bid_cookie_from_helper(self):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def iter_lines(self, decode_unicode=True):
+                return iter(['data: {"event":"end","data":{}}'])
+
+        class FakeSession:
+            def __init__(self):
+                self.cookies = {"OUID": "ouid-secret"}
+                self.last_json = {}
+
+            def post(self, url, **kwargs):
+                self.last_json = kwargs["json"]
+                return FakeResponse()
+
+        fake = FakeSession()
+        client = server.OreateClient()
+        with patch.object(
+            server,
+            "generate_banti_artifacts",
+            return_value={"jt": "helper-jt", "cookies": {"__bid_n": "helper-bid"}},
+        ):
+            client.stream_generation(
+                fake,
+                chat_id="chat-img",
+                focus_id="focus-img",
+                chat_type="aiImage",
+                prompt="hello",
+                image_config={"modelName": "Google Nano Banana 2", "ratio": "16:9", "resolution": "4K"},
+            )
+
+        self.assertEqual(fake.cookies["__bid_n"], "helper-bid")
+        self.assertEqual(fake.last_json["jt"], "helper-jt")
+        self.assertEqual(fake.last_json["extra"]["bid"], "helper-bid")
+
+    def test_stream_generation_fails_before_upstream_without_banti_bid(self):
+        class FakeSession:
+            def __init__(self):
+                self.cookies = {"OUID": "ouid-secret"}
+                self.post_called = False
+
+            def post(self, url, **kwargs):
+                self.post_called = True
+                raise AssertionError("stream endpoint should not be called")
+
+        fake = FakeSession()
+        client = server.OreateClient()
+        with patch.object(server, "generate_banti_artifacts", return_value={"jt": "helper-jt", "cookies": {}}):
+            with self.assertRaisesRegex(RuntimeError, "banti mirror artifacts unavailable"):
+                client.stream_generation(
+                    fake,
+                    chat_id="chat-img",
+                    focus_id="focus-img",
+                    chat_type="aiImage",
+                    prompt="hello",
+                    image_config={"modelName": "Google Nano Banana 2", "ratio": "16:9", "resolution": "4K"},
+                )
+
+        self.assertFalse(fake.post_called)
+
+    def test_video_text_or_image_config_is_nested_like_web(self):
+        config = server.build_video_config(
+            {
+                "model_name": "Seedance 2.0 Mini",
+                "ratio": "16:9",
+                "resolution": "480",
+                "duration": 5,
+                "scene_id": "text_or_image",
+            },
+            {"name": "Seedance 2.0 Mini", "ai_type": 14198},
+        )
+
+        self.assertEqual(config["scene"], "text_or_image")
+        self.assertEqual(config["modelName"], "Seedance 2.0 Mini")
+        self.assertEqual(config["aiType"], 14198)
+        self.assertIn("textOrImage", config)
+        self.assertEqual(config["textOrImage"]["image"], "")
+        self.assertNotIn("sceneId", config)
+
+    def test_user_mirror_metadata_matches_web_zce_fields(self):
+        metadata = server.extract_user_mirror_metadata(
+            {
+                "data": {
+                    "basicInfo": {"email": "user@example.test", "createTime": 1783500000},
+                    "vipInfo": {"vipType": 0},
+                }
+            },
+            fallback_email="fallback@example.test",
+        )
+
+        self.assertEqual(metadata["email"], "user@example.test")
+        self.assertEqual(metadata["vip"], "0")
+        self.assertEqual(metadata["reg_ts"], 1783500000)
+
+    def test_sse_error_event_is_classified_from_nested_data_code(self):
+        events = server.parse_sse_lines([
+            'data: {"event":"start","data":{}}',
+            'data: {"event":"error","data":{"code":200002,"msg":"params error"}}',
+            'data: {"event":"end","data":{}}',
+        ])
+
+        error = server.classify_sse_error(events)
+
+        self.assertEqual(error["code"], "200002")
+        self.assertEqual(error["message"], "params error")
+
+    def test_hydration_extracts_cdn_urls_from_markdown_messages(self):
+        body = {
+            "status": {"code": 0},
+            "data": {
+                "list": [
+                    {
+                        "role": "assistant",
+                        "content": "done ![](https://cdn.oreateai.com/static/result/a.jpg)",
+                    },
+                    {
+                        "role": "assistant",
+                        "result": {
+                            "type": "file",
+                            "metadata": {
+                                "files": [
+                                    {"url": "https://cdn.oreateai.com/static/result/b.png"},
+                                    {"bosUrl": "https://cdn.oreateai.com/static/result/c.jpeg"},
+                                ]
+                            },
+                        },
+                    },
+                ]
+            },
+        }
+
+        assets = server.extract_generation_assets(body)
+
+        self.assertEqual(
+            assets,
+            [
+                "https://cdn.oreateai.com/static/result/a.jpg",
+                "https://cdn.oreateai.com/static/result/b.png",
+                "https://cdn.oreateai.com/static/result/c.jpeg",
+            ],
+        )
+
+    def test_hydration_extracts_extensionless_oreate_message_list_assets(self):
+        body = {
+            "status": {"code": 0},
+            "data": {
+                "messageList": [
+                    {
+                        "role": "assistant",
+                        "content": "![](https://cdn.oreateai.com/aiimage/nano/chat-id/result-token)",
+                        "data": json.dumps({
+                            "imageList": ["https://cdn.oreateai.com/aiimage/nano/chat-id/result-token"]
+                        }),
+                    }
+                ]
+            },
+        }
+
+        assets = server.extract_generation_assets(body)
+
+        self.assertEqual(assets, ["https://cdn.oreateai.com/aiimage/nano/chat-id/result-token"])
+
+    def test_v1_generate_uses_web_generation_flow(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("web-flow-key")
+
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-web", "focusId": "focus-web"}) as create_session,
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "start"}, {"event": "end"}], "error": None}) as stream_generation,
+            patch.object(
+                server.CLIENT,
+                "hydrate_generation_result",
+                return_value={
+                    "raw": {
+                        "status": {"code": 0},
+                        "data": {"list": [{"role": "assistant", "content": "![x](https://cdn.oreateai.com/static/result/x.jpg)"}]},
+                    },
+                    "assets": ["https://cdn.oreateai.com/static/result/x.jpg"],
+                },
+            ) as hydrate,
+        ):
+            response = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer web-flow-key"},
+                json=self.valid_image_request(),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["response"]["chat"]["chatId"], "chat-web")
+        self.assertEqual(payload["assets"], ["https://cdn.oreateai.com/static/result/x.jpg"])
+        create_session.assert_called_once()
+        stream_generation.assert_called_once()
+        hydrate.assert_called_once()
+
+    def test_session_from_account_replaces_anonymous_cookie_names(self):
+        account_id = self.seed_account_with_capabilities()
+        conn = server.db_conn()
+        account = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+        conn.close()
+        session = server.requests.Session()
+        session.cookies.set("OUID", "anonymous-ouid", domain="www.oreateai.com", path="/")
+        session.cookies.set("ouss", "anonymous-ouss", domain="www.oreateai.com", path="/")
+        client = server.OreateClient()
+
+        with patch.object(client, "new_session", return_value=session):
+            result = client.session_from_account(account)
+
+        ouid_values = [c.value for c in result.cookies if c.name == "OUID"]
+        ouss_values = [c.value for c in result.cookies if c.name == "ouss"]
+        self.assertEqual(ouid_values, ["ouid-secret"])
+        self.assertEqual(ouss_values, ["ouss-secret"])
+
     def test_generate_records_model_parameters_and_estimated_cost(self):
         self.seed_account_with_capabilities()
         key_id = self.seed_api_key("cost-key")
 
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
-            patch.object(server.CLIENT, "create_chat", return_value={"data": {"chatId": "chat-cost"}}),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-cost"}),
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": []}),
         ):
             response = self.client.post(
                 "/v1/generate",
@@ -267,7 +528,9 @@ class GatewayHardeningTests(unittest.TestCase):
 
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
-            patch.object(server.CLIENT, "create_chat", return_value={"data": {"chatId": "chat-idem"}}) as create_chat,
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-idem"}) as create_chat,
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": []}),
         ):
             first = self.client.post(
                 "/v1/generate",
@@ -294,7 +557,9 @@ class GatewayHardeningTests(unittest.TestCase):
 
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
-            patch.object(server.CLIENT, "create_chat", return_value={"data": {"chatId": "chat-idem"}}),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-idem"}),
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": []}),
         ):
             first = self.client.post(
                 "/v1/generate",
@@ -317,7 +582,9 @@ class GatewayHardeningTests(unittest.TestCase):
 
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
-            patch.object(server.CLIENT, "create_chat", return_value={"data": {"chatId": "chat-rate"}}),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-rate"}),
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": []}),
         ):
             first = self.client.post("/v1/generate", headers={"Authorization": "Bearer rate-key"}, json=self.valid_image_request())
             second = self.client.post("/v1/generate", headers={"Authorization": "Bearer rate-key"}, json=self.valid_image_request())
@@ -332,7 +599,9 @@ class GatewayHardeningTests(unittest.TestCase):
 
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
-            patch.object(server.CLIENT, "create_chat", return_value={"data": {"chatId": "chat-daily"}}),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-daily"}),
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": []}),
         ):
             first = self.client.post("/v1/generate", headers={"Authorization": "Bearer daily-key"}, json=self.valid_image_request())
             second = self.client.post("/v1/generate", headers={"Authorization": "Bearer daily-key"}, json=self.valid_image_request())
@@ -347,7 +616,7 @@ class GatewayHardeningTests(unittest.TestCase):
 
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
-            patch.object(server.CLIENT, "create_chat", return_value={"data": {"chatId": "chat-point"}}) as create_chat,
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-point"}) as create_chat,
         ):
             response = self.client.post("/v1/generate", headers={"Authorization": "Bearer point-key"}, json=self.valid_image_request())
 
@@ -366,7 +635,9 @@ class GatewayHardeningTests(unittest.TestCase):
 
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
-            patch.object(server.CLIENT, "create_chat", return_value={"data": {"chatId": "chat-ready"}}),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-ready"}),
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": []}),
         ):
             response = self.client.post("/v1/generate", headers={"Authorization": "Bearer cooldown-key"}, json=self.valid_image_request())
 
@@ -380,7 +651,7 @@ class GatewayHardeningTests(unittest.TestCase):
 
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
-            patch.object(server.CLIENT, "create_chat", side_effect=RuntimeError("upstream down")),
+            patch.object(server.CLIENT, "create_chat_session", side_effect=RuntimeError("upstream down")),
         ):
             response = client.post("/v1/generate", headers={"Authorization": "Bearer fail-key"}, json=self.valid_image_request())
 
@@ -406,7 +677,9 @@ class GatewayHardeningTests(unittest.TestCase):
 
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
-            patch.object(server.CLIENT, "create_chat", return_value={"data": {"chatId": "chat-success"}}),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-success"}),
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": []}),
         ):
             response = self.client.post("/v1/generate", headers={"Authorization": "Bearer success-key"}, json=self.valid_image_request())
 
@@ -425,7 +698,9 @@ class GatewayHardeningTests(unittest.TestCase):
 
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
-            patch.object(server.CLIENT, "create_chat", return_value={"data": {"chatId": "chat-detail"}}),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-detail"}),
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": []}),
         ):
             created = self.client.post("/v1/generate", headers={"Authorization": "Bearer detail-key"}, json=self.valid_image_request())
 

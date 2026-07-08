@@ -18,6 +18,7 @@ accounts.db
 # Generated files
 banti_raw.js
 banti_*.js
+!banti_jt_helper.js
 banti_python.py
 check_rotation.py
 debanti*.js

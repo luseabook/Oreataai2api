@@ -360,8 +360,14 @@ class SecurityRegressionTests(unittest.TestCase):
             def session_from_account(self, account):
                 return object()
 
-            def create_chat(self, session, payload):
-                return {"status": {"code": 0}, "data": {"chatId": "chat-auto"}}
+            def create_chat_session(self, session, chat_type):
+                return {"chatId": "chat-auto", "focusId": "focus-auto"}
+
+            def stream_generation(self, *args, **kwargs):
+                return {"events": [{"event": "end"}], "error": None}
+
+            def hydrate_generation_result(self, session, chat_id):
+                return {"raw": {}, "assets": []}
 
         with patch.object(server, "CLIENT", StubClient()):
             response = self.client.post(

@@ -1,12 +1,18 @@
 """
-Banti Token Generator - Pure Python Implementation
-Based on reverse-engineered SDK code.
-The jt token is computed LOCALLY, not from server.
+Banti jt token entrypoint.
+
+The live Oreate web flow obtains a server token through the Banti SDK `/dr`
+request, then wraps it into the final `31$...` jt payload.  The pure-Python
+encoder below is still useful for fixed-input tests and emergency fallback,
+but generation traffic should prefer the local Node helper in
+`banti_jt_helper.js` because it reproduces the current SDK transport wrapper.
 """
 import json
+import os
+from pathlib import Path
+import subprocess
 import time
 import random
-import hashlib
 import base64
 
 
@@ -45,18 +51,63 @@ def A0(data_dict, salt="31$"):
     return salt + x0(u1(payload))
 
 
-def generate_jt_token(error_msg="", data_key="", timeout=5000):
+def generate_banti_artifacts_from_helper(timeout_sec=10):
+    helper = Path(__file__).resolve().parent / "banti_jt_helper.js"
+    if not helper.exists():
+        raise RuntimeError("banti_jt_helper.js is missing")
+    raw = subprocess.check_output(
+        ["node", str(helper)],
+        cwd=str(helper.parent),
+        text=True,
+        timeout=timeout_sec,
+        stderr=subprocess.DEVNULL,
+    )
+    body = json.loads(raw)
+    token = body.get("jt")
+    if not isinstance(token, str) or not token.startswith("31$"):
+        raise RuntimeError("banti helper returned invalid jt")
+    cookies = body.get("cookies")
+    if not isinstance(cookies, dict):
+        cookies = {}
+    return {"jt": token, "cookies": cookies, "version": body.get("version")}
+
+
+def generate_jt_token_from_helper(timeout_sec=10):
+    return generate_banti_artifacts_from_helper(timeout_sec)["jt"]
+
+
+def generate_banti_artifacts(timeout_sec=10, prefer_helper=True):
+    if prefer_helper and os.environ.get("OREATE_DISABLE_BANTI_HELPER") != "1":
+        try:
+            return generate_banti_artifacts_from_helper(timeout_sec)
+        except Exception:
+            pass
+    token = generate_jt_token(prefer_helper=False)
+    return {"jt": token, "cookies": {}, "version": None}
+
+
+def generate_jt_token(error_msg="", data_key="", timeout=200, prefer_helper=True):
     """
     Generate a banti jt token.
-    
+
+    The preferred path calls the current local SDK helper and yields a token
+    with a non-empty server-issued `j` field. Set environment variable
+    OREATE_DISABLE_BANTI_HELPER=1 to force the deterministic Python fallback.
+
     From the A3 function:
     A0({'i':'0', 'tn':ts, 'tj':ts, 'tp':data_key, 'to':timeout, 'v':version, 'j':token_value}, '31$')
-    
+
     From the Am function (fallback):
     A0 with error message in 'j' field
     """
+    if prefer_helper and os.environ.get("OREATE_DISABLE_BANTI_HELPER") != "1":
+        try:
+            return generate_jt_token_from_helper()
+        except Exception:
+            pass
+
     ts = str(f7())
-    version = str(10617531)  # from $rCkN()
+    version = "1.14.3.1"
     
     data = {
         'i': '0',
@@ -78,7 +129,7 @@ def generate_jt_with_server_response(server_token="", data_key="", timeout=5000)
     Otherwise use empty string.
     """
     ts = str(f7())
-    version = str(10617531)
+    version = "1.14.3.1"
     
     data = {
         'i': '0',

@@ -3,13 +3,14 @@
 当前状态：
 - 已打通 Oreate 登录协议
 - 已打通图片/视频配置接口
-- 已打通 `/oreate/create/chat` 的 image/video 提交入口
+- 已切换到网页一致的 `create_chat -> /oreate/sse/stream -> getmessagelist` 生成协议
+- 已用真实账号验证最小 1K 生图：stream 成功返回并可从历史消息提取 Oreate CDN 图片 URL
 - 已实现基础管理服务：账号导入、号池存储、图片/视频提交 API
 - 已新增 `/v1/capabilities` 模型能力发现接口，返回图片/视频模型、描述、分辨率、比例、时长和视频场景
 - 已新增模型参数白名单校验、API Key 限流/配额、`Idempotency-Key` 幂等和成本审计
 - 已新增 `/v1/tasks/{task_id}` 标准任务详情接口，旧 `/v1/task/{task_id}` 仍保留兼容
 - 后台支持独立修改管理员账号密码，修改后强制重新登录
-- 结果流 / 资源 URL 抽取仍需继续补完
+- 已补充 SSE 事件解析、上游错误分类和历史消息资源 URL 抽取
 - 自动注册（YYDS 邮箱）链路尚未完成
 
 ## 文件
@@ -53,32 +54,50 @@ python server.py
 ```
 
 ### 生图提交
-`POST /oreate/create/chat`
+真实网页协议不是把生成参数直接发给 `/oreate/create/chat`。该接口只创建 chat session：
 ```json
 {
-  "docId": "",
-  "content": "a cute corgi astronaut on the moon, cinematic lighting",
-  "chatMode": "aiImage",
-  "modelName": "Google Nano Banana 2",
-  "ratio": "16:9",
-  "resolution": "4K",
-  "jt": ""
+  "type": "aiImage",
+  "docId": ""
+}
+```
+
+随后提交到 `POST /oreate/sse/stream`，其中提示词在 `messages[0].content`，图片参数在 `imageConfig`：
+```json
+{
+  "chatType": "aiImage",
+  "messages": [{"role": "user", "content": "a cute corgi astronaut on the moon", "attachments": []}],
+  "imageConfig": {
+    "modelName": "Google Nano Banana 2",
+    "ratio": "16:9",
+    "resolution": "4K"
+  }
 }
 ```
 
 ### 生视频提交
-`POST /oreate/create/chat`
+同样先创建 chat session：
 ```json
 {
-  "docId": "",
-  "content": "a corgi astronaut gently waving on the moon",
-  "chatMode": "aiVideo",
-  "sceneId": "text_or_image",
-  "modelName": "Seedance 2.0 Mini",
-  "duration": 5,
-  "resolution": "480",
-  "ratio": "16:9",
-  "jt": ""
+  "type": "aiVideo",
+  "docId": ""
+}
+```
+
+再提交 `POST /oreate/sse/stream`。视频参数必须是网页的场景嵌套结构，不是扁平字段：
+```json
+{
+  "chatType": "aiVideo",
+  "messages": [{"role": "user", "content": "a corgi astronaut gently waving on the moon", "attachments": []}],
+  "videoConfig": {
+    "modelName": "Seedance 2.0 Mini",
+    "ratio": "16:9",
+    "resolution": "480",
+    "duration": 5,
+    "isAudio": false,
+    "scene": "text_or_image",
+    "textOrImage": {"image": ""}
+  }
 }
 ```
 
@@ -118,7 +137,9 @@ X-Request-ID: <可选，客户端请求 ID>
 }
 ```
 
-网关会基于 `/v1/capabilities` 的能力目录校验模型、分辨率、比例、视频时长和场景；非法参数会在调用 Oreate 前返回 `422`，避免无效扣费。成功响应包含 `request_id`、`idempotent_replay` 和 `estimated_point_cost`。
+网关会基于 `/v1/capabilities` 的能力目录校验模型、分辨率、比例、视频时长和场景；非法参数会在调用 Oreate 前返回 `422`，避免无效扣费。成功响应包含 `request_id`、`idempotent_replay`、`estimated_point_cost`、`assets` 和上游 `response` 摘要。
+
+`jt` 由本地 `banti_jt_helper.js` 恢复，Python 只负责 HTTP 协议、账号池、SSE 解析和结果水合；生产路径不依赖浏览器或浏览器配置文件。
 
 ### 任务查询
 - `GET /v1/tasks`：当前 API Key 的任务列表。
@@ -149,6 +170,7 @@ X-Request-ID: <可选，客户端请求 ID>
 - `IDEMPOTENCY_KEY_CONFLICT`：同一个 `Idempotency-Key` 被不同请求体复用。
 - `RATE_LIMITED` / `DAILY_REQUEST_LIMIT_EXCEEDED` / `DAILY_POINT_LIMIT_EXCEEDED`：API Key 策略限制触发。
 - `UPSTREAM_ERROR`：Oreate 上游调用失败，账号会进入冷却。
+- 上游 `200002 params error`：`/oreate/sse/stream` 参数合同未通过，不是额度不足；通常不会扣点。已确认关键原因包括缺少网页 `ZCe` 用户镜像字段（`vip/reg_ts`）或 Banti `__bid_n`。
 
 ### API Key 策略
 后台 API Keys 页面可配置：
@@ -172,11 +194,11 @@ X-Request-ID: <可选，客户端请求 ID>
 
 ## 当前缺口
 - 自动注册：待补 `/passport/api/emailsignupin` + YYDS 收信 + `/passport/api/emailregisterconfirm`
-- 结果流：已确认前端存在 SSE 管理器，但真实结果 URL / groupId 映射未完成
+- 视频上传类场景：`frame_based`、`reference`、`motion` 还需要补上传到 BOS 后的附件对象协议
 - 号池维护：基础结构已搭好，自动补号逻辑待实现
-- 网关结果：仍需补充真实成品 URL / groupId 映射、结果轮询或 SSE 回传、失败任务重试/取消
+- 网关结果：已支持同步解析 SSE 和历史消息资源 URL，后续可补异步任务轮询、失败任务重试/取消
 
 ## 下一步
 1. 先补自动注册链路
-2. 再补结果流定位
+2. 再补真实视频生成回归验证
 3. 最后补号池自动维护

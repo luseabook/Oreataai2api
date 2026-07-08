@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 import re
@@ -23,7 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-from banti_token_generator import generate_jt_token
+from banti_token_generator import generate_banti_artifacts, generate_jt_token
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -219,6 +219,7 @@ def normalize_video_models(video_info: Optional[Dict[str, Any]]) -> List[Dict[st
             "name": name,
             "description": localized_text(model.get("description")),
             "icon": model.get("modelIcon") or "",
+            "ai_type": model.get("aiType"),
             "durations": duration if isinstance(duration, list) else [],
             "resolutions": resolutions if isinstance(resolutions, list) else [],
             "ratios": normalize_ratios(model.get("videoSize")),
@@ -346,6 +347,147 @@ def estimate_point_cost(kind: str, options: Dict[str, Any], caps: Dict[str, Any]
         if kind == "video" and item.get("duration") == options.get("duration"):
             return item.get("point")
     return None
+
+
+def build_image_config(options: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "modelName": options.get("model_name") or "",
+        "ratio": options.get("ratio") or "",
+        "resolution": options.get("resolution") or "",
+    }
+
+
+def build_video_config(options: Dict[str, Any], model: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    scene_id = options.get("scene_id") or CFG["oreate"]["default_video_scene"]
+    config: Dict[str, Any] = {
+        "modelName": options.get("model_name") or "",
+        "ratio": options.get("ratio") or "",
+        "resolution": str(options.get("resolution") or ""),
+        "duration": options.get("duration") or CFG["oreate"]["default_video_duration"],
+        "isAudio": False,
+        "scene": scene_id,
+    }
+    ai_type = (model or {}).get("ai_type")
+    if ai_type is not None:
+        config["aiType"] = ai_type
+    if scene_id == "text_or_image":
+        config["textOrImage"] = {"image": ""}
+    elif scene_id == "frame_based":
+        config["frameBased"] = {"firstFrame": "", "lastFrame": ""}
+    elif scene_id == "reference":
+        config["reference"] = {
+            "referenceImages": [],
+            "referenceVideos": [],
+            "refDuration": "2-5",
+            "refTotalDuration": config["duration"],
+            "keepOriginalSound": False,
+        }
+    elif scene_id == "motion":
+        config["motion"] = {
+            "characterImage": "",
+            "motionVideo": "",
+            "motDuration": config["duration"],
+            "keepOriginalSound": False,
+        }
+    return config
+
+
+def extract_user_mirror_metadata(body: Any, fallback_email: str = "") -> Dict[str, Any]:
+    source = body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else body
+    source = source if isinstance(source, dict) else {}
+    basic = source.get("basicInfo") or source.get("userInfo") or {}
+    vip = source.get("vipInfo") or {}
+    if not isinstance(basic, dict):
+        basic = {}
+    if not isinstance(vip, dict):
+        vip = {}
+    vip_type = vip.get("vipType")
+    return {
+        "email": basic.get("email") or fallback_email or "",
+        "vip": "" if vip_type is None else str(vip_type),
+        "reg_ts": basic.get("createTime") or "",
+    }
+
+
+def parse_sse_lines(lines: Iterable[Any]) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for raw in lines:
+        if raw is None:
+            continue
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        line = line.strip()
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            parsed = {"event": "message", "data": data}
+        if isinstance(parsed, dict):
+            events.append(parsed)
+        else:
+            events.append({"event": "message", "data": parsed})
+    return events
+
+
+def classify_sse_error(events: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    for event in events:
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        code = data.get("code") or event.get("code") or event.get("err")
+        if event.get("event") == "error" or code:
+            message = data.get("msg") or data.get("message") or event.get("msg") or event.get("message") or "upstream error"
+            return {"code": str(code or "UPSTREAM_ERROR"), "message": str(message)}
+    return None
+
+
+MEDIA_URL_RE = re.compile(
+    r"https?://(?:"
+    r"cdn\.oreateai\.com/(?:aiimage|aivideo|static/result)[^\s)\"']+"
+    r"|[^\s)\"']+\.(?:jpg|jpeg|png|webp|gif|mp4|mov|webm)(?:\?[^\s)\"']*)?"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def extract_generation_assets(body: Any) -> List[str]:
+    assets: List[str] = []
+
+    def add(value: Any) -> None:
+        if not isinstance(value, str) or not value:
+            return
+        for url in MEDIA_URL_RE.findall(value):
+            if url not in assets:
+                assets.append(url)
+
+    def walk(value: Any) -> None:
+        if isinstance(value, str):
+            add(value)
+            return
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+            return
+        if not isinstance(value, dict):
+            return
+        for key in ("url", "bosUrl", "bos_url", "object", "src", "downloadUrl"):
+            add(value.get(key))
+        files = value.get("files")
+        if isinstance(files, list):
+            for item in files:
+                walk(item)
+        for item in value.values():
+            walk(item)
+
+    walk(body)
+    return assets
+
+
+class UpstreamGenerationError(RuntimeError):
+    def __init__(self, error: Dict[str, str]):
+        self.error = error
+        super().__init__(f"{error.get('code')}: {error.get('message')}")
 
 
 def request_hash_for_generation(body: Any) -> str:
@@ -985,17 +1127,17 @@ class OreateClient:
     def session_from_account(self, account: sqlite3.Row) -> requests.Session:
         s = self.new_session()
         if account["ouid"]:
-            s.cookies.set("OUID", account["ouid"])
+            self._set_cookie_unique(s, "OUID", account["ouid"])
         if account["ouss"]:
-            s.cookies.set("ouss", account["ouss"])
+            self._set_cookie_unique(s, "ouss", account["ouss"])
         return s
 
     def session_from_cookie_dict(self, cookies: Dict[str, str]) -> requests.Session:
         s = self.new_session()
         if cookies.get("OUID"):
-            s.cookies.set("OUID", cookies["OUID"])
+            self._set_cookie_unique(s, "OUID", cookies["OUID"])
         if cookies.get("ouss"):
-            s.cookies.set("ouss", cookies["ouss"])
+            self._set_cookie_unique(s, "ouss", cookies["ouss"])
         return s
 
     def fetch_image_models(self, s: requests.Session) -> Dict[str, Any]:
@@ -1012,6 +1154,123 @@ class OreateClient:
         r = s.get(self.base + "/oreate/aivideo/getsceneconfig", headers=self.headers, timeout=self.timeout)
         r.raise_for_status()
         return r.json()
+
+    def fetch_user_mirror_metadata(self, s: requests.Session, account: Optional[sqlite3.Row] = None) -> Dict[str, Any]:
+        fallback_email = account["email"] if account is not None and "email" in account.keys() else ""
+        try:
+            r = s.get(self.base + "/oreate/user/getuserinfo", headers=self.headers, timeout=self.timeout)
+            r.raise_for_status()
+            return extract_user_mirror_metadata(r.json(), fallback_email)
+        except Exception:
+            return {"email": fallback_email, "vip": "", "reg_ts": ""}
+
+    def _set_cookie_unique(self, s: requests.Session, name: str, value: str) -> None:
+        cookies = getattr(s, "cookies", {})
+        if isinstance(cookies, dict):
+            cookies[name] = value
+            return
+        for cookie in list(cookies):
+            if cookie.name == name:
+                cookies.clear(cookie.domain, cookie.path, cookie.name)
+        cookies.set(name, value)
+
+    def _cookie_value(self, s: requests.Session, name: str) -> str:
+        cookies = getattr(s, "cookies", {})
+        if hasattr(cookies, "get"):
+            try:
+                return cookies.get(name) or ""
+            except Exception:
+                for cookie in reversed(list(cookies)):
+                    if getattr(cookie, "name", "") == name:
+                        return getattr(cookie, "value", "") or ""
+        return ""
+
+    def create_chat_session(self, s: requests.Session, chat_type: str) -> Dict[str, Any]:
+        r = s.post(
+            self.base + "/oreate/create/chat",
+            headers={**self.headers, "content-type": "application/json"},
+            json={"type": chat_type, "docId": ""},
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        body = r.json()
+        data = body.get("data") if isinstance(body.get("data"), dict) else body
+        chat_id = (data or {}).get("chatId") or ""
+        focus_id = (data or {}).get("focusId") or chat_id
+        if not chat_id:
+            raise RuntimeError(f"create_chat_session missing chatId: {body}")
+        return {"chatId": chat_id, "focusId": focus_id, "raw": body}
+
+    def stream_generation(
+        self,
+        s: requests.Session,
+        chat_id: str,
+        focus_id: str,
+        chat_type: str,
+        prompt: str,
+        image_config: Optional[Dict[str, Any]] = None,
+        video_config: Optional[Dict[str, Any]] = None,
+        account: Optional[sqlite3.Row] = None,
+        jt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        banti_artifacts: Dict[str, Any] = {"jt": jt or "", "cookies": {}}
+        if jt is None:
+            banti_artifacts = generate_banti_artifacts()
+            helper_cookies = banti_artifacts.get("cookies") if isinstance(banti_artifacts.get("cookies"), dict) else {}
+            bid = helper_cookies.get("__bid_n")
+            if not banti_artifacts.get("jt") or not bid:
+                raise RuntimeError("banti mirror artifacts unavailable for generation")
+            self._set_cookie_unique(s, "__bid_n", str(bid))
+        mirror = self.fetch_user_mirror_metadata(s, account) if account is not None else {"email": "", "vip": "", "reg_ts": ""}
+        extra: Dict[str, Any] = {
+            "doc_name": "",
+            "module_name": "gpt4o",
+            "email": mirror.get("email") or "",
+            "vip": mirror.get("vip") or "",
+            "reg_ts": mirror.get("reg_ts") or "",
+            "deviceID": self._cookie_value(s, "OUID"),
+            "bid": self._cookie_value(s, "__bid_n"),
+        }
+        body: Dict[str, Any] = {
+            "type": "chat",
+            "focusId": focus_id or chat_id,
+            "chatId": chat_id,
+            "chatType": chat_type,
+            "from": "home",
+            "chatTitle": "Unnamed Session",
+            "messages": [{"role": "user", "content": prompt, "attachments": []}],
+            "isFirst": True,
+            "extra": extra,
+            "clientType": "pc",
+            "jt": banti_artifacts["jt"],
+            "ua": self.headers["user-agent"],
+            "js_env": "h5",
+        }
+        if image_config is not None:
+            body["imageConfig"] = image_config
+        if video_config is not None:
+            body["videoConfig"] = video_config
+        r = s.post(
+            self.base + "/oreate/sse/stream",
+            headers={**self.headers, "content-type": "application/json"},
+            json=body,
+            timeout=self.timeout,
+            stream=True,
+        )
+        r.raise_for_status()
+        events = parse_sse_lines(r.iter_lines(decode_unicode=True))
+        return {"events": events, "error": classify_sse_error(events)}
+
+    def hydrate_generation_result(self, s: requests.Session, chat_id: str) -> Dict[str, Any]:
+        r = s.get(
+            self.base + "/oreate/memory/getmessagelist",
+            headers=self.headers,
+            params={"pn": 1, "rn": 30, "chatID": chat_id},
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        body = r.json()
+        return {"raw": body, "assets": extract_generation_assets(body)}
 
     def create_chat(self, s: requests.Session, payload: Dict[str, Any]) -> Dict[str, Any]:
         r = s.post(
@@ -1073,9 +1332,14 @@ def list_accounts() -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def save_task(account_id: int, kind: str, prompt: str, payload: Dict[str, Any], response: Dict[str, Any]) -> int:
+def save_task(account_id: int, kind: str, prompt: str, payload: Dict[str, Any], response: Dict[str, Any], status: str = "created") -> int:
     now = time.time()
-    chat_id = response.get("data", {}).get("chatId", "")
+    chat_id = (
+        response.get("chat", {}).get("chatId")
+        or response.get("data", {}).get("chatId")
+        or response.get("chatId")
+        or ""
+    )
     conn = db_conn()
     conn.execute(
         """
@@ -1088,7 +1352,7 @@ def save_task(account_id: int, kind: str, prompt: str, payload: Dict[str, Any], 
             prompt,
             json.dumps(payload, ensure_ascii=False),
             chat_id,
-            "created",
+            status,
             json.dumps(response, ensure_ascii=False),
             now,
             now,
@@ -1192,6 +1456,52 @@ def refresh_capabilities_from_pool() -> Dict[str, Any]:
     conn.close()
     caps = normalize_capabilities(image_info, video_info)
     return {"ok": True, "source_account_id": account["id"], **caps}
+
+
+def submit_generation_for_account(account: sqlite3.Row, kind: str, prompt: str, options: Dict[str, Any]) -> Dict[str, Any]:
+    s = CLIENT.session_from_account(account)
+    chat_type = "aiImage" if kind == "image" else "aiVideo"
+    caps = capabilities_from_account(account)
+    request_payload: Dict[str, Any] = {
+        "chatType": chat_type,
+        "messages": [{"role": "user", "content": prompt, "attachments": []}],
+    }
+    image_config = None
+    video_config = None
+    if kind == "image":
+        image_config = build_image_config(options)
+        request_payload["imageConfig"] = image_config
+    else:
+        model = find_capability_model(caps.get("video", {}).get("models") or [], options.get("model_name") or "") or {}
+        video_config = build_video_config(options, model)
+        request_payload["videoConfig"] = video_config
+
+    chat = CLIENT.create_chat_session(s, chat_type)
+    stream = CLIENT.stream_generation(
+        s,
+        chat_id=chat["chatId"],
+        focus_id=chat.get("focusId") or chat["chatId"],
+        chat_type=chat_type,
+        prompt=prompt,
+        image_config=image_config,
+        video_config=video_config,
+        account=account,
+    )
+    if stream.get("error"):
+        raise UpstreamGenerationError(stream["error"])
+    hydration = CLIENT.hydrate_generation_result(s, chat["chatId"])
+    assets = hydration.get("assets") or []
+    response = {
+        "chat": {"chatId": chat["chatId"], "focusId": chat.get("focusId") or chat["chatId"]},
+        "stream": stream,
+        "hydration": hydration,
+    }
+    return {
+        "payload": request_payload,
+        "response": response,
+        "assets": assets,
+        "status": "completed" if assets else "submitted",
+    }
 
 
 def auto_register_accounts(count: int = 1) -> List[Dict[str, Any]]:
@@ -1591,104 +1901,83 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
     validate_generation_options(body.kind, options, caps)
     estimated_point_cost = estimate_point_cost(body.kind, options, caps)
     check_daily_quota(api_key_id, estimated_point_cost, policy, now, request_id)
-    
+
     try:
-        s = CLIENT.session_from_account(account)
+        generation = submit_generation_for_account(account, body.kind, body.prompt, options)
+    except UpstreamGenerationError as e:
+        mark_account_failure(account["id"], e)
+        log_usage(
+            api_key_id,
+            body.kind,
+            account["id"],
+            body.prompt,
+            "failed",
+            summary=str(e),
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+            model_name=options.get("model_name") or "",
+            resolution=options.get("resolution") or "",
+            ratio=options.get("ratio") or "",
+            duration=options.get("duration"),
+            scene_id=options.get("scene_id") or "",
+            estimated_point_cost=estimated_point_cost,
+            error_code=e.error.get("code") or "UPSTREAM_ERROR",
+            status_code=503,
+        )
+        raise GatewayAPIError(503, "UPSTREAM_ERROR", e.error.get("message") or str(e), {"upstream": e.error}, request_id=request_id)
     except Exception as e:
         mark_account_failure(account["id"], e)
+        log_usage(
+            api_key_id,
+            body.kind,
+            account["id"],
+            body.prompt,
+            "failed",
+            summary=str(e),
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+            model_name=options.get("model_name") or "",
+            resolution=options.get("resolution") or "",
+            ratio=options.get("ratio") or "",
+            duration=options.get("duration"),
+            scene_id=options.get("scene_id") or "",
+            estimated_point_cost=estimated_point_cost,
+            error_code="UPSTREAM_ERROR",
+            status_code=503,
+        )
         raise GatewayAPIError(503, "UPSTREAM_ERROR", str(e), request_id=request_id)
-    
-    if body.kind == "image":
-        payload = {
-            "docId": "",
-            "content": body.prompt,
-            "chatMode": "aiImage",
-            "modelName": options["model_name"],
-            "ratio": options["ratio"],
-            "resolution": options["resolution"],
-        }
-        try:
-            response = CLIENT.create_chat(s, payload)
-        except Exception as e:
-            mark_account_failure(account["id"], e)
-            raise GatewayAPIError(503, "UPSTREAM_ERROR", str(e), request_id=request_id)
-        mark_account_success(account["id"])
-        task_id = save_task(account["id"], "image", body.prompt, payload, response)
-        log_usage(
-            api_key_id,
-            "image",
-            account["id"],
-            body.prompt,
-            "created",
-            task_id=task_id,
-            request_id=request_id,
-            idempotency_key=idempotency_key,
-            model_name=options["model_name"],
-            resolution=options["resolution"],
-            ratio=options["ratio"],
-            estimated_point_cost=estimated_point_cost,
-            status_code=200,
-        )
-        result = {
-            "ok": True,
-            "task_id": task_id,
-            "account_id": account["id"],
-            "request_id": request_id,
-            "idempotent_replay": False,
-            "estimated_point_cost": estimated_point_cost,
-            "response": response,
-        }
-        save_idempotency_record(api_key_id, idempotency_key, request_hash, 200, result, task_id)
-        return result
-    
-    elif body.kind == "video":
-        payload = {
-            "docId": "",
-            "content": body.prompt,
-            "chatMode": "aiVideo",
-            "sceneId": options["scene_id"],
-            "modelName": options["model_name"],
-            "duration": options["duration"],
-            "resolution": options["resolution"],
-            "ratio": options["ratio"],
-        }
-        try:
-            response = CLIENT.create_chat(s, payload)
-        except Exception as e:
-            mark_account_failure(account["id"], e)
-            raise GatewayAPIError(503, "UPSTREAM_ERROR", str(e), request_id=request_id)
-        mark_account_success(account["id"])
-        task_id = save_task(account["id"], "video", body.prompt, payload, response)
-        log_usage(
-            api_key_id,
-            "video",
-            account["id"],
-            body.prompt,
-            "created",
-            task_id=task_id,
-            request_id=request_id,
-            idempotency_key=idempotency_key,
-            model_name=options["model_name"],
-            resolution=options["resolution"],
-            ratio=options["ratio"],
-            duration=options["duration"],
-            scene_id=options["scene_id"],
-            estimated_point_cost=estimated_point_cost,
-            status_code=200,
-        )
-        result = {
-            "ok": True,
-            "task_id": task_id,
-            "account_id": account["id"],
-            "request_id": request_id,
-            "idempotent_replay": False,
-            "estimated_point_cost": estimated_point_cost,
-            "response": response,
-        }
-        save_idempotency_record(api_key_id, idempotency_key, request_hash, 200, result, task_id)
-        return result
-    
-    raise GatewayAPIError(400, "UNSUPPORTED_KIND", f"unsupported kind: {body.kind}", {"field": "kind"}, request_id=request_id)
+
+    mark_account_success(account["id"])
+    task_id = save_task(account["id"], body.kind, body.prompt, generation["payload"], generation["response"], generation["status"])
+    log_usage(
+        api_key_id,
+        body.kind,
+        account["id"],
+        body.prompt,
+        generation["status"],
+        task_id=task_id,
+        request_id=request_id,
+        idempotency_key=idempotency_key,
+        model_name=options.get("model_name") or "",
+        resolution=options.get("resolution") or "",
+        ratio=options.get("ratio") or "",
+        duration=options.get("duration"),
+        scene_id=options.get("scene_id") or "",
+        estimated_point_cost=estimated_point_cost,
+        status_code=200,
+    )
+    result = {
+        "ok": True,
+        "task_id": task_id,
+        "account_id": account["id"],
+        "request_id": request_id,
+        "idempotent_replay": False,
+        "estimated_point_cost": estimated_point_cost,
+        "assets": generation["assets"],
+        "response": generation["response"],
+    }
+    save_idempotency_record(api_key_id, idempotency_key, request_hash, 200, result, task_id)
+    return result
 
 
 @app.get("/v1/tasks")
@@ -1893,31 +2182,31 @@ def generate_media(body: MediaTaskIn, _=Depends(require_admin)):
         account = pick_account_for_task(body.kind)
     if not account:
         raise HTTPException(503, "no verified account available")
-    s = CLIENT.session_from_account(account)
-    payload = {
-        "docId": "",
-        "content": body.prompt,
-        "chatMode": "aiImage" if body.kind == "image" else "aiVideo",
-    }
     if body.kind == "image":
-        payload.update({
-            "modelName": body.model_name or CFG["oreate"]["default_image_model"],
+        options = {
+            "model_name": body.model_name or CFG["oreate"]["default_image_model"],
             "ratio": body.ratio or CFG["oreate"]["default_image_ratio"],
             "resolution": body.resolution or CFG["oreate"]["default_image_resolution"],
-        })
-    elif body.kind == "video":
-        payload.update({
-            "sceneId": body.scene_id or CFG["oreate"]["default_video_scene"],
-            "modelName": body.model_name or CFG["oreate"]["default_video_model"],
+        }
+    else:
+        options = {
+            "scene_id": body.scene_id or CFG["oreate"]["default_video_scene"],
+            "model_name": body.model_name or CFG["oreate"]["default_video_model"],
             "duration": body.duration or CFG["oreate"]["default_video_duration"],
             "resolution": body.resolution or CFG["oreate"]["default_video_resolution"],
             "ratio": body.ratio or CFG["oreate"]["default_video_ratio"],
-        })
-    if body.jt is not None:
-        payload["jt"] = body.jt
-    response = CLIENT.create_chat(s, payload)
-    task_id = save_task(account["id"], body.kind, body.prompt, payload, response)
-    return {"ok": True, "task_id": task_id, "response": response}
+        }
+    try:
+        generation = submit_generation_for_account(account, body.kind, body.prompt, options)
+    except UpstreamGenerationError as e:
+        mark_account_failure(account["id"], e)
+        raise HTTPException(503, {"code": e.error.get("code"), "message": e.error.get("message")})
+    except Exception as e:
+        mark_account_failure(account["id"], e)
+        raise HTTPException(503, str(e))
+    mark_account_success(account["id"])
+    task_id = save_task(account["id"], body.kind, body.prompt, generation["payload"], generation["response"], generation["status"])
+    return {"ok": True, "task_id": task_id, "assets": generation["assets"], "response": generation["response"]}
 
 
 @app.get("/api/tasks")
