@@ -1,11 +1,13 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import secrets
 import sqlite3
 import threading
 import time
+from urllib.parse import parse_qs, urlparse
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,13 +28,15 @@ from banti_token_generator import generate_jt_token
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 DB_PATH = BASE_DIR / "accounts.db"
+SECRET_PLACEHOLDER = "__redacted__"
+UNSAFE_ADMIN_PASSWORDS = {"", "admin123", "CHANGE_ME", "changeme", "password"}
 
 DEFAULT_CONFIG = {
     "server": {
-        "host": "0.0.0.0",
+        "host": "127.0.0.1",
         "port": 8890,
         "admin_username": "admin",
-        "admin_password": "admin123",
+        "admin_password": "",
     },
     "oreate": {
         "base_url": "https://www.oreateai.com",
@@ -59,6 +63,14 @@ DEFAULT_CONFIG = {
         "valid_threshold_pct": 1.0,
         "maintain_check_interval": 300,
     },
+    "gateway": {
+        "default_rate_limit_per_minute": 60,
+        "default_daily_request_limit": 0,
+        "default_daily_point_limit": 0,
+        "idempotency_ttl_hours": 24,
+        "account_cooldown_seconds": 300,
+        "prompt_max_length": 4000,
+    },
 }
 
 
@@ -83,15 +95,433 @@ def save_config(cfg: Dict[str, Any]) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def model_data(model: BaseModel) -> Dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_none=True)
+    return model.dict(exclude_none=True)
+
+
+def public_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    out = json.loads(json.dumps(cfg))
+    if out.get("server", {}).get("admin_password"):
+        out["server"]["admin_password"] = SECRET_PLACEHOLDER
+    if out.get("mail", {}).get("api_key"):
+        out["mail"]["api_key"] = SECRET_PLACEHOLDER
+    return out
+
+
+def clean_settings_update(data: Dict[str, Any]) -> Dict[str, Any]:
+    out = json.loads(json.dumps(data))
+    server_cfg = out.get("server")
+    if isinstance(server_cfg, dict):
+        server_cfg.pop("admin_username", None)
+        server_cfg.pop("admin_password", None)
+    mail_cfg = out.get("mail")
+    if isinstance(mail_cfg, dict) and mail_cfg.get("api_key") in (None, "", SECRET_PLACEHOLDER):
+        mail_cfg.pop("api_key", None)
+    return out
+
+
+def public_account(row: sqlite3.Row) -> Dict[str, Any]:
+    item = dict(row)
+    item["has_password"] = bool(item.get("password"))
+    item["ouid_preview"] = (item.get("ouid") or "")[:12]
+    for key in ("password", "ouid", "ouss", "model_info_json", "video_info_json"):
+        item.pop(key, None)
+    return item
+
+
+def public_api_key(row: sqlite3.Row, reveal: bool = False) -> Dict[str, Any]:
+    item = dict(row)
+    key = item.get("key", "")
+    item["key_preview"] = f"{key[:16]}..." if key else ""
+    if not reveal:
+        item.pop("key", None)
+    return item
+
+
+def extract_token_id_from_link(link: str) -> str:
+    if not link:
+        return ""
+    params = parse_qs(urlparse(link).query)
+    return params.get("tokenID", [""])[0]
+
+
+def is_unsafe_admin_password(password: str) -> bool:
+    return password.strip() in UNSAFE_ADMIN_PASSWORDS
+
+
+def localized_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("zh", "en", "zh-TW"):
+            text = value.get(key)
+            if isinstance(text, str) and text:
+                return text
+        for text in value.values():
+            if isinstance(text, str) and text:
+                return text
+    return ""
+
+
+def normalize_ratios(value: Any) -> List[str]:
+    ratios = []
+    if isinstance(value, list):
+        for item in value:
+            ratio = item.get("ratio") if isinstance(item, dict) else item
+            if isinstance(ratio, str) and ratio and ratio not in ratios:
+                ratios.append(ratio)
+    return ratios
+
+
+def normalize_image_models(image_info: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    models = []
+    factories = (image_info or {}).get("data", {}).get("factory", [])
+    if not isinstance(factories, list):
+        return models
+    for factory in factories:
+        if not isinstance(factory, dict):
+            continue
+        factory_name = factory.get("modelFactoryName", "")
+        for model in factory.get("models", []) or []:
+            if not isinstance(model, dict):
+                continue
+            name = model.get("modelName", "")
+            if not name:
+                continue
+            models.append({
+                "name": name,
+                "factory": factory_name,
+                "description": localized_text(model.get("modelDesc")),
+                "icon": model.get("modelIcon") or factory.get("modelIcon") or "",
+                "resolutions": model.get("resolution") if isinstance(model.get("resolution"), list) else [],
+                "ratios": normalize_ratios(model.get("size")),
+                "point_cost": model.get("pointCost") if isinstance(model.get("pointCost"), list) else [],
+            })
+    return models
+
+
+def normalize_video_models(video_info: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    models = []
+    raw_models = (video_info or {}).get("models", {}).get("data", {}).get("models", [])
+    if not isinstance(raw_models, list):
+        return models
+    for model in raw_models:
+        if not isinstance(model, dict):
+            continue
+        name = model.get("modelName", "")
+        if not name:
+            continue
+        duration = model.get("duration")
+        resolutions = model.get("videoResolution")
+        models.append({
+            "name": name,
+            "description": localized_text(model.get("description")),
+            "icon": model.get("modelIcon") or "",
+            "durations": duration if isinstance(duration, list) else [],
+            "resolutions": resolutions if isinstance(resolutions, list) else [],
+            "ratios": normalize_ratios(model.get("videoSize")),
+            "supports_audio": bool(model.get("supportAudio")),
+            "supports_modify_size": bool(model.get("supportModifySize")),
+            "point_cost_image": model.get("pointCostImage") if isinstance(model.get("pointCostImage"), list) else [],
+            "point_cost_reference": model.get("pointCostReference") if isinstance(model.get("pointCostReference"), list) else [],
+        })
+    return models
+
+
+def normalize_video_scenes(video_info: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    scenes = []
+    raw_scenes = (video_info or {}).get("scenes", {}).get("data", {}).get("scenes", [])
+    if not isinstance(raw_scenes, list):
+        return scenes
+    for scene in raw_scenes:
+        if not isinstance(scene, dict):
+            continue
+        scene_id = scene.get("sceneId", "")
+        if not scene_id:
+            continue
+        scenes.append({
+            "scene_id": scene_id,
+            "name": localized_text(scene.get("sceneName")),
+            "description": localized_text(scene.get("description")),
+            "icon": scene.get("sceneIcon") or "",
+        })
+    return scenes
+
+
+def normalize_capabilities(image_info: Optional[Dict[str, Any]], video_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "image": {"models": normalize_image_models(image_info)},
+        "video": {
+            "models": normalize_video_models(video_info),
+            "scenes": normalize_video_scenes(video_info),
+        },
+    }
+
+
+def json_from_db(raw: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def capabilities_from_account(account: sqlite3.Row) -> Dict[str, Any]:
+    return normalize_capabilities(json_from_db(account["model_info_json"]), json_from_db(account["video_info_json"]))
+
+
+def find_capability_model(models: List[Dict[str, Any]], name: str) -> Optional[Dict[str, Any]]:
+    for model in models:
+        if model.get("name") == name:
+            return model
+    return None
+
+
+def effective_generation_options(body: Any, caps: Dict[str, Any]) -> Dict[str, Any]:
+    if body.kind == "image":
+        return {
+            "model_name": body.model_name or CFG["oreate"]["default_image_model"],
+            "ratio": body.ratio or CFG["oreate"]["default_image_ratio"],
+            "resolution": body.resolution or CFG["oreate"]["default_image_resolution"],
+        }
+    if body.kind == "video":
+        return {
+            "model_name": body.model_name or CFG["oreate"]["default_video_model"],
+            "ratio": body.ratio or CFG["oreate"]["default_video_ratio"],
+            "resolution": body.resolution or CFG["oreate"]["default_video_resolution"],
+            "duration": body.duration or CFG["oreate"]["default_video_duration"],
+            "scene_id": body.scene_id or CFG["oreate"]["default_video_scene"],
+        }
+    return {}
+
+
+def ensure_capability_value(field: str, value: Any, allowed: List[Any], code: str) -> None:
+    if allowed and value not in allowed:
+        raise GatewayAPIError(
+            422,
+            code,
+            f"{field} is not supported",
+            {"field": field, "value": value, "allowed": allowed},
+        )
+
+
+def validate_generation_options(kind: str, options: Dict[str, Any], caps: Dict[str, Any]) -> None:
+    if kind not in ("image", "video"):
+        raise GatewayAPIError(400, "UNSUPPORTED_KIND", f"unsupported kind: {kind}", {"field": "kind"})
+    models = caps.get(kind, {}).get("models") or []
+    if not models:
+        raise GatewayAPIError(503, "CAPABILITIES_UNAVAILABLE", "model capabilities are unavailable; refresh model capabilities first")
+    model = find_capability_model(models, options.get("model_name") or "")
+    if not model:
+        raise GatewayAPIError(
+            422,
+            "INVALID_MODEL",
+            f"model_name is not supported for {kind} generation",
+            {"field": "model_name", "value": options.get("model_name"), "allowed": [m.get("name") for m in models]},
+        )
+    ensure_capability_value("resolution", options.get("resolution"), model.get("resolutions") or [], "INVALID_RESOLUTION")
+    ensure_capability_value("ratio", options.get("ratio"), model.get("ratios") or [], "INVALID_RATIO")
+    if kind == "video":
+        ensure_capability_value("duration", options.get("duration"), model.get("durations") or [], "INVALID_DURATION")
+        scenes = caps.get("video", {}).get("scenes") or []
+        scene_ids = [scene.get("scene_id") for scene in scenes if scene.get("scene_id")]
+        ensure_capability_value("scene_id", options.get("scene_id"), scene_ids, "INVALID_SCENE")
+
+
+def estimate_point_cost(kind: str, options: Dict[str, Any], caps: Dict[str, Any]) -> Optional[int]:
+    models = caps.get(kind, {}).get("models") or []
+    model = find_capability_model(models, options.get("model_name") or "")
+    if not model:
+        return None
+    costs = model.get("point_cost") if kind == "image" else model.get("point_cost_image")
+    for item in costs or []:
+        if not isinstance(item, dict):
+            continue
+        if kind == "image" and item.get("resolution") == options.get("resolution"):
+            return item.get("point")
+        if kind == "video" and item.get("duration") == options.get("duration"):
+            return item.get("point")
+    return None
+
+
+def request_hash_for_generation(body: Any) -> str:
+    data = model_data(body) if isinstance(body, BaseModel) else dict(body)
+    stable = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+
+def find_idempotency_record(api_key_id: int, idempotency_key: str) -> Optional[sqlite3.Row]:
+    if not idempotency_key:
+        return None
+    conn = db_conn()
+    row = conn.execute(
+        "SELECT * FROM idempotency_keys WHERE api_key_id=? AND idempotency_key=?",
+        (api_key_id, idempotency_key),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def save_idempotency_record(api_key_id: int, idempotency_key: str, request_hash: str, status_code: int, response: Dict[str, Any], task_id: Optional[int]) -> None:
+    if not idempotency_key:
+        return
+    conn = db_conn()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO idempotency_keys(api_key_id,idempotency_key,request_hash,status_code,response_json,task_id,created_at)
+        VALUES(?,?,?,?,?,?,?)
+        """,
+        (api_key_id, idempotency_key, request_hash, status_code, json.dumps(response, ensure_ascii=False), task_id, time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_api_key_record(api_key_id: int) -> sqlite3.Row:
+    conn = db_conn()
+    row = conn.execute("SELECT * FROM api_keys WHERE id=?", (api_key_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise GatewayAPIError(401, "UNAUTHORIZED", "valid API key required (header: Authorization: Bearer <key>)")
+    return row
+
+
+def resolve_api_key_policy(row: sqlite3.Row) -> Dict[str, int]:
+    gateway_cfg = CFG.get("gateway", {})
+    return {
+        "rate_limit_per_minute": int(row["rate_limit_per_minute"] or gateway_cfg.get("default_rate_limit_per_minute") or 0),
+        "daily_request_limit": int(row["daily_request_limit"] or gateway_cfg.get("default_daily_request_limit") or 0),
+        "daily_point_limit": int(row["daily_point_limit"] or gateway_cfg.get("default_daily_point_limit") or 0),
+    }
+
+
+def check_rate_limit(api_key_id: int, policy: Dict[str, int], now: float, request_id: str) -> None:
+    limit = policy.get("rate_limit_per_minute") or 0
+    if limit <= 0:
+        return
+    window_start = now - 60
+    bucket = [t for t in RATE_BUCKETS.get(api_key_id, []) if t >= window_start]
+    if len(bucket) >= limit:
+        RATE_BUCKETS[api_key_id] = bucket
+        raise GatewayAPIError(
+            429,
+            "RATE_LIMITED",
+            "API key rate limit exceeded",
+            {"rate_limit_per_minute": limit},
+            request_id=request_id,
+        )
+    bucket.append(now)
+    RATE_BUCKETS[api_key_id] = bucket
+
+
+def day_start_timestamp(now: float) -> float:
+    start = datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.timestamp()
+
+
+def check_daily_quota(api_key_id: int, estimated_point_cost: Optional[int], policy: Dict[str, int], now: float, request_id: str) -> None:
+    start = day_start_timestamp(now)
+    conn = db_conn()
+    row = conn.execute(
+        """
+        SELECT COUNT(*) as request_count, COALESCE(SUM(estimated_point_cost), 0) as point_count
+        FROM usage_log
+        WHERE api_key_id=? AND created_at>=?
+        """,
+        (api_key_id, start),
+    ).fetchone()
+    conn.close()
+    daily_request_limit = policy.get("daily_request_limit") or 0
+    if daily_request_limit > 0 and row["request_count"] >= daily_request_limit:
+        raise GatewayAPIError(
+            429,
+            "DAILY_REQUEST_LIMIT_EXCEEDED",
+            "API key daily request limit exceeded",
+            {"daily_request_limit": daily_request_limit},
+            request_id=request_id,
+        )
+    daily_point_limit = policy.get("daily_point_limit") or 0
+    current_cost = estimated_point_cost or 0
+    if daily_point_limit > 0 and row["point_count"] + current_cost > daily_point_limit:
+        raise GatewayAPIError(
+            429,
+            "DAILY_POINT_LIMIT_EXCEEDED",
+            "API key daily point limit exceeded",
+            {"daily_point_limit": daily_point_limit, "estimated_point_cost": estimated_point_cost},
+            request_id=request_id,
+        )
+
+
+def pick_account_for_generation(kind: str, requested_account_id: Optional[int] = None) -> Optional[sqlite3.Row]:
+    now = time.time()
+    capability_clause = "model_info_json IS NOT NULL AND model_info_json != ''" if kind == "image" else "video_info_json IS NOT NULL AND video_info_json != ''"
+    params: List[Any] = [now]
+    account_clause = ""
+    if requested_account_id:
+        account_clause = "AND id=?"
+        params.append(requested_account_id)
+    conn = db_conn()
+    row = conn.execute(
+        f"""
+        SELECT * FROM accounts
+        WHERE status IN ('verified', 'active')
+          AND ({capability_clause})
+          AND (cooldown_until IS NULL OR cooldown_until <= ?)
+          {account_clause}
+        ORDER BY COALESCE(failure_count, 0) ASC, COALESCE(last_used_at, 0) ASC, updated_at DESC, id ASC
+        LIMIT 1
+        """,
+        tuple(params),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def mark_account_success(account_id: int) -> None:
+    now = time.time()
+    conn = db_conn()
+    conn.execute(
+        "UPDATE accounts SET last_used_at=?, failure_count=0, cooldown_until=NULL, last_error=NULL, updated_at=? WHERE id=?",
+        (now, now, account_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def mark_account_failure(account_id: int, error: Exception) -> None:
+    now = time.time()
+    conn = db_conn()
+    row = conn.execute("SELECT COALESCE(failure_count, 0) as failure_count FROM accounts WHERE id=?", (account_id,)).fetchone()
+    next_failure_count = (row["failure_count"] if row else 0) + 1
+    cooldown_seconds = int(CFG.get("gateway", {}).get("account_cooldown_seconds") or 300) * min(next_failure_count, 6)
+    conn.execute(
+        "UPDATE accounts SET failure_count=?, cooldown_until=?, last_error=?, updated_at=? WHERE id=?",
+        (next_failure_count, now + cooldown_seconds, str(error)[:500], now, account_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 CFG = load_config()
 ADMIN_TOKENS: Dict[str, str] = {}
 WS_CLIENTS: List[WebSocket] = []
+RATE_BUCKETS: Dict[int, List[float]] = {}
 
 
 def db_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def init_db():
@@ -148,16 +578,52 @@ def init_db():
         CREATE TABLE IF NOT EXISTS usage_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             api_key_id INTEGER,
+            task_id INTEGER,
             kind TEXT NOT NULL,
             account_id INTEGER,
             prompt TEXT,
             status TEXT NOT NULL,
             response_summary TEXT,
             created_at REAL NOT NULL,
-            FOREIGN KEY(api_key_id) REFERENCES api_keys(id)
+            FOREIGN KEY(api_key_id) REFERENCES api_keys(id),
+            FOREIGN KEY(task_id) REFERENCES tasks(id)
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS idempotency_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            api_key_id INTEGER NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            status_code INTEGER NOT NULL,
+            response_json TEXT NOT NULL,
+            task_id INTEGER,
+            created_at REAL NOT NULL,
+            UNIQUE(api_key_id, idempotency_key),
+            FOREIGN KEY(api_key_id) REFERENCES api_keys(id),
+            FOREIGN KEY(task_id) REFERENCES tasks(id)
+        )
+        """
+    )
+    add_column_if_missing(conn, "api_keys", "rate_limit_per_minute", "INTEGER")
+    add_column_if_missing(conn, "api_keys", "daily_request_limit", "INTEGER")
+    add_column_if_missing(conn, "api_keys", "daily_point_limit", "INTEGER")
+    add_column_if_missing(conn, "accounts", "last_used_at", "REAL")
+    add_column_if_missing(conn, "accounts", "failure_count", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "accounts", "cooldown_until", "REAL")
+    add_column_if_missing(conn, "usage_log", "task_id", "INTEGER")
+    add_column_if_missing(conn, "usage_log", "request_id", "TEXT")
+    add_column_if_missing(conn, "usage_log", "idempotency_key", "TEXT")
+    add_column_if_missing(conn, "usage_log", "model_name", "TEXT")
+    add_column_if_missing(conn, "usage_log", "resolution", "TEXT")
+    add_column_if_missing(conn, "usage_log", "ratio", "TEXT")
+    add_column_if_missing(conn, "usage_log", "duration", "INTEGER")
+    add_column_if_missing(conn, "usage_log", "scene_id", "TEXT")
+    add_column_if_missing(conn, "usage_log", "estimated_point_cost", "INTEGER")
+    add_column_if_missing(conn, "usage_log", "error_code", "TEXT")
+    add_column_if_missing(conn, "usage_log", "status_code", "INTEGER")
     conn.commit()
     conn.close()
 
@@ -191,13 +657,20 @@ class SettingsIn(BaseModel):
     pool: Optional[Dict[str, Any]] = None
 
 
+class AdminCredentialsIn(BaseModel):
+    current_password: str
+    new_username: str
+    new_password: str
+    confirm_password: str
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
 
 
 class MediaTaskIn(BaseModel):
-    account_id: int
+    account_id: Optional[int] = None
     prompt: str
     kind: str
     model_name: Optional[str] = None
@@ -659,6 +1132,68 @@ def pick_account_for_task(kind: str) -> Optional[sqlite3.Row]:
     return row
 
 
+def pick_account_for_capabilities() -> Optional[sqlite3.Row]:
+    conn = db_conn()
+    row = conn.execute(
+        """
+        SELECT * FROM accounts
+        WHERE status IN ('verified', 'active')
+          AND (
+            (model_info_json IS NOT NULL AND model_info_json != '')
+            OR
+            (video_info_json IS NOT NULL AND video_info_json != '')
+          )
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def capability_response_from_account(account: sqlite3.Row) -> Dict[str, Any]:
+    caps = normalize_capabilities(json_from_db(account["model_info_json"]), json_from_db(account["video_info_json"]))
+    return {"ok": True, "source_account_id": account["id"], **caps}
+
+
+def load_capabilities_from_pool() -> Dict[str, Any]:
+    account = pick_account_for_capabilities()
+    if not account:
+        raise HTTPException(503, "no account with model capabilities available")
+    return capability_response_from_account(account)
+
+
+def refresh_capabilities_from_pool() -> Dict[str, Any]:
+    conn = db_conn()
+    account = conn.execute(
+        """
+        SELECT * FROM accounts
+        WHERE status IN ('verified', 'active')
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    conn.close()
+    if not account:
+        raise HTTPException(503, "no verified account available")
+    session = CLIENT.session_from_account(account)
+    image_info = CLIENT.fetch_image_models(session)
+    video_info = {
+        "models": CLIENT.fetch_video_models(session),
+        "scenes": CLIENT.fetch_video_scenes(session),
+    }
+    now = time.time()
+    conn = db_conn()
+    conn.execute(
+        "UPDATE accounts SET model_info_json=?, video_info_json=?, updated_at=? WHERE id=?",
+        (json.dumps(image_info, ensure_ascii=False), json.dumps(video_info, ensure_ascii=False), now, account["id"]),
+    )
+    conn.commit()
+    conn.close()
+    caps = normalize_capabilities(image_info, video_info)
+    return {"ok": True, "source_account_id": account["id"], **caps}
+
+
 def auto_register_accounts(count: int = 1) -> List[Dict[str, Any]]:
     results = []
     for _ in range(max(1, count)):
@@ -721,9 +1256,7 @@ def auto_register_accounts(count: int = 1) -> List[Dict[str, Any]]:
                         token_id = ""
                         link = artifact.get("link", "")
                         if link:
-                            parsed = urllib.parse.urlparse(link)
-                            params = urllib.parse.parse_qs(parsed.query)
-                            token_id = params.get("tokenID", [""])[0]
+                            token_id = extract_token_id_from_link(link)
                             trace.append({"step": "extract_token_from_link", "tokenID": token_id, "link": link})
                             # Visit the verification link (click it) - REQUIRED for email to be marked verified
                             try:
@@ -785,6 +1318,71 @@ def auto_register_accounts(count: int = 1) -> List[Dict[str, Any]]:
 
 app = FastAPI(title="OreateAI Gateway")
 
+
+class GatewayAPIError(Exception):
+    def __init__(self, status_code: int, code: str, message: str, details: Optional[Dict[str, Any]] = None, request_id: str = ""):
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+        self.details = details or {}
+        self.request_id = request_id
+
+
+def gateway_request_id(request: Optional[Request] = None) -> str:
+    if request is not None:
+        incoming = request.headers.get("X-Request-ID")
+        if incoming:
+            return incoming
+    return "req_" + secrets.token_hex(8)
+
+
+def gateway_error_response(request_id: str, status_code: int, code: str, message: str, details: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "ok": False,
+            "error": {
+                "code": code,
+                "message": message,
+                "details": details or {},
+            },
+            "request_id": request_id,
+        },
+    )
+
+
+@app.exception_handler(GatewayAPIError)
+def handle_gateway_api_error(request: Request, exc: GatewayAPIError):
+    return gateway_error_response(
+        exc.request_id or gateway_request_id(request),
+        exc.status_code,
+        exc.code,
+        exc.message,
+        exc.details,
+    )
+
+
+@app.exception_handler(HTTPException)
+def handle_http_exception(request: Request, exc: HTTPException):
+    if request.url.path.startswith("/v1/"):
+        code_by_status = {
+            400: "BAD_REQUEST",
+            401: "UNAUTHORIZED",
+            403: "FORBIDDEN",
+            404: "NOT_FOUND",
+            409: "CONFLICT",
+            422: "VALIDATION_ERROR",
+            429: "RATE_LIMITED",
+            503: "SERVICE_UNAVAILABLE",
+        }
+        return gateway_error_response(
+            gateway_request_id(request),
+            exc.status_code,
+            code_by_status.get(exc.status_code, "GATEWAY_ERROR"),
+            str(exc.detail),
+        )
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+
 # === API Key Auth ===
 security = HTTPBearer(auto_error=False)
 
@@ -802,16 +1400,65 @@ def get_api_key(credentials: Optional[HTTPAuthorizationCredentials] = Depends(se
         return row["id"]
     return None
 
-def require_api_key(api_key_id: Optional[int] = Depends(get_api_key)):
+def require_api_key(request: Request, api_key_id: Optional[int] = Depends(get_api_key)):
     if api_key_id is None:
-        raise HTTPException(401, "valid API key required (header: Authorization: Bearer <key>)")
+        raise GatewayAPIError(
+            401,
+            "UNAUTHORIZED",
+            "valid API key required (header: Authorization: Bearer <key>)",
+            request_id=gateway_request_id(request),
+        )
     return api_key_id
 
-def log_usage(api_key_id: int, kind: str, account_id: int, prompt: str, status: str, summary: str = ""):
+def log_usage(
+    api_key_id: int,
+    kind: str,
+    account_id: int,
+    prompt: str,
+    status: str,
+    summary: str = "",
+    task_id: Optional[int] = None,
+    request_id: str = "",
+    idempotency_key: str = "",
+    model_name: str = "",
+    resolution: str = "",
+    ratio: str = "",
+    duration: Optional[int] = None,
+    scene_id: str = "",
+    estimated_point_cost: Optional[int] = None,
+    error_code: str = "",
+    status_code: Optional[int] = None,
+):
     conn = db_conn()
     conn.execute(
-        "INSERT INTO usage_log (api_key_id, kind, account_id, prompt, status, response_summary, created_at) VALUES (?,?,?,?,?,?,?)",
-        (api_key_id, kind, account_id, prompt[:200], status, summary[:200], time.time()),
+        """
+        INSERT INTO usage_log (
+            api_key_id, task_id, kind, account_id, prompt, status, response_summary,
+            request_id, idempotency_key, model_name, resolution, ratio, duration, scene_id,
+            estimated_point_cost, error_code, status_code, created_at
+        )
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            api_key_id,
+            task_id,
+            kind,
+            account_id,
+            prompt[:200],
+            status,
+            summary[:200],
+            request_id,
+            idempotency_key,
+            model_name,
+            resolution,
+            ratio,
+            duration,
+            scene_id,
+            estimated_point_cost,
+            error_code,
+            status_code,
+            time.time(),
+        ),
     )
     conn.commit()
     conn.close()
@@ -831,18 +1478,52 @@ def list_api_keys(_=Depends(require_admin)):
     conn = db_conn()
     rows = conn.execute("SELECT * FROM api_keys ORDER BY id DESC").fetchall()
     conn.close()
-    return {"items": [dict(r) for r in rows]}
+    return {"items": [public_api_key(r) for r in rows]}
 
 
 @app.post("/api/admin/apikeys")
-def create_api_key(name: str = "", _=Depends(require_admin)):
+def create_api_key(body: Dict[str, Any] = None, _=Depends(require_admin)):
+    name = (body or {}).get("name", "")
     key = "oreate_" + secrets.token_hex(24)
     conn = db_conn()
     conn.execute("INSERT INTO api_keys (key, name, enabled, created_at) VALUES (?,?,1,?)", (key, name, time.time()))
     conn.commit()
     row = conn.execute("SELECT * FROM api_keys WHERE key=?", (key,)).fetchone()
     conn.close()
-    return {"ok": True, "item": dict(row) if row else None}
+    return {"ok": True, "item": public_api_key(row, reveal=True) if row else None}
+
+
+@app.patch("/api/admin/apikeys/{key_id}")
+def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_admin)):
+    def limit_value(name: str) -> Optional[int]:
+        value = body.get(name)
+        if value in (None, ""):
+            return None
+        value = int(value)
+        if value < 0:
+            raise HTTPException(400, f"{name} must be non-negative")
+        return value
+
+    conn = db_conn()
+    conn.execute(
+        """
+        UPDATE api_keys
+        SET rate_limit_per_minute=?, daily_request_limit=?, daily_point_limit=?
+        WHERE id=?
+        """,
+        (
+            limit_value("rate_limit_per_minute"),
+            limit_value("daily_request_limit"),
+            limit_value("daily_point_limit"),
+            key_id,
+        ),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM api_keys WHERE id=?", (key_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "api key not found")
+    return {"ok": True, "item": public_api_key(row)}
 
 
 @app.delete("/api/admin/apikeys/{key_id}")
@@ -878,55 +1559,136 @@ class GatewayGenerateIn(BaseModel):
 
 
 @app.post("/v1/generate")
-def gateway_generate(body: GatewayGenerateIn, api_key_id: int = Depends(require_api_key)):
+def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int = Depends(require_api_key)):
     """Generate image or video via the account pool. Auto-selects account if not specified."""
-    conn = db_conn()
-    
-    # Pick account
-    if body.account_id:
-        account = conn.execute("SELECT * FROM accounts WHERE id=? AND status='verified'", (body.account_id,)).fetchone()
-    else:
-        account = conn.execute(
-            "SELECT * FROM accounts WHERE status='verified' ORDER BY last_error IS NULL DESC, id ASC LIMIT 1"
-        ).fetchone()
-    conn.close()
-    
+    request_id = gateway_request_id(request)
+    idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+    request_hash = request_hash_for_generation(body)
+    existing_idempotency = find_idempotency_record(api_key_id, idempotency_key)
+    if existing_idempotency:
+        if existing_idempotency["request_hash"] != request_hash:
+            raise GatewayAPIError(
+                409,
+                "IDEMPOTENCY_KEY_CONFLICT",
+                "Idempotency-Key was already used with a different request body",
+                {"field": "Idempotency-Key"},
+                request_id=request_id,
+            )
+        replay = json.loads(existing_idempotency["response_json"])
+        replay["idempotent_replay"] = True
+        replay["request_id"] = request_id
+        return JSONResponse(status_code=existing_idempotency["status_code"], content=replay)
+    policy = resolve_api_key_policy(get_api_key_record(api_key_id))
+    now = time.time()
+    check_rate_limit(api_key_id, policy, now, request_id)
+    if body.kind not in ("image", "video"):
+        raise GatewayAPIError(400, "UNSUPPORTED_KIND", f"unsupported kind: {body.kind}", {"field": "kind"}, request_id=request_id)
+    account = pick_account_for_generation(body.kind, body.account_id)
     if not account:
-        raise HTTPException(503, "no verified account available")
+        raise GatewayAPIError(503, "NO_ACCOUNT_AVAILABLE", "no verified account available")
+    caps = capabilities_from_account(account)
+    options = effective_generation_options(body, caps)
+    validate_generation_options(body.kind, options, caps)
+    estimated_point_cost = estimate_point_cost(body.kind, options, caps)
+    check_daily_quota(api_key_id, estimated_point_cost, policy, now, request_id)
     
-    s = CLIENT.session_from_account(account)
+    try:
+        s = CLIENT.session_from_account(account)
+    except Exception as e:
+        mark_account_failure(account["id"], e)
+        raise GatewayAPIError(503, "UPSTREAM_ERROR", str(e), request_id=request_id)
     
     if body.kind == "image":
         payload = {
             "docId": "",
             "content": body.prompt,
             "chatMode": "aiImage",
-            "modelName": body.model_name or CFG["oreate"]["default_image_model"],
-            "ratio": body.ratio or CFG["oreate"]["default_image_ratio"],
-            "resolution": body.resolution or CFG["oreate"]["default_image_resolution"],
+            "modelName": options["model_name"],
+            "ratio": options["ratio"],
+            "resolution": options["resolution"],
         }
-        response = CLIENT.create_chat(s, payload)
+        try:
+            response = CLIENT.create_chat(s, payload)
+        except Exception as e:
+            mark_account_failure(account["id"], e)
+            raise GatewayAPIError(503, "UPSTREAM_ERROR", str(e), request_id=request_id)
+        mark_account_success(account["id"])
         task_id = save_task(account["id"], "image", body.prompt, payload, response)
-        log_usage(api_key_id, "image", account["id"], body.prompt, "created")
-        return {"ok": True, "task_id": task_id, "account_id": account["id"], "response": response}
+        log_usage(
+            api_key_id,
+            "image",
+            account["id"],
+            body.prompt,
+            "created",
+            task_id=task_id,
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+            model_name=options["model_name"],
+            resolution=options["resolution"],
+            ratio=options["ratio"],
+            estimated_point_cost=estimated_point_cost,
+            status_code=200,
+        )
+        result = {
+            "ok": True,
+            "task_id": task_id,
+            "account_id": account["id"],
+            "request_id": request_id,
+            "idempotent_replay": False,
+            "estimated_point_cost": estimated_point_cost,
+            "response": response,
+        }
+        save_idempotency_record(api_key_id, idempotency_key, request_hash, 200, result, task_id)
+        return result
     
     elif body.kind == "video":
         payload = {
             "docId": "",
             "content": body.prompt,
             "chatMode": "aiVideo",
-            "sceneId": body.scene_id or CFG["oreate"]["default_video_scene"],
-            "modelName": body.model_name or CFG["oreate"]["default_video_model"],
-            "duration": body.duration or CFG["oreate"]["default_video_duration"],
-            "resolution": body.resolution or CFG["oreate"]["default_video_resolution"],
-            "ratio": body.ratio or CFG["oreate"]["default_video_ratio"],
+            "sceneId": options["scene_id"],
+            "modelName": options["model_name"],
+            "duration": options["duration"],
+            "resolution": options["resolution"],
+            "ratio": options["ratio"],
         }
-        response = CLIENT.create_chat(s, payload)
+        try:
+            response = CLIENT.create_chat(s, payload)
+        except Exception as e:
+            mark_account_failure(account["id"], e)
+            raise GatewayAPIError(503, "UPSTREAM_ERROR", str(e), request_id=request_id)
+        mark_account_success(account["id"])
         task_id = save_task(account["id"], "video", body.prompt, payload, response)
-        log_usage(api_key_id, "video", account["id"], body.prompt, "created")
-        return {"ok": True, "task_id": task_id, "account_id": account["id"], "response": response}
+        log_usage(
+            api_key_id,
+            "video",
+            account["id"],
+            body.prompt,
+            "created",
+            task_id=task_id,
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+            model_name=options["model_name"],
+            resolution=options["resolution"],
+            ratio=options["ratio"],
+            duration=options["duration"],
+            scene_id=options["scene_id"],
+            estimated_point_cost=estimated_point_cost,
+            status_code=200,
+        )
+        result = {
+            "ok": True,
+            "task_id": task_id,
+            "account_id": account["id"],
+            "request_id": request_id,
+            "idempotent_replay": False,
+            "estimated_point_cost": estimated_point_cost,
+            "response": response,
+        }
+        save_idempotency_record(api_key_id, idempotency_key, request_hash, 200, result, task_id)
+        return result
     
-    raise HTTPException(400, f"unsupported kind: {body.kind}")
+    raise GatewayAPIError(400, "UNSUPPORTED_KIND", f"unsupported kind: {body.kind}", {"field": "kind"}, request_id=request_id)
 
 
 @app.get("/v1/tasks")
@@ -950,14 +1712,63 @@ def gateway_account_status(api_key_id: int = Depends(require_api_key)):
     return {"ok": True, "total_accounts": total, "verified_accounts": verified}
 
 
+@app.get("/v1/capabilities")
+def gateway_capabilities(api_key_id: int = Depends(require_api_key)):
+    return load_capabilities_from_pool()
+
+
+def gateway_task_detail_payload(task_id: int, api_key_id: int) -> Dict[str, Any]:
+    conn = db_conn()
+    row = conn.execute(
+        """
+        SELECT
+            t.*,
+            u.model_name as audit_model_name,
+            u.resolution as audit_resolution,
+            u.ratio as audit_ratio,
+            u.duration as audit_duration,
+            u.scene_id as audit_scene_id,
+            u.estimated_point_cost as audit_estimated_point_cost,
+            u.request_id as audit_request_id,
+            u.idempotency_key as audit_idempotency_key,
+            u.error_code as audit_error_code,
+            u.status_code as audit_status_code
+        FROM tasks t
+        JOIN usage_log u ON u.task_id=t.id
+        WHERE t.id=? AND u.api_key_id=?
+        LIMIT 1
+        """,
+        (task_id, api_key_id),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise GatewayAPIError(404, "TASK_NOT_FOUND", "task not found")
+    task = dict(row)
+    payload = json_from_db(task.get("payload_json")) or {}
+    audit_fields = {
+        "model_name": task.pop("audit_model_name", None) or payload.get("modelName"),
+        "resolution": task.pop("audit_resolution", None) or payload.get("resolution"),
+        "ratio": task.pop("audit_ratio", None) or payload.get("ratio"),
+        "duration": task.pop("audit_duration", None) or payload.get("duration"),
+        "scene_id": task.pop("audit_scene_id", None) or payload.get("sceneId"),
+        "estimated_point_cost": task.pop("audit_estimated_point_cost", None),
+        "request_id": task.pop("audit_request_id", None),
+        "idempotency_key": task.pop("audit_idempotency_key", None),
+        "error_code": task.pop("audit_error_code", None),
+        "status_code": task.pop("audit_status_code", None),
+    }
+    task.update(audit_fields)
+    return {"ok": True, "task": task}
+
+
 @app.get("/v1/task/{task_id}")
 def gateway_task_detail(task_id: int, api_key_id: int = Depends(require_api_key)):
-    conn = db_conn()
-    task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-    conn.close()
-    if not task:
-        raise HTTPException(404, "task not found")
-    return {"ok": True, "task": dict(task)}
+    return gateway_task_detail_payload(task_id, api_key_id)
+
+
+@app.get("/v1/tasks/{task_id}")
+def gateway_task_detail_alias(task_id: int, api_key_id: int = Depends(require_api_key)):
+    return gateway_task_detail_payload(task_id, api_key_id)
 
 
 @app.on_event("startup")
@@ -979,50 +1790,82 @@ def root():
 
 @app.post("/api/admin/login")
 def admin_login(body: LoginIn):
-    if body.username != CFG["server"]["admin_username"] or body.password != CFG["server"]["admin_password"]:
+    expected_user = str(CFG["server"].get("admin_username") or "")
+    expected_password = str(CFG["server"].get("admin_password") or "")
+    if is_unsafe_admin_password(expected_password):
+        raise HTTPException(500, "admin password must be changed before login")
+    if not secrets.compare_digest(body.username, expected_user) or not secrets.compare_digest(body.password, expected_password):
         raise HTTPException(401, "invalid admin credentials")
     token = secrets.token_hex(24)
     ADMIN_TOKENS[token] = body.username
     return {"ok": True, "token": token}
 
 
+@app.post("/api/admin/credentials")
+def update_admin_credentials(body: AdminCredentialsIn, _=Depends(require_admin)):
+    global CFG
+    current_password = str(CFG["server"].get("admin_password") or "")
+    if not secrets.compare_digest(body.current_password, current_password):
+        raise HTTPException(401, "current password is incorrect")
+    new_username = body.new_username.strip()
+    if not new_username:
+        raise HTTPException(400, "new username is required")
+    if body.new_password != body.confirm_password:
+        raise HTTPException(400, "new passwords do not match")
+    if len(body.new_password) < 8 or is_unsafe_admin_password(body.new_password):
+        raise HTTPException(400, "new password is too weak")
+    CFG = deep_merge(CFG, {"server": {"admin_username": new_username, "admin_password": body.new_password}})
+    save_config(CFG)
+    ADMIN_TOKENS.clear()
+    return {"ok": True}
+
+
 @app.get("/api/admin/settings")
-def get_settings():
-    cfg = load_config()
-    return cfg
+def get_settings(_=Depends(require_admin)):
+    return public_config(CFG)
 
 
 @app.put("/api/admin/settings")
-def put_settings(body: SettingsIn):
+def put_settings(body: SettingsIn, _=Depends(require_admin)):
     global CFG
-    data = body.dict(exclude_none=True)
+    data = clean_settings_update(model_data(body))
     CFG = deep_merge(CFG, data)
     save_config(CFG)
-    return {"ok": True, "config": CFG}
+    return {"ok": True, "config": public_config(CFG)}
 
 
 @app.get("/api/accounts")
-def api_accounts():
-    return {"items": list_accounts()}
+def api_accounts(_=Depends(require_admin)):
+    return {"items": [public_account(row) for row in list_accounts()]}
+
+
+@app.get("/api/models/capabilities")
+def admin_model_capabilities(_=Depends(require_admin)):
+    return load_capabilities_from_pool()
+
+
+@app.post("/api/models/refresh")
+def admin_models_refresh(_=Depends(require_admin)):
+    return refresh_capabilities_from_pool()
 
 
 @app.get("/api/mail/test")
-def mail_test():
+def mail_test(_=Depends(require_admin)):
     return MAIL.test_connectivity()
 
 
 @app.post("/api/register/one")
-def register_one():
+def register_one(_=Depends(require_admin)):
     return {"items": auto_register_accounts(1)}
 
 
 @app.post("/api/register/batch")
-def register_batch(body: AutoRegisterIn):
+def register_batch(body: AutoRegisterIn, _=Depends(require_admin)):
     return {"items": auto_register_accounts(body.count)}
 
 
 @app.post("/api/accounts/import")
-def import_account(body: Dict[str, str]):
+def import_account(body: Dict[str, str], _=Depends(require_admin)):
     email = body.get("email", "").strip()
     password = body.get("password", "")
     if not email or not password:
@@ -1039,12 +1882,17 @@ def import_account(body: Dict[str, str]):
 
 
 @app.post("/api/media/generate")
-def generate_media(body: MediaTaskIn):
-    conn = db_conn()
-    account = conn.execute("SELECT * FROM accounts WHERE id=?", (body.account_id,)).fetchone()
-    conn.close()
+def generate_media(body: MediaTaskIn, _=Depends(require_admin)):
+    if body.kind not in ("image", "video"):
+        raise HTTPException(400, f"unsupported kind: {body.kind}")
+    if body.account_id:
+        conn = db_conn()
+        account = conn.execute("SELECT * FROM accounts WHERE id=? AND status IN ('verified', 'active')", (body.account_id,)).fetchone()
+        conn.close()
+    else:
+        account = pick_account_for_task(body.kind)
     if not account:
-        raise HTTPException(404, "account not found")
+        raise HTTPException(503, "no verified account available")
     s = CLIENT.session_from_account(account)
     payload = {
         "docId": "",
@@ -1068,12 +1916,12 @@ def generate_media(body: MediaTaskIn):
     if body.jt is not None:
         payload["jt"] = body.jt
     response = CLIENT.create_chat(s, payload)
-    task_id = save_task(body.account_id, body.kind, body.prompt, payload, response)
+    task_id = save_task(account["id"], body.kind, body.prompt, payload, response)
     return {"ok": True, "task_id": task_id, "response": response}
 
 
 @app.get("/api/tasks")
-def list_tasks():
+def list_tasks(_=Depends(require_admin)):
     conn = db_conn()
     rows = conn.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()
     conn.close()
@@ -1081,7 +1929,7 @@ def list_tasks():
 
 
 @app.post("/api/tasks/{task_id}/mark")
-def mark_task(task_id: int, body: Dict[str, Any]):
+def mark_task(task_id: int, body: Dict[str, Any], _=Depends(require_admin)):
     status = str(body.get("status", "")).strip()
     if not status:
         raise HTTPException(400, "status required")
@@ -1090,7 +1938,7 @@ def mark_task(task_id: int, body: Dict[str, Any]):
 
 
 @app.post("/api/pool/maintain")
-def pool_maintain(body: MaintainIn):
+def pool_maintain(body: MaintainIn, _=Depends(require_admin)):
     accounts = list_accounts()
     verified = [a for a in accounts if a.get("status") in ("verified", "active")]
     created = []
@@ -1132,10 +1980,12 @@ ADMIN_HTML = """<!doctype html>
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f5f5f7;color:#1d1d1f;padding:0}
 .nav{background:#fff;border-bottom:1px solid #e5e5e5;padding:16px 32px;display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100;animation:slideDown .5s cubic-bezier(.22,1,.36,1)}
 .nav h1{font-size:18px;font-weight:600;letter-spacing:-.3px}
-.nav a{color:#1d1d1f;text-decoration:none;font-size:14px;padding:6px 16px;border-radius:8px;transition:.2s}
+.nav a{color:#1d1d1f;text-decoration:none;font-size:14px;padding:6px 16px;border-radius:8px;transition:.2s;cursor:pointer}
 .nav a:hover{background:#f0f0f0}
 .nav .badge{background:#1d1d1f;color:#fff;font-size:11px;padding:2px 8px;border-radius:12px;margin-left:4px}
 .container{max-width:1200px;margin:0 auto;padding:24px 32px}
+.login-panel{max-width:420px;margin:80px auto 0}
+.login-error{color:#c62828;font-size:12px;margin-top:8px;min-height:16px}
 .section{background:#fff;border-radius:16px;padding:24px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.04);animation:fadeUp .6s cubic-bezier(.22,1,.36,1)}
 .section h2{font-size:15px;font-weight:600;margin-bottom:16px;display:flex;align-items:center;gap:8px}
 .row{display:flex;gap:12px;flex-wrap:wrap;align-items:end}
@@ -1146,16 +1996,13 @@ input:focus,select:focus,textarea:focus{border-color:#1d1d1f;box-shadow:0 0 0 3p
 textarea{min-height:80px;resize:vertical;font-family:inherit}
 button{font-size:14px;padding:10px 20px;border:none;border-radius:10px;cursor:pointer;transition:all .25s cubic-bezier(.22,1,.36,1);font-weight:500}
 button:active{transform:scale(.96)}
-.btn-primary{background:#1d1d1f;color:#fff}
-.btn-primary:hover{background:#000}
-.btn-secondary{background:#f0f0f0;color:#1d1d1f}
-.btn-secondary:hover{background:#e5e5e5}
-.btn-danger{background:#ff3b30;color:#fff}
-.btn-danger:hover{background:#d62d20}
+.btn-primary{background:#1d1d1f;color:#fff}.btn-primary:hover{background:#000}
+.btn-secondary{background:#f0f0f0;color:#1d1d1f}.btn-secondary:hover{background:#e5e5e5}
+.btn-danger{background:#ff3b30;color:#fff}.btn-danger:hover{background:#d62d20}
 .btn-sm{padding:6px 14px;font-size:12px;border-radius:8px}
 .table-wrap{overflow-x:auto;border-radius:10px;border:1px solid #e5e5e5}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th{background:#f5f5f7;padding:10px 12px;text-align:left;font-weight:500;border-bottom:1px solid #e5e5e5}
+th{background:#f5f5f7;padding:10px 12px;text-align:left;font-weight:500;border-bottom:1px solid #e5e5e5;white-space:nowrap}
 td{padding:10px 12px;border-bottom:1px solid #f0f0f0;vertical-align:middle}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:#fafafa}
@@ -1164,18 +2011,16 @@ tr:hover td{background:#fafafa}
 .tag-red{background:#ffebee;color:#c62828}
 .tag-gray{background:#f5f5f5;color:#616161}
 .tag-blue{background:#e3f2fd;color:#1565c0}
-.copy-btn{cursor:pointer;font-size:11px;padding:2px 8px;border-radius:6px;background:#f0f0f0;border:none;margin-left:4px}
+.copy-btn{display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-size:11px;padding:3px 10px;border-radius:6px;background:#f0f0f0;border:none;transition:.15s}
 .copy-btn:hover{background:#e0e0e0}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:0}
 .stat-card{background:#f5f5f7;border-radius:12px;padding:16px;text-align:center}
 .stat-card .num{font-size:28px;font-weight:700;letter-spacing:-.5px}
 .stat-card .label{font-size:12px;color:#86868b;margin-top:2px}
-.tabs{display:flex;gap:4px;margin-bottom:16px;background:#f5f5f7;padding:4px;border-radius:10px}
-.tab{flex:1;text-align:center;padding:8px 12px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:500;transition:.2s;border:none;background:transparent}
-.tab.active{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08)}
-.tab:hover:not(.active){background:rgba(0,0,0,.03)}
+.endpoint-box{background:#f5f5f7;border-radius:10px;padding:12px 16px;margin-bottom:12px;font-family:monospace;font-size:13px}
+.endpoint-box .url{font-weight:600;color:#1d1d1f}
+.endpoint-box .desc{font-size:12px;color:#86868b;margin-top:2px}
 .hidden{display:none!important}
-.loading{text-align:center;padding:32px;color:#86868b}
 @keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
 @keyframes slideDown{from{opacity:0;transform:translateY(-12px)}to{opacity:1;transform:translateY(0)}}
 pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;overflow:auto;font-size:12px;max-height:300px}
@@ -1183,21 +2028,30 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
 </head>
 <body>
 
+<div id="login-panel" class="section login-panel hidden">
+  <h2>管理员登录</h2>
+  <div style="margin-top:12px"><label>用户名</label><input id="login-user" autocomplete="username" value="admin"></div>
+  <div style="margin-top:12px"><label>密码</label><input id="login-pass" type="password" autocomplete="current-password"></div>
+  <div style="margin-top:16px"><button class="btn-primary" onclick="adminLogin()">登录</button></div>
+  <div id="login-error" class="login-error"></div>
+</div>
+
+<div id="app-shell" class="hidden">
 <div class="nav">
   <h1>OreateAI Gateway</h1>
-  <a href="#" onclick="switchTab('pool')" id="tab-pool-btn">号池 <span class="badge" id="pool-count">0</span></a>
-  <a href="#" onclick="switchTab('generate')">生成</a>
-  <a href="#" onclick="switchTab('tasks')">任务</a>
-  <a href="#" onclick="switchTab('apikeys')">API Keys</a>
-  <a href="#" onclick="switchTab('settings')">设置</a>
+  <a onclick="switchTab('pool')">号池 <span class="badge" id="pool-count">0</span></a>
+  <a onclick="switchTab('generate')">生成</a>
+  <a onclick="switchTab('tasks')">任务</a>
+  <a onclick="switchTab('apikeys')">API Keys</a>
+  <a onclick="switchTab('settings')">设置</a>
   <span style="flex:1"></span>
   <span style="font-size:12px;color:#86868b" id="status-text">就绪</span>
+  <button class="btn-secondary btn-sm" onclick="logout()">退出</button>
 </div>
 
 <div class="container">
 
-<!-- Stats -->
-<div class="stats" id="stats-row">
+<div class="stats">
   <div class="stat-card"><div class="num" id="st-total">-</div><div class="label">总账号</div></div>
   <div class="stat-card"><div class="num" id="st-verified">-</div><div class="label">可用</div></div>
   <div class="stat-card"><div class="num" id="st-tasks">-</div><div class="label">任务数</div></div>
@@ -1212,15 +2066,9 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
     <div><button class="btn-primary" onclick="registerOne()">注册 1 个</button></div>
     <div><button class="btn-primary" onclick="registerBatch()">批量注册</button></div>
     <div><button class="btn-secondary" onclick="maintainPool()">补号</button></div>
-    <div><button class="btn-secondary" onclick="importDialog()">导入账号</button></div>
+    <div><button class="btn-secondary" onclick="toggleImport()">导入账号</button></div>
   </div>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>ID</th><th>邮箱</th><th>状态</th><th>来源</th><th>OUID</th><th>创建时间</th><th>操作</th></tr></thead>
-      <tbody id="accounts-tbody"></tbody>
-    </table>
-  </div>
-  <div id="import-area" class="hidden" style="margin-top:12px">
+  <div id="import-area" class="hidden" style="margin-bottom:12px">
     <div class="row">
       <div class="col"><input id="imp-email" placeholder="邮箱"></div>
       <div class="col"><input id="imp-pwd" placeholder="密码"></div>
@@ -1228,25 +2076,41 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
       <div><button class="btn-secondary" onclick="document.getElementById('import-area').classList.add('hidden')">取消</button></div>
     </div>
   </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>ID</th><th>邮箱</th><th>状态</th><th>来源</th><th>OUID</th><th>创建时间</th><th>操作</th>
+      </tr></thead>
+      <tbody id="accounts-tbody"></tbody>
+    </table>
+  </div>
 </div>
 
 <!-- Tab: 生成 -->
 <div id="tab-generate" class="section hidden">
   <h2>🎨 图片 / 🎬 视频 生成</h2>
-  <div class="row">
-    <div class="col">
-      <label>类型</label>
-      <select id="g-kind"><option value="image">图片</option><option value="video">视频</option></select>
+  <div style="margin-bottom:16px">
+    <div class="endpoint-box">
+      <div class="url">POST <span id="gw-url">/v1/generate</span></div>
+      <div class="desc">Authorization: Bearer &lt;API Key&gt; &nbsp;|&nbsp; Content-Type: application/json</div>
     </div>
-    <div class="col"><label>账号ID（留空自动分配）</label><input id="g-account" placeholder="auto"></div>
-    <div class="col"><label>模型（可选）</label><input id="g-model" placeholder="默认"></div>
-    <div class="col"><label>比例</label><input id="g-ratio" placeholder="16:9"></div>
+    <div style="font-size:12px;color:#86868b;margin-top:4px">
+      示例: <code id="gw-example">curl -H "Authorization: Bearer &lt;key&gt;" -H "Content-Type: application/json" -d '{"kind":"image","prompt":"hello"}' http://localhost:8894/v1/generate</code>
+      <button class="copy-btn" onclick="copyExample()" style="margin-left:4px">复制</button>
+    </div>
   </div>
   <div class="row">
-    <div class="col"><label>分辨率</label><input id="g-res" placeholder="4K / 480"></div>
-    <div class="col"><label>时长（视频）</label><input id="g-dur" placeholder="5"></div>
-    <div class="col"><label>场景（视频）</label><input id="g-scene" placeholder="text_or_image"></div>
+    <div class="col"><label>类型</label><select id="g-kind" onchange="applyGenerateOptions()"><option value="image">图片</option><option value="video">视频</option></select></div>
+    <div class="col"><label>账号ID（留空自动分配）</label><input id="g-account" placeholder="auto"></div>
+    <div class="col"><label>模型</label><select id="g-model" onchange="applyModelOptions()"></select></div>
+    <div class="col"><label>比例</label><select id="g-ratio"></select></div>
   </div>
+  <div class="row">
+    <div class="col"><label>分辨率</label><select id="g-res"></select></div>
+    <div class="col"><label>视频时长</label><select id="g-dur"></select></div>
+    <div class="col"><label>视频场景</label><select id="g-scene"></select></div>
+  </div>
+  <div id="g-model-desc" style="font-size:12px;color:#6e6e73;margin-top:8px"></div>
   <div style="margin-top:12px"><label>描述词</label><textarea id="g-prompt" placeholder="请输入描述词..."></textarea></div>
   <div style="margin-top:12px;display:flex;gap:8px">
     <button class="btn-primary" onclick="gatewayGenerate()">提交生成</button>
@@ -1270,24 +2134,30 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
 <!-- Tab: API Keys -->
 <div id="tab-apikeys" class="section hidden">
   <h2>🔑 API Keys</h2>
+  <div style="margin-bottom:16px">
+    <div class="endpoint-box">
+      <div class="url">POST /v1/generate</div>
+      <div class="desc">请求头: <code>Authorization: Bearer &lt;你的 API Key&gt;</code></div>
+    </div>
+  </div>
   <div class="row" style="margin-bottom:16px">
     <div class="col"><input id="ak-name" placeholder="名称（可选）"></div>
     <div><button class="btn-primary" onclick="createApiKey()">创建 Key</button></div>
   </div>
   <div id="ak-new" class="hidden" style="background:#e8f5e9;padding:12px;border-radius:10px;margin-bottom:12px">
     <strong>新 Key:</strong> <code id="ak-new-value"></code>
-    <button class="copy-btn" onclick="copyKey()">复制</button>
+    <button class="copy-btn" onclick="copyKey()">📋 复制</button>
   </div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>Key</th><th>名称</th><th>状态</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead>
+      <thead><tr><th>ID</th><th>Key</th><th>名称</th><th>状态</th><th>每分钟</th><th>每日请求</th><th>每日点数</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead>
       <tbody id="apikeys-tbody"></tbody>
     </table>
   </div>
   <h2 style="margin-top:24px">📊 用量日志</h2>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>类型</th><th>账号</th><th>状态</th><th>提示词</th><th>时间</th></tr></thead>
+      <thead><tr><th>ID</th><th>类型</th><th>账号</th><th>模型</th><th>点数</th><th>错误码</th><th>状态</th><th>提示词</th><th>时间</th></tr></thead>
       <tbody id="usage-tbody"></tbody>
     </table>
   </div>
@@ -1296,234 +2166,432 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
 <!-- Tab: 设置 -->
 <div id="tab-settings" class="section hidden">
   <h2>⚙️ 系统设置</h2>
-  <div id="settings-form"></div>
-  <div style="margin-top:12px"><button class="btn-primary" onclick="saveSettings()">保存设置</button></div>
+  <div class="row">
+    <div class="col"><label>服务端口</label><input id="s-port" value="8894"></div>
+  </div>
+  <div class="row" style="margin-top:12px">
+    <div class="col"><label>OreateAI 基础 URL</label><input id="s-base" value="https://www.oreateai.com"></div>
+    <div class="col"><label>默认图片模型</label><input id="s-img-model" value=""></div>
+    <div class="col"><label>默认视频模型</label><input id="s-vid-model" value=""></div>
+  </div>
+  <h3 style="margin-top:20px;font-size:14px">📧 YYDS 邮箱配置</h3>
+  <div class="row" style="margin-top:8px">
+    <div class="col"><label>API 地址</label><input id="s-mail-url" value="https://maliapi.215.im/v1"></div>
+    <div class="col" style="flex:2"><label>API Key</label><input id="s-mail-key" placeholder="mail api key"></div>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <div class="col" style="flex:3"><label>首选域名（逗号分隔）</label><input id="s-mail-domains" placeholder="domain1.xyz,domain2.xyz"></div>
+  </div>
+  <h3 style="margin-top:20px;font-size:14px">📦 号池配置</h3>
+  <div class="row" style="margin-top:8px">
+    <div class="col"><label>最低账号数</label><input id="s-min" value="3"></div>
+    <div class="col"><label>维护目标数</label><input id="s-target" value="5"></div>
+  </div>
+  <div style="margin-top:16px"><button class="btn-primary" onclick="saveSettings()">保存设置</button></div>
   <pre id="settings-raw" style="margin-top:12px"></pre>
+
+  <h3 style="margin-top:20px;font-size:14px">管理员账号</h3>
+  <div class="row" style="margin-top:8px">
+    <div class="col"><label>当前密码</label><input id="cred-current" type="password" autocomplete="current-password"></div>
+    <div class="col"><label>新用户名</label><input id="cred-user" autocomplete="username"></div>
+    <div class="col"><label>新密码</label><input id="cred-pass" type="password" autocomplete="new-password"></div>
+    <div class="col"><label>确认新密码</label><input id="cred-confirm" type="password" autocomplete="new-password"></div>
+  </div>
+  <div style="margin-top:16px"><button class="btn-secondary" onclick="changeCredentials()">修改账号密码</button></div>
+
+  <h3 style="margin-top:20px;font-size:14px">模型能力</h3>
+  <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+    <button class="btn-secondary" onclick="refreshCapabilities()">刷新模型能力</button>
+    <span style="font-size:12px;color:#86868b" id="cap-status">未加载</span>
+  </div>
 </div>
 
+</div>
 </div>
 
 <script>
-let state = {accounts:[],tasks:[],apikeys:[],usage:[],settings:{}};
-const BASE = '';
+const BASE = location.origin;
+let adminToken = localStorage.getItem('oreate_admin_token') || '';
 
-async function api(method, url, body) {
-  const opts = {method, headers:{'Content-Type':'application/json'}};
-  if (body) opts.body = JSON.stringify(body);
-  const r = await fetch(BASE + url, opts);
-  return r.json();
+function copyText(t) { navigator.clipboard.writeText(t).catch(()=>{}); }
+function authHeaders(){
+  const headers = {'Content-Type':'application/json'};
+  if (adminToken) headers.Authorization = 'Bearer ' + adminToken;
+  return headers;
 }
-
-async function init() {
-  document.getElementById('status-text').textContent = '加载中...';
-  await Promise.all([loadAccounts(), loadTasks(), loadApiKeys(), loadUsage(), loadSettings()]);
-  document.getElementById('status-text').textContent = `就绪 — ${state.accounts.filter(a=>a.status==='verified').length} 可用账号`;
+function showLogin(message=''){
+  document.getElementById('login-panel').classList.remove('hidden');
+  document.getElementById('app-shell').classList.add('hidden');
+  document.getElementById('login-error').textContent = message;
 }
-
+function showApp(){
+  document.getElementById('login-panel').classList.add('hidden');
+  document.getElementById('app-shell').classList.remove('hidden');
+}
+async function adminLogin(){
+  const r = await fetch(BASE + '/api/admin/login', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      username:document.getElementById('login-user').value,
+      password:document.getElementById('login-pass').value
+    })
+  });
+  const data = await r.json().catch(()=>({}));
+  if (!r.ok || !data.token) {
+    showLogin(data.detail || '登录失败');
+    return;
+  }
+  adminToken = data.token;
+  localStorage.setItem('oreate_admin_token', adminToken);
+  await init();
+}
+function logout(){
+  adminToken = '';
+  localStorage.removeItem('oreate_admin_token');
+  showLogin();
+}
 function switchTab(name) {
-  document.querySelectorAll('.tab-pool,.tab-generate,.tab-tasks,.tab-apikeys,.tab-settings'.split(',').map(n=>'#tab-'+n)).forEach(el => {
-    const e = document.getElementById('tab-'+el.id.replace('tab-',''));
-    if(e) e.classList.add('hidden');
-  });
-  // Simple version:
-  ['pool','generate','tasks','apikeys','settings'].forEach(t => {
-    const el = document.getElementById('tab-'+t);
-    if (el) el.classList.toggle('hidden', t !== name);
+  document.querySelectorAll('#tab-pool,#tab-generate,#tab-tasks,#tab-apikeys,#tab-settings').forEach(el => {
+    el.classList.toggle('hidden', el.id !== 'tab-'+name);
   });
 }
 
-// Accounts
-async function loadAccounts() {
-  const r = await api('GET','/api/accounts');
-  state.accounts = r.items || [];
-  renderAccounts();
-  updateStats();
+// Init
+async function init() {
+  if (!adminToken) {
+    showLogin();
+    return;
+  }
+  showApp();
+  document.getElementById('status-text').textContent = '加载中...';
+  try {
+    await Promise.all([loadAccounts(), loadTasks(), loadApiKeys(), loadUsage(), loadSettings()]);
+    await loadCapabilities();
+  } catch (e) {
+    document.getElementById('status-text').textContent = '未授权';
+    showLogin('登录已失效');
+    return;
+  }
+  const v = state.accounts.filter(a=>a.status==='verified').length;
+  document.getElementById('status-text').textContent = `就绪 — ${v} 可用账号`;
+  document.getElementById('gw-url').textContent = location.origin + '/v1/generate';
+  document.getElementById('gw-example').textContent =
+    'curl -H "Authorization: Bearer <key>" -H "Content-Type: application/json" -d \'{"kind":"image","prompt":"hello"}\' ' + location.origin + '/v1/generate';
 }
+function copyExample() { copyText(document.getElementById('gw-example').textContent); }
 
-function renderAccounts() {
-  const tbody = document.getElementById('accounts-tbody');
+// === Accounts ===
+let state = {accounts:[],tasks:[],apikeys:[],usage:[],settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}}};
+async function api(m,u,b){
+  const o={method:m,headers:authHeaders()};
+  if(b) o.body=JSON.stringify(b);
+  const r = await fetch(BASE+u,o);
+  const data = await r.json().catch(()=>({}));
+  if (r.status === 401) throw new Error(data.detail || 'unauthorized');
+  if (!r.ok) throw new Error(data.detail || 'request failed');
+  return data;
+}
+function escapeHtml(value){
+  return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function normalizedOptionValues(values){
+  const out=[];
+  (Array.isArray(values)?values:[]).forEach(v => {
+    const s=String(v ?? '').trim();
+    if(s && !out.includes(s)) out.push(s);
+  });
+  return out;
+}
+function setSelectOptions(id, items, selectedValue='', emptyLabel='默认'){
+  const el=document.getElementById(id);
+  if(!el) return;
+  const selected=String(selectedValue ?? '');
+  const options=[];
+  if(emptyLabel !== null) options.push(`<option value="">${escapeHtml(emptyLabel)}</option>`);
+  (Array.isArray(items)?items:[]).forEach(item => {
+    const value=String((item && typeof item === 'object' ? item.value : item) ?? '');
+    if(!value) return;
+    const label=String((item && typeof item === 'object' ? item.label : item) ?? value);
+    options.push(`<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`);
+  });
+  el.innerHTML=options.join('');
+  if([...el.options].some(o=>o.value===selected)) {
+    el.value=selected;
+  } else if(el.options.length > (emptyLabel === null ? 0 : 1)) {
+    el.selectedIndex=emptyLabel === null ? 0 : 1;
+  } else {
+    el.value='';
+  }
+}
+function valueOptions(values){
+  return normalizedOptionValues(values).map(v => ({value:v,label:v}));
+}
+function capabilityModels(kind){
+  return (((state.capabilities || {})[kind] || {}).models || []);
+}
+function capabilityScenes(){
+  return (((state.capabilities || {}).video || {}).scenes || []);
+}
+function defaultModel(kind){
+  return kind === 'video' ? (state.settings.oreate?.default_video_model || '') : (state.settings.oreate?.default_image_model || '');
+}
+function defaultRatio(kind){
+  return kind === 'video' ? (state.settings.oreate?.default_video_ratio || '') : (state.settings.oreate?.default_image_ratio || '');
+}
+function defaultResolution(kind){
+  return kind === 'video' ? (state.settings.oreate?.default_video_resolution || '') : (state.settings.oreate?.default_image_resolution || '');
+}
+function setVideoFieldsVisible(visible){
+  ['g-dur','g-scene'].forEach(id => {
+    const wrap=document.getElementById(id)?.closest('.col');
+    if(wrap) wrap.style.display = visible ? '' : 'none';
+  });
+}
+function setCapabilityState(payload){
+  state.capabilities={
+    image: payload?.image || {models:[]},
+    video: payload?.video || {models:[],scenes:[]},
+    source_account_id: payload?.source_account_id || null,
+  };
+}
+async function loadAccounts(){
+  const r=await api('GET','/api/accounts');
+  state.accounts=r.items||[]; renderAccounts(); updateStats();
+}
+function renderAccounts(){
+  const tbody=document.getElementById('accounts-tbody');
   tbody.innerHTML = state.accounts.map(a => {
-    const statusClass = a.status === 'verified' ? 'tag-green' : a.status === 'new' ? 'tag-blue' : 'tag-gray';
-    const ouid = (a.ouid||'').substring(0,12);
+    const sc = a.status==='verified'?'tag-green':a.status==='new'?'tag-blue':'tag-gray';
+    const em = a.email||'';
     return `<tr>
       <td>${a.id}</td>
-      <td style="max-width:240px;overflow:hidden;text-overflow:ellipsis">${a.email}</td>
-      <td><span class="tag ${statusClass}">${a.status}</span></td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis">${em}<button class="copy-btn" onclick="copyText('${em.replace(/'/g,"\\'")}')">📋</button></td>
+      <td><span class="tag ${sc}">${a.status}</span></td>
       <td>${a.source||'-'}</td>
-      <td style="font-family:monospace;font-size:11px">${ouid}...</td>
-      <td>${new Date((a.created_at||0)*1000).toLocaleString()}</td>
-      <td><button class="btn-sm btn-secondary" onclick="generateWith('${a.id}')">生成</button></td>
+      <td style="font-family:monospace;font-size:11px">${a.ouid_preview||''}</td>
+      <td style="font-size:11px">${new Date((a.created_at||0)*1000).toLocaleString()}</td>
+      <td><button class="btn-sm btn-secondary" onclick="generateWith(${a.id})">生成</button></td>
     </tr>`;
   }).join('');
   document.getElementById('pool-count').textContent = state.accounts.filter(a=>a.status==='verified').length;
 }
+async function registerOne(){document.getElementById('status-text').textContent='注册中...';const r=await api('POST','/api/register/one');await loadAccounts();document.getElementById('status-text').textContent='完成';alert(JSON.stringify(r));}
+async function registerBatch(){document.getElementById('status-text').textContent='批量注册中...';const n=Number(document.getElementById('reg_count').value||1);const r=await api('POST','/api/register/batch',{count:n});await loadAccounts();document.getElementById('status-text').textContent='完成';const ok=(r.items||[]).filter(i=>i.status==='verified').length;alert(`成功: ${ok}/${n}`);}
+async function maintainPool(){const r=await api('POST','/api/pool/maintain',{force_register:true,max_register:Number(document.getElementById('reg_count').value||1)});await loadAccounts();alert(JSON.stringify(r.created));}
+function toggleImport(){document.getElementById('import-area').classList.toggle('hidden');}
+async function doImport(){const r=await api('POST','/api/accounts/import',{email:document.getElementById('imp-email').value,password:document.getElementById('imp-pwd').value});await loadAccounts();alert(r.ok?'✅ 导入成功':'❌ 失败');}
+function generateWith(aid){switchTab('generate');document.getElementById('g-account').value=aid;}
 
-async function registerOne() { document.getElementById('status-text').textContent = '注册中...'; const r=await api('POST','/api/register/one'); await loadAccounts(); document.getElementById('status-text').textContent='完成'; alert(JSON.stringify(r)); }
-async function registerBatch() { document.getElementById('status-text').textContent='批量注册中...'; const r=await api('POST','/api/register/batch',{count:Number(document.getElementById('reg_count').value||1)}); await loadAccounts(); document.getElementById('status-text').textContent='完成'; alert('成功: '+((r.items||[]).filter(i=>i.status==='verified').length)+'/'+((r.items||[]).length)); }
-async function maintainPool() { const r=await api('POST','/api/pool/maintain',{force_register:true,max_register:Number(document.getElementById('reg_count').value||1)}); await loadAccounts(); alert(JSON.stringify(r.created)); }
-function importDialog() { document.getElementById('import-area').classList.remove('hidden'); }
-async function doImport() { const r=await api('POST','/api/accounts/import',{email:document.getElementById('imp-email').value,password:document.getElementById('imp-pwd').value}); await loadAccounts(); alert(r.ok?'✅ 导入成功':'❌ 失败'); }
-
-function generateWith(aid) { switchTab('generate'); document.getElementById('g-account').value=aid; }
-
-// Generate
-async function gatewayGenerate() {
-  const payload = {
+// === Generate ===
+async function loadCapabilities(){
+  const status=document.getElementById('cap-status');
+  if(status) status.textContent='加载中...';
+  try {
+    const r=await api('GET','/api/models/capabilities');
+    setCapabilityState(r);
+    const imageCount=capabilityModels('image').length;
+    const videoCount=capabilityModels('video').length;
+    if(status) status.textContent=`账号 ${r.source_account_id || '-'} · 图片模型 ${imageCount} · 视频模型 ${videoCount}`;
+  } catch(e) {
+    setCapabilityState({});
+    if(status) status.textContent='未加载：' + e.message;
+  }
+  applyGenerateOptions();
+}
+async function refreshCapabilities(){
+  const status=document.getElementById('cap-status');
+  if(status) status.textContent='刷新中...';
+  try {
+    const r=await api('POST','/api/models/refresh');
+    setCapabilityState(r);
+    const imageCount=capabilityModels('image').length;
+    const videoCount=capabilityModels('video').length;
+    if(status) status.textContent=`账号 ${r.source_account_id || '-'} · 图片模型 ${imageCount} · 视频模型 ${videoCount}`;
+    applyGenerateOptions();
+    alert('已刷新模型能力');
+  } catch(e) {
+    if(status) status.textContent='刷新失败：' + e.message;
+    alert('刷新失败：' + e.message);
+  }
+}
+function selectedModel(kind){
+  const name=document.getElementById('g-model').value;
+  return capabilityModels(kind).find(m => m.name === name) || null;
+}
+function applyGenerateOptions(){
+  const kind=document.getElementById('g-kind').value;
+  const models=capabilityModels(kind);
+  const current=document.getElementById('g-model').value;
+  const configured=defaultModel(kind);
+  const selected=models.some(m=>m.name===current) ? current : (models.some(m=>m.name===configured) ? configured : (models[0]?.name || ''));
+  setVideoFieldsVisible(kind === 'video');
+  setSelectOptions(
+    'g-model',
+    models.map(m => ({value:m.name,label:m.description ? `${m.name} - ${m.description}` : m.name})),
+    selected,
+    models.length ? null : '使用默认模型'
+  );
+  applyModelOptions();
+}
+function applyModelOptions(){
+  const kind=document.getElementById('g-kind').value;
+  const model=selectedModel(kind);
+  const desc=document.getElementById('g-model-desc');
+  if(model) {
+    desc.textContent = model.description || '';
+    setSelectOptions('g-ratio', valueOptions(model.ratios), defaultRatio(kind), model.ratios?.length ? null : '默认比例');
+    setSelectOptions('g-res', valueOptions(model.resolutions), defaultResolution(kind), model.resolutions?.length ? null : '默认分辨率');
+  } else {
+    desc.textContent = capabilityModels(kind).length ? '' : '模型能力未加载，可在设置页刷新模型能力。';
+    setSelectOptions('g-ratio', valueOptions([defaultRatio(kind)]), defaultRatio(kind), '默认比例');
+    setSelectOptions('g-res', valueOptions([defaultResolution(kind)]), defaultResolution(kind), '默认分辨率');
+  }
+  if(kind === 'video') {
+    setSelectOptions('g-dur', valueOptions(model?.durations || [state.settings.oreate?.default_video_duration]), state.settings.oreate?.default_video_duration || '', model?.durations?.length ? null : '默认时长');
+    setSelectOptions(
+      'g-scene',
+      capabilityScenes().map(s => ({value:s.scene_id,label:s.name ? `${s.name} - ${s.scene_id}` : s.scene_id})),
+      state.settings.oreate?.default_video_scene || '',
+      capabilityScenes().length ? null : '默认场景'
+    );
+  } else {
+    setSelectOptions('g-dur', [], '', '默认时长');
+    setSelectOptions('g-scene', [], '', '默认场景');
+  }
+}
+async function gatewayGenerate(){
+  const payload={
     kind: document.getElementById('g-kind').value,
     prompt: document.getElementById('g-prompt').value,
-    model_name: document.getElementById('g-model').value || null,
-    ratio: document.getElementById('g-ratio').value || null,
-    resolution: document.getElementById('g-res').value || null,
-    duration: document.getElementById('g-dur').value ? Number(document.getElementById('g-dur').value) : null,
-    scene_id: document.getElementById('g-scene').value || null,
-    account_id: document.getElementById('g-account').value ? Number(document.getElementById('g-account').value) : null,
+    model_name: document.getElementById('g-model').value||null,
+    ratio: document.getElementById('g-ratio').value||null,
+    resolution: document.getElementById('g-res').value||null,
+    duration: document.getElementById('g-dur').value?Number(document.getElementById('g-dur').value):null,
+    scene_id: document.getElementById('g-scene').value||null,
+    account_id: document.getElementById('g-account').value?Number(document.getElementById('g-account').value):null,
   };
-  document.getElementById('g-result').textContent = '提交中...';
-  // Use internal admin endpoint (no API key needed)
-  const r = await api('POST','/api/media/generate',payload);
-  document.getElementById('g-result').textContent = JSON.stringify(r, null, 2);
+  document.getElementById('g-result').textContent='提交中...';
+  const r=await api('POST','/api/media/generate',payload);
+  document.getElementById('g-result').textContent=JSON.stringify(r,null,2);
   await loadTasks();
 }
 
-// Tasks
-async function loadTasks() {
-  const r = await api('GET','/api/tasks');
-  state.tasks = r.items || [];
-  renderTasks();
-  updateStats();
-}
-
-function renderTasks() {
-  const tbody = document.getElementById('tasks-tbody');
-  tbody.innerHTML = state.tasks.slice(0,50).map(t => {
-    const sClass = t.status==='created'?'tag-blue':t.status==='completed'?'tag-green':'tag-gray';
-    return `<tr>
-      <td>${t.id}</td>
-      <td>${t.kind}</td>
-      <td>${t.account_id||'-'}</td>
-      <td><span class="tag ${sClass}">${t.status}</span></td>
-      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${(t.prompt||'').substring(0,40)}</td>
-      <td style="font-family:monospace;font-size:11px">${(t.chat_id||'').substring(0,12)}</td>
-      <td>${new Date((t.created_at||0)*1000).toLocaleString()}</td>
-    </tr>`;
+// === Tasks ===
+async function loadTasks(){const r=await api('GET','/api/tasks');state.tasks=r.items||[];renderTasks();updateStats();}
+function renderTasks(){
+  document.getElementById('tasks-tbody').innerHTML = state.tasks.slice(0,50).map(t => {
+    const sc=t.status==='created'?'tag-blue':t.status==='completed'?'tag-green':'tag-gray';
+    return `<tr><td>${t.id}</td><td><span class="tag ${t.kind==='image'?'tag-blue':'tag-green'}">${t.kind}</span></td><td>${t.account_id||'-'}</td><td><span class="tag ${sc}">${t.status}</span></td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${(t.prompt||'').substring(0,40)}</td><td style="font-family:monospace;font-size:11px">${(t.chat_id||'').substring(0,12)}</td><td style="font-size:11px">${new Date((t.created_at||0)*1000).toLocaleString()}</td></tr>`;
   }).join('');
 }
 
-// API Keys
-async function loadApiKeys() {
-  const r = await api('GET','/api/admin/apikeys');
-  state.apikeys = r.items || [];
-  renderApiKeys();
-  updateStats();
-}
-
-function renderApiKeys() {
-  const tbody = document.getElementById('apikeys-tbody');
-  tbody.innerHTML = state.apikeys.map(k => {
-    const keyShort = (k.key||'').substring(0,20)+'...';
-    return `<tr>
-      <td>${k.id}</td>
-      <td style="font-family:monospace;font-size:11px" title="${k.key}">${keyShort} <button class="copy-btn" onclick="navigator.clipboard.writeText('${k.key}')">复制</button></td>
-      <td>${k.name||'-'}</td>
-      <td><span class="tag ${k.enabled?'tag-green':'tag-gray'}">${k.enabled?'启用':'停用'}</span></td>
-      <td>${new Date((k.created_at||0)*1000).toLocaleString()}</td>
-      <td>${k.last_used_at?new Date(k.last_used_at*1000).toLocaleString():'-'}</td>
-      <td><button class="btn-sm btn-danger" onclick="deleteKey(${k.id})">删除</button></td>
-    </tr>`;
+// === API Keys ===
+async function loadApiKeys(){const r=await api('GET','/api/admin/apikeys');state.apikeys=r.items||[];renderApiKeys();updateStats();}
+function renderApiKeys(){
+  document.getElementById('apikeys-tbody').innerHTML = state.apikeys.map(k => {
+    const kp=k.key_preview||'';
+    return `<tr><td>${k.id}</td><td style="font-family:monospace;font-size:11px">${kp}</td><td>${k.name||'-'}</td><td><span class="tag ${k.enabled?'tag-green':'tag-gray'}">${k.enabled?'启用':'停用'}</span></td><td><input id="ak-rate-${k.id}" data-field="rate_limit_per_minute" value="${k.rate_limit_per_minute||''}" style="width:84px"></td><td><input id="ak-req-${k.id}" data-field="daily_request_limit" value="${k.daily_request_limit||''}" style="width:84px"></td><td><input id="ak-point-${k.id}" data-field="daily_point_limit" value="${k.daily_point_limit||''}" style="width:84px"></td><td style="font-size:11px">${new Date((k.created_at||0)*1000).toLocaleString()}</td><td style="font-size:11px">${k.last_used_at?new Date(k.last_used_at*1000).toLocaleString():'-'}</td><td><button class="btn-sm btn-secondary" onclick="updateApiKeyPolicy(${k.id})">保存</button> <button class="btn-sm btn-danger" onclick="deleteKey(${k.id})">删除</button></td></tr>`;
   }).join('');
 }
-
-async function createApiKey() {
-  const name = document.getElementById('ak-name').value;
-  const r = await api('POST','/api/admin/apikeys?name='+encodeURIComponent(name));
-  if (r.item) {
-    const el = document.getElementById('ak-new');
-    el.classList.remove('hidden');
-    document.getElementById('ak-new-value').textContent = r.item.key;
+async function createApiKey(){
+  const name=document.getElementById('ak-name').value;
+  const r=await api('POST','/api/admin/apikeys',{name:name});
+  if(r.item){
+    document.getElementById('ak-new').classList.remove('hidden');
+    document.getElementById('ak-new-value').textContent=r.item.key;
     await loadApiKeys();
-  }
+  } else alert('创建失败: '+JSON.stringify(r));
 }
-
-function copyKey() {
-  const val = document.getElementById('ak-new-value').textContent;
-  navigator.clipboard.writeText(val);
-  alert('已复制');
-}
-
-async function deleteKey(id) {
-  if (!confirm('确认删除此 API Key？')) return;
-  await api('DELETE','/api/admin/apikeys/'+id);
+function copyKey(){const v=document.getElementById('ak-new-value').textContent;copyText(v);alert('已复制');}
+async function updateApiKeyPolicy(id){
+  const body={
+    rate_limit_per_minute:document.getElementById('ak-rate-'+id).value || null,
+    daily_request_limit:document.getElementById('ak-req-'+id).value || null,
+    daily_point_limit:document.getElementById('ak-point-'+id).value || null,
+  };
+  await api('PATCH','/api/admin/apikeys/'+id,body);
   await loadApiKeys();
 }
+async function deleteKey(id){if(!confirm('确认删除此 API Key？')) return; await api('DELETE','/api/admin/apikeys/'+id);await loadApiKeys();}
 
-// Usage
-async function loadUsage() {
-  const r = await api('GET','/api/admin/usage');
-  state.usage = r.items || [];
-  renderUsage();
-}
-
-function renderUsage() {
-  const tbody = document.getElementById('usage-tbody');
-  tbody.innerHTML = state.usage.slice(0,50).map(u => {
-    return `<tr>
-      <td>${u.id}</td>
-      <td><span class="tag ${u.kind==='image'?'tag-blue':'tag-green'}">${u.kind}</span></td>
-      <td>${u.account_email||u.account_id||'-'}</td>
-      <td>${u.status}</td>
-      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${(u.prompt||'').substring(0,40)}</td>
-      <td>${new Date((u.created_at||0)*1000).toLocaleString()}</td>
-    </tr>`;
+// === Usage ===
+async function loadUsage(){const r=await api('GET','/api/admin/usage');state.usage=r.items||[];renderUsage();}
+function renderUsage(){
+  document.getElementById('usage-tbody').innerHTML = state.usage.slice(0,50).map(u => {
+    return `<tr><td>${u.id}</td><td><span class="tag ${u.kind==='image'?'tag-blue':'tag-green'}">${u.kind}</span></td><td>${u.account_email||u.account_id||'-'}</td><td>${u.model_name||'-'}</td><td>${u.estimated_point_cost ?? '-'}</td><td>${u.error_code||'-'}</td><td>${u.status}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${(u.prompt||'').substring(0,40)}</td><td style="font-size:11px">${new Date((u.created_at||0)*1000).toLocaleString()}</td></tr>`;
   }).join('');
 }
 
-// Settings
-async function loadSettings() {
-  state.settings = await api('GET','/api/admin/settings');
-  document.getElementById('settings-raw').textContent = JSON.stringify(state.settings, null, 2);
-  renderSettings();
+// === Settings ===
+async function loadSettings(){
+  state.settings=await api('GET','/api/admin/settings');
+  const s=state.settings;
+  document.getElementById('s-port').value=s.server?.port||8894;
+  document.getElementById('s-base').value=s.oreate?.base_url||'';
+  document.getElementById('s-img-model').value=s.oreate?.default_image_model||'';
+  document.getElementById('s-vid-model').value=s.oreate?.default_video_model||'';
+  document.getElementById('s-min').value=s.pool?.min_accounts||3;
+  document.getElementById('s-target').value=s.pool?.maintain_target||5;
+  document.getElementById('s-mail-url').value=s.mail?.base_url||'';
+  document.getElementById('s-mail-key').value='';
+  document.getElementById('s-mail-key').placeholder=s.mail?.api_key==='__redacted__'?'留空不修改':'mail api key';
+  document.getElementById('s-mail-domains').value=(s.mail?.preferred_domains||[]).join(',');
+  document.getElementById('cred-user').value=s.server?.admin_username||'';
+  document.getElementById('settings-raw').textContent=JSON.stringify(s,null,2);
 }
-
-function renderSettings() {
-  const s = state.settings;
-  document.getElementById('settings-form').innerHTML = `
-    <div class="row">
-      <div class="col"><label>服务端口</label><input id="s-port" value="${s.server?.port||8890}"></div>
-      <div class="col"><label>管理员密码</label><input id="s-admin-pwd" placeholder="留空不修改"></div>
-      <div class="col"><label>API基础URL</label><input id="s-base" value="${s.oreate?.base_url||''}"></div>
-    </div>
-    <div class="row" style="margin-top:12px">
-      <div class="col"><label>默认图片模型</label><input id="s-img-model" value="${s.oreate?.default_image_model||''}"></div>
-      <div class="col"><label>默认视频模型</label><input id="s-vid-model" value="${s.oreate?.default_video_model||''}"></div>
-      <div class="col"><label>号池最低数</label><input id="s-min" value="${s.pool?.min_accounts||3}"></div>
-    </div>
-  `;
-}
-
-async function saveSettings() {
-  const body = {
-    server: { port: Number(document.getElementById('s-port').value) },
-    oreate: {
-      base_url: document.getElementById('s-base').value,
-      default_image_model: document.getElementById('s-img-model').value,
-      default_video_model: document.getElementById('s-vid-model').value,
+async function saveSettings(){
+  const doms = document.getElementById('s-mail-domains').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const body={
+    server:{port:Number(document.getElementById('s-port').value)},
+    oreate:{
+      base_url:document.getElementById('s-base').value,
+      default_image_model:document.getElementById('s-img-model').value,
+      default_video_model:document.getElementById('s-vid-model').value,
     },
-    pool: { min_accounts: Number(document.getElementById('s-min').value) },
+    mail:{
+      base_url:document.getElementById('s-mail-url').value,
+      preferred_domains:doms,
+    },
+    pool:{
+      min_accounts:Number(document.getElementById('s-min').value),
+      maintain_target:Number(document.getElementById('s-target').value),
+    },
   };
-  const pwd = document.getElementById('s-admin-pwd').value;
-  if (pwd) body.server.admin_password = pwd;
-  const r = await api('PUT','/api/admin/settings', body);
-  if (r.ok) { await loadSettings(); alert('✅ 已保存'); }
+  const mailKey=document.getElementById('s-mail-key').value;
+  if(mailKey) body.mail.api_key=mailKey;
+  const r=await api('PUT','/api/admin/settings',body);
+  if(r.ok){await loadSettings();alert('✅ 已保存');} else alert('❌ 保存失败');
 }
-
-function updateStats() {
-  const accounts = state.accounts || [];
-  document.getElementById('st-total').textContent = accounts.length;
-  document.getElementById('st-verified').textContent = accounts.filter(a=>a.status==='verified').length;
-  document.getElementById('st-tasks').textContent = (state.tasks||[]).length;
-  document.getElementById('st-apikeys').textContent = (state.apikeys||[]).length;
+async function changeCredentials(){
+  const body={
+    current_password:document.getElementById('cred-current').value,
+    new_username:document.getElementById('cred-user').value,
+    new_password:document.getElementById('cred-pass').value,
+    confirm_password:document.getElementById('cred-confirm').value,
+  };
+  if(!body.current_password || !body.new_username || !body.new_password || !body.confirm_password){
+    alert('请填写当前密码、新用户名、新密码和确认密码');
+    return;
+  }
+  const r=await api('POST','/api/admin/credentials',body);
+  if(r.ok){
+    document.getElementById('cred-current').value='';
+    document.getElementById('cred-pass').value='';
+    document.getElementById('cred-confirm').value='';
+    adminToken='';
+    localStorage.removeItem('oreate_admin_token');
+    document.getElementById('login-user').value=body.new_username;
+    showLogin('账号密码已修改，请重新登录');
+  }
 }
-
+function updateStats(){
+  const a=state.accounts||[];
+  document.getElementById('st-total').textContent=a.length;
+  document.getElementById('st-verified').textContent=a.filter(x=>x.status==='verified').length;
+  document.getElementById('st-tasks').textContent=(state.tasks||[]).length;
+  document.getElementById('st-apikeys').textContent=(state.apikeys||[]).length;
+}
 init();
 </script>
 </body>

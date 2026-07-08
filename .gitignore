@@ -18,9 +18,18 @@ accounts.db
 # Generated files
 banti_raw.js
 banti_*.js
+banti_python.py
+check_rotation.py
+debanti*.js
+debanti*.py
 *_decoded*.js
 *_readable*.js
 oqjk_*.txt
+oreate_auth_chunks.txt
+capture_mailbox.json
+last_mailbox.json
+ui_mailbox.json
+oreateai.db
 banti_stringtable.js
 banti_strings.json
 banti_sdk_source.js
@@ -28,8 +37,6 @@ banti_sdk_final.js
 
 # Test scripts
 test_*.py
-debanti_*.js
-debanti_*.py
 decode_*.py
 run_oqjk*.js
 
