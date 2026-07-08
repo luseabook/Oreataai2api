@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# Config (contains API keys)
+config.json
+
+# Database
+accounts.db
+
+# Generated files
+banti_raw.js
+banti_*.js
+*_decoded*.js
+*_readable*.js
+oqjk_*.txt
+banti_stringtable.js
+banti_strings.json
+banti_sdk_source.js
+banti_sdk_final.js
+
+# Test scripts
+test_*.py
+debanti_*.js
+debanti_*.py
+decode_*.py
+run_oqjk*.js
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
