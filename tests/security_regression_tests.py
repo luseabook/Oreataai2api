@@ -12,6 +12,8 @@ from fastapi.testclient import TestClient
 
 import server
 
+TEST_ENCRYPTION_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
 
 class SecurityRegressionTests(unittest.TestCase):
     def setUp(self):
@@ -29,7 +31,12 @@ class SecurityRegressionTests(unittest.TestCase):
             server.deep_merge(
                 base_cfg,
                 {
-                    "server": {"host": "127.0.0.1", "admin_username": "admin", "admin_password": "test-admin-password"},
+                    "server": {
+                        "host": "127.0.0.1",
+                        "admin_username": "admin",
+                        "admin_password": "test-admin-password",
+                        "encryption_key": TEST_ENCRYPTION_KEY,
+                    },
                     "gateway": {"enable_background_worker": False},
                 },
             ),
@@ -95,6 +102,93 @@ class SecurityRegressionTests(unittest.TestCase):
         account_id = conn.execute("SELECT id FROM accounts").fetchone()[0]
         conn.close()
         return account_id
+
+    def test_account_sensitive_fields_are_encrypted_at_rest(self):
+        server.save_account(
+            "secure@example.com",
+            "plain-password",
+            server.OreateSession(
+                email="secure@example.com",
+                password="plain-password",
+                cookies={"OUID": "ouid-secret", "ouss": "ouss-secret"},
+            ),
+            model_info={},
+            video_info={},
+            status="verified",
+            source="manual",
+        )
+
+        conn = server.db_conn()
+        row = conn.execute("SELECT password,ouid,ouss FROM accounts WHERE email=?", ("secure@example.com",)).fetchone()
+        conn.close()
+
+        self.assertIsNotNone(row)
+        self.assertNotEqual(row["password"], "plain-password")
+        self.assertNotEqual(row["ouid"], "ouid-secret")
+        self.assertNotEqual(row["ouss"], "ouss-secret")
+
+    def test_plaintext_account_secrets_are_migrated_when_encryption_is_available(self):
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute(
+            """
+            INSERT INTO accounts(email,password,status,source,ouid,ouss,model_info_json,video_info_json,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "legacy@example.com",
+                "legacy-password",
+                "verified",
+                "manual",
+                "legacy-ouid",
+                "legacy-ouss",
+                "{}",
+                "{}",
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        server.init_db()
+
+        conn = server.db_conn()
+        row = conn.execute("SELECT * FROM accounts WHERE email=?", ("legacy@example.com",)).fetchone()
+        conn.close()
+
+        self.assertIsNotNone(row)
+        self.assertNotEqual(row["password"], "legacy-password")
+        self.assertNotEqual(row["ouid"], "legacy-ouid")
+        self.assertNotEqual(row["ouss"], "legacy-ouss")
+
+        session = server.CLIENT.session_from_account(row)
+        self.assertEqual(session.cookies.get("OUID"), "legacy-ouid")
+        self.assertEqual(session.cookies.get("ouss"), "legacy-ouss")
+
+    def test_admin_backup_database_does_not_contain_plaintext_account_secrets(self):
+        server.save_account(
+            "backup-safe@example.com",
+            "plain-password",
+            server.OreateSession(
+                email="backup-safe@example.com",
+                password="plain-password",
+                cookies={"OUID": "backup-ouid", "ouss": "backup-ouss"},
+            ),
+            model_info={},
+            video_info={},
+            status="verified",
+            source="manual",
+        )
+
+        response = self.client.get("/api/admin/backup", headers=self.admin_headers())
+
+        self.assertEqual(response.status_code, 200)
+        archive = zipfile.ZipFile(io.BytesIO(response.content))
+        db_bytes = archive.read("accounts.db")
+        self.assertNotIn(b"plain-password", db_bytes)
+        self.assertNotIn(b"backup-ouid", db_bytes)
+        self.assertNotIn(b"backup-ouss", db_bytes)
 
     def sample_image_info(self):
         return {

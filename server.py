@@ -22,6 +22,7 @@ import requests
 import re
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -33,6 +34,19 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 DB_PATH = BASE_DIR / "accounts.db"
 SECRET_PLACEHOLDER = "__redacted__"
+ENCRYPTED_SECRET_PREFIX = "enc:v1:"
+ACCOUNT_SECRET_FIELDS = ("password", "ouid", "ouss")
+API_KEY_SCOPE_LIST_FIELDS = (
+    "allowed_kinds",
+    "allowed_models",
+    "allowed_scenes",
+    "allowed_resolutions",
+    "allowed_durations",
+)
+API_KEY_SCOPE_BOOL_DEFAULTS = {
+    "allow_uploads": True,
+    "allow_experimental": True,
+}
 UNSAFE_ADMIN_PASSWORDS = {"", "admin123", "CHANGE_ME", "changeme", "password"}
 
 DEFAULT_CONFIG = {
@@ -41,6 +55,7 @@ DEFAULT_CONFIG = {
         "port": 8890,
         "admin_username": "admin",
         "admin_password": "",
+        "encryption_key": "",
         "admin_session_ttl_hours": 12,
     },
     "oreate": {
@@ -140,6 +155,61 @@ def save_config(cfg: Dict[str, Any]) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def active_encryption_key() -> str:
+    env_key = str(os.environ.get("OREATE_ENCRYPTION_KEY") or "").strip()
+    if env_key:
+        return env_key
+    server_cfg = CFG.get("server", {}) if isinstance(CFG.get("server", {}), dict) else {}
+    return str(server_cfg.get("encryption_key") or "").strip()
+
+
+def secret_fernet(required: bool = False) -> Optional[Fernet]:
+    key = active_encryption_key()
+    if not key:
+        if required:
+            raise RuntimeError("server encryption key is not configured")
+        return None
+    try:
+        return Fernet(key.encode("utf-8"))
+    except Exception as exc:
+        if required:
+            raise RuntimeError("server encryption key is invalid") from exc
+        return None
+
+
+def is_encrypted_secret(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith(ENCRYPTED_SECRET_PREFIX)
+
+
+def encrypt_secret_value(value: Any) -> str:
+    raw = "" if value in (None, "") else str(value)
+    if raw == "":
+        return ""
+    if is_encrypted_secret(raw):
+        return raw
+    cipher = secret_fernet(required=True)
+    token = cipher.encrypt(raw.encode("utf-8")).decode("utf-8")
+    return f"{ENCRYPTED_SECRET_PREFIX}{token}"
+
+
+def decrypt_secret_value(value: Any, required: bool = False) -> str:
+    raw = "" if value in (None, "") else str(value)
+    if raw == "":
+        return ""
+    if not is_encrypted_secret(raw):
+        return raw
+    cipher = secret_fernet(required=required)
+    if not cipher:
+        return ""
+    token = raw[len(ENCRYPTED_SECRET_PREFIX) :]
+    try:
+        return cipher.decrypt(token.encode("utf-8")).decode("utf-8")
+    except (InvalidToken, ValueError) as exc:
+        if required:
+            raise RuntimeError("server encryption key cannot decrypt stored account secrets") from exc
+        return ""
+
+
 def gateway_cfg() -> Dict[str, Any]:
     return CFG.get("gateway", {}) if isinstance(CFG.get("gateway", {}), dict) else {}
 
@@ -212,6 +282,8 @@ def public_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     out = json.loads(json.dumps(cfg))
     if out.get("server", {}).get("admin_password"):
         out["server"]["admin_password"] = SECRET_PLACEHOLDER
+    if out.get("server", {}).get("encryption_key"):
+        out["server"]["encryption_key"] = SECRET_PLACEHOLDER
     if out.get("mail", {}).get("api_key"):
         out["mail"]["api_key"] = SECRET_PLACEHOLDER
     return out
@@ -223,6 +295,7 @@ def clean_settings_update(data: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(server_cfg, dict):
         server_cfg.pop("admin_username", None)
         server_cfg.pop("admin_password", None)
+        server_cfg.pop("encryption_key", None)
     mail_cfg = out.get("mail")
     if isinstance(mail_cfg, dict) and mail_cfg.get("api_key") in (None, "", SECRET_PLACEHOLDER):
         mail_cfg.pop("api_key", None)
@@ -231,8 +304,8 @@ def clean_settings_update(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def public_account(row: sqlite3.Row) -> Dict[str, Any]:
     item = dict(row)
-    item["has_password"] = bool(item.get("password"))
-    item["ouid_preview"] = (item.get("ouid") or "")[:12]
+    item["has_password"] = bool(decrypt_secret_value(item.get("password")))
+    item["ouid_preview"] = decrypt_secret_value(item.get("ouid"))[:12]
     for key in ("password", "ouid", "ouss", "model_info_json", "video_info_json", "point_balance_json"):
         item.pop(key, None)
     now = time.time()
@@ -253,6 +326,16 @@ def public_api_key(row: sqlite3.Row, reveal: bool = False) -> Dict[str, Any]:
     if item.get("client_name") is None and item.get("client_id") is not None:
         item["client_name"] = ""
     item["client_name"] = item.get("client_name") or ""
+    for field in API_KEY_SCOPE_LIST_FIELDS:
+        value = json_value_from_db(item.get(field))
+        if field == "allowed_durations":
+            values = [int_or_default(v, 0) for v in value] if isinstance(value, list) else []
+            item[field] = [v for v in values if v > 0]
+        else:
+            values = [str(v).strip() for v in value] if isinstance(value, list) else []
+            item[field] = [v for v in values if v]
+    item["allow_uploads"] = bool(item.get("allow_uploads")) if item.get("allow_uploads") is not None else API_KEY_SCOPE_BOOL_DEFAULTS["allow_uploads"]
+    item["allow_experimental"] = bool(item.get("allow_experimental")) if item.get("allow_experimental") is not None else API_KEY_SCOPE_BOOL_DEFAULTS["allow_experimental"]
     if not reveal:
         item.pop("key", None)
     return item
@@ -846,6 +929,84 @@ def json_value_from_db(raw: Optional[str]) -> Any:
         return None
 
 
+def parse_boolean_flag(value: Any, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+    raise HTTPException(400, f"{field} must be a boolean")
+
+
+def normalize_string_scope_values(value: Any, field: str) -> List[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        parts = re.split(r"[\r\n,]", value)
+    elif isinstance(value, (list, tuple, set)):
+        parts = list(value)
+    else:
+        raise HTTPException(400, f"{field} must be a list or comma-separated string")
+    out: List[str] = []
+    for item in parts:
+        text = str(item).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def normalize_int_scope_values(value: Any, field: str) -> List[int]:
+    items = normalize_string_scope_values(value, field) if isinstance(value, str) else (list(value) if isinstance(value, (list, tuple, set)) else ([] if value in (None, "") else None))
+    if items is None:
+        raise HTTPException(400, f"{field} must be a list or comma-separated string")
+    out: List[int] = []
+    for item in items:
+        try:
+            number = int(item)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"{field} must contain integers")
+        if number > 0 and number not in out:
+            out.append(number)
+    return out
+
+
+def encode_scope_values(values: List[Any]) -> Optional[str]:
+    return json.dumps(values, ensure_ascii=False) if values else None
+
+
+def scope_values_from_db(raw: Any, field: str) -> List[Any]:
+    values = json_value_from_db(raw) if isinstance(raw, str) else raw
+    if not isinstance(values, list):
+        return []
+    if field == "allowed_durations":
+        return [v for v in (int_or_default(item, 0) for item in values) if v > 0]
+    return [text for text in (str(item).strip() for item in values) if text]
+
+
+def migrate_plaintext_account_secrets(conn: sqlite3.Connection) -> None:
+    if not active_encryption_key():
+        return
+    rows = conn.execute("SELECT id,password,ouid,ouss FROM accounts").fetchall()
+    for row in rows:
+        updates: Dict[str, Any] = {}
+        for field in ACCOUNT_SECRET_FIELDS:
+            raw = row[field]
+            if raw not in (None, "") and not is_encrypted_secret(raw):
+                updates[field] = encrypt_secret_value(raw)
+        if updates:
+            updates["updated_at"] = time.time()
+            set_clause = ", ".join(f"{name}=?" for name in updates.keys())
+            conn.execute(
+                f"UPDATE accounts SET {set_clause} WHERE id=?",
+                tuple(updates.values()) + (row["id"],),
+            )
+
+
 def capabilities_from_account(account: sqlite3.Row) -> Dict[str, Any]:
     return normalize_capabilities(json_from_db(account["model_info_json"]), json_from_db(account["video_info_json"]))
 
@@ -1428,13 +1589,68 @@ def get_api_key_record(api_key_id: int) -> sqlite3.Row:
     return row
 
 
-def resolve_api_key_policy(row: sqlite3.Row) -> Dict[str, int]:
+def resolve_api_key_policy(row: sqlite3.Row) -> Dict[str, Any]:
     gateway_cfg = CFG.get("gateway", {})
     return {
         "rate_limit_per_minute": int(row["rate_limit_per_minute"] or gateway_cfg.get("default_rate_limit_per_minute") or 0),
         "daily_request_limit": int(row["daily_request_limit"] or gateway_cfg.get("default_daily_request_limit") or 0),
         "daily_point_limit": int(row["daily_point_limit"] or gateway_cfg.get("default_daily_point_limit") or 0),
+        "allowed_kinds": scope_values_from_db(row["allowed_kinds"], "allowed_kinds"),
+        "allowed_models": scope_values_from_db(row["allowed_models"], "allowed_models"),
+        "allowed_scenes": scope_values_from_db(row["allowed_scenes"], "allowed_scenes"),
+        "allowed_resolutions": scope_values_from_db(row["allowed_resolutions"], "allowed_resolutions"),
+        "allowed_durations": scope_values_from_db(row["allowed_durations"], "allowed_durations"),
+        "allow_uploads": bool(row["allow_uploads"]) if row["allow_uploads"] is not None else API_KEY_SCOPE_BOOL_DEFAULTS["allow_uploads"],
+        "allow_experimental": bool(row["allow_experimental"]) if row["allow_experimental"] is not None else API_KEY_SCOPE_BOOL_DEFAULTS["allow_experimental"],
     }
+
+
+def request_uses_uploaded_media(options: Dict[str, Any]) -> bool:
+    for field in ("image", "first_frame", "last_frame", "motion_video", "character_image"):
+        if isinstance(options.get(field), dict) and options.get(field):
+            return True
+    for field in ("reference_images", "reference_videos"):
+        if isinstance(options.get(field), list) and options.get(field):
+            return True
+    return False
+
+
+def enforce_api_key_scope(policy: Dict[str, Any], kind: str, options: Dict[str, Any], caps: Dict[str, Any], request_id: str) -> None:
+    allowed_kinds = policy.get("allowed_kinds") or []
+    if allowed_kinds and kind not in allowed_kinds:
+        raise GatewayAPIError(403, "API_KEY_KIND_FORBIDDEN", "API key is not allowed to use this kind", {"field": "kind", "value": kind, "allowed": allowed_kinds}, request_id=request_id)
+
+    model_name = str(options.get("model_name") or "")
+    allowed_models = policy.get("allowed_models") or []
+    if allowed_models and model_name not in allowed_models:
+        raise GatewayAPIError(403, "API_KEY_MODEL_FORBIDDEN", "API key is not allowed to use this model", {"field": "model_name", "value": model_name, "allowed": allowed_models}, request_id=request_id)
+
+    resolution = str(options.get("resolution") or "")
+    allowed_resolutions = policy.get("allowed_resolutions") or []
+    if allowed_resolutions and resolution not in allowed_resolutions:
+        raise GatewayAPIError(403, "API_KEY_RESOLUTION_FORBIDDEN", "API key is not allowed to use this resolution", {"field": "resolution", "value": resolution, "allowed": allowed_resolutions}, request_id=request_id)
+
+    if not policy.get("allow_uploads", True) and request_uses_uploaded_media(options):
+        raise GatewayAPIError(403, "API_KEY_UPLOAD_FORBIDDEN", "API key is not allowed to use uploaded media", request_id=request_id)
+
+    model = find_capability_model(caps.get(kind, {}).get("models") or [], model_name)
+    scene = None
+    if kind == "video":
+        scene_id = str(options.get("scene_id") or CFG["oreate"]["default_video_scene"])
+        allowed_scenes = policy.get("allowed_scenes") or []
+        if allowed_scenes and scene_id not in allowed_scenes:
+            raise GatewayAPIError(403, "API_KEY_SCENE_FORBIDDEN", "API key is not allowed to use this scene", {"field": "scene_id", "value": scene_id, "allowed": allowed_scenes}, request_id=request_id)
+        allowed_durations = policy.get("allowed_durations") or []
+        duration = int_or_default(options.get("duration"), 0)
+        if allowed_durations and duration not in allowed_durations:
+            raise GatewayAPIError(403, "API_KEY_DURATION_FORBIDDEN", "API key is not allowed to use this duration", {"field": "duration", "value": duration, "allowed": allowed_durations}, request_id=request_id)
+        scene = find_capability_scene(caps.get("video", {}).get("scenes") or [], scene_id)
+
+    if not policy.get("allow_experimental", False):
+        if model and bool(model.get("experimental")):
+            raise GatewayAPIError(403, "API_KEY_EXPERIMENTAL_FORBIDDEN", "API key is not allowed to use experimental models", {"field": "model_name", "value": model_name}, request_id=request_id)
+        if scene and bool(scene.get("experimental")):
+            raise GatewayAPIError(403, "API_KEY_EXPERIMENTAL_FORBIDDEN", "API key is not allowed to use experimental scenes", {"field": "scene_id", "value": scene.get("scene_id")}, request_id=request_id)
 
 
 def check_rate_limit(api_key_id: int, policy: Dict[str, int], now: float, request_id: str) -> None:
@@ -1732,6 +1948,13 @@ def init_db():
             key TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL DEFAULT '',
             enabled INTEGER NOT NULL DEFAULT 1,
+            allowed_kinds TEXT,
+            allowed_models TEXT,
+            allowed_scenes TEXT,
+            allow_uploads INTEGER NOT NULL DEFAULT 1,
+            allow_experimental INTEGER NOT NULL DEFAULT 1,
+            allowed_resolutions TEXT,
+            allowed_durations TEXT,
             deleted_at REAL,
             disabled_reason TEXT,
             created_at REAL NOT NULL,
@@ -1823,6 +2046,13 @@ def init_db():
     add_column_if_missing(conn, "api_keys", "daily_request_limit", "INTEGER")
     add_column_if_missing(conn, "api_keys", "daily_point_limit", "INTEGER")
     add_column_if_missing(conn, "api_keys", "client_id", "INTEGER")
+    add_column_if_missing(conn, "api_keys", "allowed_kinds", "TEXT")
+    add_column_if_missing(conn, "api_keys", "allowed_models", "TEXT")
+    add_column_if_missing(conn, "api_keys", "allowed_scenes", "TEXT")
+    add_column_if_missing(conn, "api_keys", "allow_uploads", "INTEGER NOT NULL DEFAULT 1")
+    add_column_if_missing(conn, "api_keys", "allow_experimental", "INTEGER NOT NULL DEFAULT 1")
+    add_column_if_missing(conn, "api_keys", "allowed_resolutions", "TEXT")
+    add_column_if_missing(conn, "api_keys", "allowed_durations", "TEXT")
     add_column_if_missing(conn, "api_keys", "deleted_at", "REAL")
     add_column_if_missing(conn, "api_keys", "disabled_reason", "TEXT")
     add_column_if_missing(conn, "clients", "contact", "TEXT NOT NULL DEFAULT ''")
@@ -1893,6 +2123,7 @@ def init_db():
           AND next_attempt_at IS NULL
         """
     )
+    migrate_plaintext_account_secrets(conn)
     conn.commit()
     conn.close()
 
@@ -2295,10 +2526,12 @@ class OreateClient:
 
     def session_from_account(self, account: sqlite3.Row) -> requests.Session:
         s = self.new_session()
-        if account["ouid"]:
-            self._set_cookie_unique(s, "OUID", account["ouid"])
-        if account["ouss"]:
-            self._set_cookie_unique(s, "ouss", account["ouss"])
+        ouid = decrypt_secret_value(account["ouid"], required=True)
+        ouss = decrypt_secret_value(account["ouss"], required=True)
+        if ouid:
+            self._set_cookie_unique(s, "OUID", ouid)
+        if ouss:
+            self._set_cookie_unique(s, "ouss", ouss)
         return s
 
     def session_from_cookie_dict(self, cookies: Dict[str, str]) -> requests.Session:
@@ -2692,6 +2925,9 @@ MAIL = YydsClient()
 
 def save_account(email: str, password: str, session: OreateSession, model_info=None, video_info=None, status="verified", source="auto") -> int:
     now = time.time()
+    encrypted_password = encrypt_secret_value(password)
+    encrypted_ouid = encrypt_secret_value(session.cookies.get("OUID", ""))
+    encrypted_ouss = encrypt_secret_value(session.cookies.get("ouss", ""))
     conn = db_conn()
     conn.execute(
         """
@@ -2709,11 +2945,11 @@ def save_account(email: str, password: str, session: OreateSession, model_info=N
         """,
         (
             email,
-            password,
+            encrypted_password,
             status,
             source,
-            session.cookies.get("OUID", ""),
-            session.cookies.get("ouss", ""),
+            encrypted_ouid,
+            encrypted_ouss,
             json.dumps(model_info, ensure_ascii=False) if model_info else None,
             json.dumps(video_info, ensure_ascii=False) if video_info else None,
             None,
@@ -3537,11 +3773,65 @@ def capability_response_from_account(account: sqlite3.Row) -> Dict[str, Any]:
     return {"ok": True, "source_account_id": account["id"], **caps}
 
 
-def load_capabilities_from_pool() -> Dict[str, Any]:
+def filter_capabilities_for_api_key(caps: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
+    out = json.loads(json.dumps(caps))
+    allowed_kinds = policy.get("allowed_kinds") or []
+    allowed_models = policy.get("allowed_models") or []
+    allowed_scenes = policy.get("allowed_scenes") or []
+    allowed_resolutions = policy.get("allowed_resolutions") or []
+    allowed_durations = policy.get("allowed_durations") or []
+    allow_experimental = bool(policy.get("allow_experimental", False))
+
+    def filter_models(kind: str) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for model in out.get(kind, {}).get("models") or []:
+            if allowed_models and model.get("name") not in allowed_models:
+                continue
+            if not allow_experimental and bool(model.get("experimental")):
+                continue
+            filtered = dict(model)
+            if allowed_resolutions:
+                filtered["resolutions"] = [value for value in filtered.get("resolutions") or [] if value in allowed_resolutions]
+                if (model.get("resolutions") or []) and not filtered["resolutions"]:
+                    continue
+            if kind == "video" and allowed_durations:
+                filtered["durations"] = [value for value in filtered.get("durations") or [] if value in allowed_durations]
+                if (model.get("durations") or []) and not filtered["durations"]:
+                    continue
+            items.append(filtered)
+        return items
+
+    if allowed_kinds and "image" not in allowed_kinds:
+        out.setdefault("image", {})["models"] = []
+    else:
+        out.setdefault("image", {})["models"] = filter_models("image")
+
+    if allowed_kinds and "video" not in allowed_kinds:
+        out.setdefault("video", {})["models"] = []
+        out.setdefault("video", {})["scenes"] = []
+    else:
+        out.setdefault("video", {})["models"] = filter_models("video")
+        scenes: List[Dict[str, Any]] = []
+        for scene in out.get("video", {}).get("scenes") or []:
+            if allowed_scenes and scene.get("scene_id") not in allowed_scenes:
+                continue
+            if not allow_experimental and bool(scene.get("experimental")):
+                continue
+            scenes.append(scene)
+        out.setdefault("video", {})["scenes"] = scenes
+    return out
+
+
+def load_capabilities_from_pool(api_key_policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     account = pick_account_for_capabilities()
     if not account:
         raise HTTPException(503, "no account with model capabilities available")
-    return capability_response_from_account(account)
+    payload = capability_response_from_account(account)
+    if api_key_policy:
+        filtered = filter_capabilities_for_api_key({"image": payload.get("image", {}), "video": payload.get("video", {})}, api_key_policy)
+        payload["image"] = filtered.get("image", {})
+        payload["video"] = filtered.get("video", {})
+    return payload
 
 
 def refresh_capabilities_from_pool() -> Dict[str, Any]:
@@ -4191,6 +4481,34 @@ def get_client_record(client_id: int) -> sqlite3.Row:
     return row
 
 
+def api_key_scope_payload_values(payload: Dict[str, Any], current: Optional[sqlite3.Row] = None) -> Dict[str, Any]:
+    current_data = dict(current) if current is not None else {}
+
+    def list_value(field: str) -> Optional[str]:
+        if field not in payload:
+            return current_data.get(field)
+        if field == "allowed_durations":
+            return encode_scope_values(normalize_int_scope_values(payload.get(field), field))
+        return encode_scope_values(normalize_string_scope_values(payload.get(field), field))
+
+    def bool_value(field: str) -> int:
+        if field not in payload:
+            raw = current_data.get(field)
+            default = API_KEY_SCOPE_BOOL_DEFAULTS[field]
+            return int(bool(raw)) if raw is not None else int(default)
+        return int(parse_boolean_flag(payload.get(field), field))
+
+    return {
+        "allowed_kinds": list_value("allowed_kinds"),
+        "allowed_models": list_value("allowed_models"),
+        "allowed_scenes": list_value("allowed_scenes"),
+        "allowed_resolutions": list_value("allowed_resolutions"),
+        "allowed_durations": list_value("allowed_durations"),
+        "allow_uploads": bool_value("allow_uploads"),
+        "allow_experimental": bool_value("allow_experimental"),
+    }
+
+
 @app.get("/api/admin/apikeys")
 def list_api_keys(_=Depends(require_admin)):
     conn = db_conn()
@@ -4269,10 +4587,30 @@ def create_api_key(body: Dict[str, Any] = None, _=Depends(require_admin)):
             raise HTTPException(400, "client_id must be an integer")
         get_client_record(client_id_value)
     key = "oreate_" + secrets.token_hex(24)
+    scopes = api_key_scope_payload_values(payload)
     conn = db_conn()
     conn.execute(
-        "INSERT INTO api_keys (client_id, key, name, enabled, created_at) VALUES (?,?,?,?,?)",
-        (client_id_value, key, name, 1, time.time()),
+        """
+        INSERT INTO api_keys (
+            client_id, key, name, enabled, created_at,
+            allowed_kinds, allowed_models, allowed_scenes,
+            allow_uploads, allow_experimental, allowed_resolutions, allowed_durations
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            client_id_value,
+            key,
+            name,
+            1,
+            time.time(),
+            scopes["allowed_kinds"],
+            scopes["allowed_models"],
+            scopes["allowed_scenes"],
+            scopes["allow_uploads"],
+            scopes["allow_experimental"],
+            scopes["allowed_resolutions"],
+            scopes["allowed_durations"],
+        ),
     )
     conn.commit()
     row = conn.execute(
@@ -4300,7 +4638,7 @@ def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_a
         return value
 
     conn = db_conn()
-    current = conn.execute("SELECT client_id FROM api_keys WHERE id=?", (key_id,)).fetchone()
+    current = conn.execute("SELECT * FROM api_keys WHERE id=?", (key_id,)).fetchone()
     if not current:
         conn.close()
         raise HTTPException(404, "api key not found")
@@ -4315,10 +4653,13 @@ def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_a
             conn.close()
             raise HTTPException(400, "client_id must be an integer")
         get_client_record(client_id_value)
+    scopes = api_key_scope_payload_values(body or {}, current)
     conn.execute(
         """
         UPDATE api_keys
-        SET client_id=?, rate_limit_per_minute=?, daily_request_limit=?, daily_point_limit=?
+        SET client_id=?, rate_limit_per_minute=?, daily_request_limit=?, daily_point_limit=?,
+            allowed_kinds=?, allowed_models=?, allowed_scenes=?,
+            allow_uploads=?, allow_experimental=?, allowed_resolutions=?, allowed_durations=?
         WHERE id=?
         """,
         (
@@ -4326,6 +4667,13 @@ def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_a
             limit_value("rate_limit_per_minute"),
             limit_value("daily_request_limit"),
             limit_value("daily_point_limit"),
+            scopes["allowed_kinds"],
+            scopes["allowed_models"],
+            scopes["allowed_scenes"],
+            scopes["allow_uploads"],
+            scopes["allow_experimental"],
+            scopes["allowed_resolutions"],
+            scopes["allowed_durations"],
             key_id,
         ),
     )
@@ -4369,6 +4717,92 @@ def get_usage(_=Depends(require_admin)):
     ).fetchall()
     conn.close()
     return {"items": [dict(r) for r in rows]}
+
+
+def parse_report_date_boundary(value: Optional[str], end_of_day: bool = False) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "date must use YYYY-MM-DD")
+    if end_of_day:
+        dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return dt.timestamp()
+
+
+@app.get("/api/admin/cost-report")
+def get_cost_report(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    client_id: Optional[int] = None,
+    api_key_id: Optional[int] = None,
+    account_id: Optional[int] = None,
+    model_name: Optional[str] = None,
+    _=Depends(require_admin),
+):
+    where = ["1=1"]
+    params: List[Any] = []
+    start = parse_report_date_boundary(date_from, end_of_day=False)
+    end = parse_report_date_boundary(date_to, end_of_day=True)
+    if start is not None:
+        where.append("u.created_at>=?")
+        params.append(start)
+    if end is not None:
+        where.append("u.created_at<=?")
+        params.append(end)
+    if client_id is not None:
+        where.append("k.client_id=?")
+        params.append(client_id)
+    if api_key_id is not None:
+        where.append("u.api_key_id=?")
+        params.append(api_key_id)
+    if account_id is not None:
+        where.append("u.account_id=?")
+        params.append(account_id)
+    if model_name:
+        where.append("u.model_name=?")
+        params.append(model_name)
+    conn = db_conn()
+    rows = conn.execute(
+        f"""
+        SELECT
+            date(datetime(u.created_at, 'unixepoch', 'localtime')) AS report_date,
+            k.client_id AS client_id,
+            COALESCE(c.name, '') AS client_name,
+            u.api_key_id AS api_key_id,
+            COALESCE(k.name, '') AS api_key_name,
+            u.account_id AS account_id,
+            COALESCE(a.email, '') AS account_email,
+            COALESCE(u.model_name, '') AS model_name,
+            COUNT(*) AS request_count,
+            COALESCE(SUM(COALESCE(u.estimated_point_cost, 0)), 0) AS estimated_point_cost,
+            COALESCE(SUM(COALESCE(u.actual_point_cost, 0)), 0) AS actual_point_cost,
+            COALESCE(SUM(CASE WHEN u.status='completed' THEN 1 ELSE 0 END), 0) AS success_request_count,
+            COALESCE(SUM(CASE WHEN u.status!='completed' THEN 1 ELSE 0 END), 0) AS failed_request_count,
+            COALESCE(SUM(CASE WHEN u.status='completed' THEN COALESCE(u.actual_point_cost, 0) ELSE 0 END), 0) AS success_actual_point_cost,
+            COALESCE(SUM(CASE WHEN u.status!='completed' THEN COALESCE(u.actual_point_cost, 0) ELSE 0 END), 0) AS failed_actual_point_cost
+        FROM usage_log u
+        LEFT JOIN api_keys k ON k.id=u.api_key_id
+        LEFT JOIN clients c ON c.id=k.client_id
+        LEFT JOIN accounts a ON a.id=u.account_id
+        WHERE {' AND '.join(where)}
+        GROUP BY report_date, k.client_id, c.name, u.api_key_id, k.name, u.account_id, a.email, u.model_name
+        ORDER BY report_date DESC, actual_point_cost DESC, request_count DESC, api_key_id DESC
+        LIMIT 500
+        """,
+        tuple(params),
+    ).fetchall()
+    conn.close()
+    items = [dict(row) for row in rows]
+    summary = {
+        "request_count": sum(int_or_default(item.get("request_count"), 0) for item in items),
+        "estimated_point_cost": sum(int_or_default(item.get("estimated_point_cost"), 0) for item in items),
+        "actual_point_cost": sum(int_or_default(item.get("actual_point_cost"), 0) for item in items),
+        "success_actual_point_cost": sum(int_or_default(item.get("success_actual_point_cost"), 0) for item in items),
+        "failed_actual_point_cost": sum(int_or_default(item.get("failed_actual_point_cost"), 0) for item in items),
+    }
+    return {"items": items, "summary": summary}
 
 
 # === Gateway Endpoints (API Key protected) ===
@@ -4497,6 +4931,7 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
     if body.kind not in ("image", "video"):
         raise GatewayAPIError(400, "UNSUPPORTED_KIND", f"unsupported kind: {body.kind}", {"field": "kind"}, request_id=request_id)
     account, caps, options, estimated_point_cost = select_generation_account(body, request_id=request_id)
+    enforce_api_key_scope(policy, body.kind, options, caps, request_id)
     check_daily_quota(api_key_id, estimated_point_cost, policy, now, request_id)
 
     task_id = queue_generation_task(api_key_id, request_id, account, body, options, estimated_point_cost)
@@ -4569,6 +5004,9 @@ async def gateway_upload(
 ):
     """Upload a local file to the same BOS object path format used by web video scenes."""
     request_id = gateway_request_id(request)
+    policy = resolve_api_key_policy(get_api_key_record(api_key_id))
+    if not policy.get("allow_uploads", True):
+        raise GatewayAPIError(403, "API_KEY_UPLOAD_FORBIDDEN", "API key is not allowed to upload files", request_id=request_id)
     account = pick_account_for_generation("video", account_id) or pick_account_for_generation("image", account_id)
     if not account:
         raise GatewayAPIError(503, "NO_ACCOUNT_AVAILABLE", "no verified account available", request_id=request_id)
@@ -5283,13 +5721,26 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
     <div class="col"><select id="ak-client"></select></div>
     <div><button class="btn-primary" onclick="createApiKey()">创建 Key</button></div>
   </div>
+  <div class="row" style="margin-bottom:16px">
+    <div class="col"><input id="ak-kinds" placeholder="允许类型: image,video"></div>
+    <div class="col"><input id="ak-models" placeholder="允许模型: 逗号分隔"></div>
+    <div class="col"><input id="ak-scenes" placeholder="允许场景: text_or_image"></div>
+  </div>
+  <div class="row" style="margin-bottom:16px">
+    <div class="col"><input id="ak-resolutions" placeholder="允许分辨率: 4K,480"></div>
+    <div class="col"><input id="ak-durations" placeholder="允许时长: 5,10"></div>
+    <div class="col" style="display:flex;gap:16px;align-items:center;padding-top:8px">
+      <label style="display:flex;gap:6px;align-items:center"><input id="ak-allow-uploads" type="checkbox" checked> 允许上传</label>
+      <label style="display:flex;gap:6px;align-items:center"><input id="ak-allow-experimental" type="checkbox"> 允许实验场景</label>
+    </div>
+  </div>
   <div id="ak-new" class="hidden" style="background:#e8f5e9;padding:12px;border-radius:10px;margin-bottom:12px">
     <strong>新 Key:</strong> <code id="ak-new-value"></code>
     <button class="copy-btn" onclick="copyKey()">📋 复制</button>
   </div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>Key</th><th>名称</th><th>客户</th><th>状态</th><th>每分钟</th><th>每日请求</th><th>每日点数</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead>
+      <thead><tr><th>ID</th><th>Key</th><th>名称</th><th>客户</th><th>状态</th><th>每分钟</th><th>每日请求</th><th>每日点数</th><th>允许类型</th><th>允许模型</th><th>允许场景</th><th>允许分辨率</th><th>允许时长</th><th>上传</th><th>实验</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead>
       <tbody id="apikeys-tbody"></tbody>
     </table>
   </div>
@@ -5305,6 +5756,19 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
     <table>
       <thead><tr><th>ID</th><th>类型</th><th>账号</th><th>模型</th><th>点数</th><th>错误码</th><th>状态</th><th>提示词</th><th>时间</th></tr></thead>
       <tbody id="usage-tbody"></tbody>
+    </table>
+  </div>
+  <h2 style="margin-top:24px">💹 成本报表</h2>
+  <div class="row" style="margin-bottom:16px">
+    <div class="col"><label>开始日期</label><input id="cost-date-from" type="date"></div>
+    <div class="col"><label>结束日期</label><input id="cost-date-to" type="date"></div>
+    <div class="col"><label>模型</label><input id="cost-model-name" placeholder="模型名（可选）"></div>
+    <div class="col" style="align-self:end"><button class="btn-secondary" onclick="loadCostReport()">刷新报表</button></div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>日期</th><th>客户</th><th>Key</th><th>账号</th><th>模型</th><th>请求数</th><th>预估点数</th><th>实际点数</th><th>成功扣点</th><th>失败扣点</th></tr></thead>
+      <tbody id="cost-report-tbody"></tbody>
     </table>
   </div>
 </div>
@@ -5467,7 +5931,7 @@ async function init() {
   document.getElementById('status-text').textContent = '加载中...';
   try {
     await loadClients();
-    await Promise.all([loadAccounts(), loadTasks(), loadApiKeys(), loadUsage(), loadAuditLogs(), loadSettings()]);
+    await Promise.all([loadAccounts(), loadTasks(), loadApiKeys(), loadUsage(), loadCostReport(), loadAuditLogs(), loadSettings()]);
     await loadCapabilities();
   } catch (e) {
     document.getElementById('status-text').textContent = '未授权';
@@ -5483,7 +5947,7 @@ async function init() {
 function copyExample() { copyText(document.getElementById('gw-example').textContent); }
 
 // === Accounts ===
-let state = {accounts:[],tasks:[],apikeys:[],clients:[],usage:[],auditLogs:[],settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}}};
+let state = {accounts:[],tasks:[],apikeys:[],clients:[],usage:[],costReport:[],auditLogs:[],settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}}};
 async function api(m,u,b){
   const o={method:m,headers:authHeaders()};
   if(b) o.body=JSON.stringify(b);
@@ -5812,10 +6276,11 @@ async function hydrateTask(id){
 
 // === API Keys ===
 async function loadApiKeys(){const r=await api('GET','/api/admin/apikeys');state.apikeys=r.items||[];renderApiKeys();updateStats();}
+function scopeCsv(values){return (Array.isArray(values)?values:[]).join(',');}
 function renderApiKeys(){
   document.getElementById('apikeys-tbody').innerHTML = state.apikeys.map(k => {
     const kp=k.key_preview||'';
-    return `<tr><td>${k.id}</td><td style="font-family:monospace;font-size:11px">${kp}</td><td>${k.name||'-'}</td><td>${k.client_name||'-'}</td><td><span class="tag ${k.enabled?'tag-green':'tag-gray'}">${k.enabled?'启用':'停用'}</span></td><td><input id="ak-rate-${k.id}" data-field="rate_limit_per_minute" value="${k.rate_limit_per_minute||''}" style="width:84px"></td><td><input id="ak-req-${k.id}" data-field="daily_request_limit" value="${k.daily_request_limit||''}" style="width:84px"></td><td><input id="ak-point-${k.id}" data-field="daily_point_limit" value="${k.daily_point_limit||''}" style="width:84px"></td><td style="font-size:11px">${new Date((k.created_at||0)*1000).toLocaleString()}</td><td style="font-size:11px">${k.last_used_at?new Date(k.last_used_at*1000).toLocaleString():'-'}</td><td><button class="btn-sm btn-secondary" onclick="updateApiKeyPolicy(${k.id})">保存</button> <button class="btn-sm btn-danger" onclick="deleteKey(${k.id})">删除</button></td></tr>`;
+    return `<tr><td>${k.id}</td><td style="font-family:monospace;font-size:11px">${kp}</td><td>${escapeHtml(k.name||'-')}</td><td>${escapeHtml(k.client_name||'-')}</td><td><span class="tag ${k.enabled?'tag-green':'tag-gray'}">${k.enabled?'启用':'停用'}</span></td><td><input id="ak-rate-${k.id}" data-field="rate_limit_per_minute" value="${k.rate_limit_per_minute||''}" style="width:84px"></td><td><input id="ak-req-${k.id}" data-field="daily_request_limit" value="${k.daily_request_limit||''}" style="width:84px"></td><td><input id="ak-point-${k.id}" data-field="daily_point_limit" value="${k.daily_point_limit||''}" style="width:84px"></td><td><input id="ak-kinds-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_kinds))}" style="width:120px"></td><td><input id="ak-models-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_models))}" style="width:160px"></td><td><input id="ak-scenes-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_scenes))}" style="width:130px"></td><td><input id="ak-resolutions-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_resolutions))}" style="width:110px"></td><td><input id="ak-durations-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_durations))}" style="width:90px"></td><td><input id="ak-uploads-${k.id}" type="checkbox" ${k.allow_uploads!==false ? 'checked' : ''}></td><td><input id="ak-experimental-${k.id}" type="checkbox" ${k.allow_experimental ? 'checked' : ''}></td><td style="font-size:11px">${new Date((k.created_at||0)*1000).toLocaleString()}</td><td style="font-size:11px">${k.last_used_at?new Date(k.last_used_at*1000).toLocaleString():'-'}</td><td><button class="btn-sm btn-secondary" onclick="updateApiKeyPolicy(${k.id})">保存</button> <button class="btn-sm btn-danger" onclick="deleteKey(${k.id})">删除</button></td></tr>`;
   }).join('');
 }
 function renderClients(){
@@ -5835,12 +6300,29 @@ async function createClient(){
 async function createApiKey(){
   const name=document.getElementById('ak-name').value;
   const clientValue=document.getElementById('ak-client').value;
-  const body={name:name};
+  const body={
+    name:name,
+    allowed_kinds:document.getElementById('ak-kinds').value || '',
+    allowed_models:document.getElementById('ak-models').value || '',
+    allowed_scenes:document.getElementById('ak-scenes').value || '',
+    allowed_resolutions:document.getElementById('ak-resolutions').value || '',
+    allowed_durations:document.getElementById('ak-durations').value || '',
+    allow_uploads:document.getElementById('ak-allow-uploads').checked,
+    allow_experimental:document.getElementById('ak-allow-experimental').checked,
+  };
   if(clientValue) body.client_id=Number(clientValue);
   const r=await api('POST','/api/admin/apikeys',body);
   if(r.item){
     document.getElementById('ak-new').classList.remove('hidden');
     document.getElementById('ak-new-value').textContent=r.item.key;
+    document.getElementById('ak-name').value='';
+    document.getElementById('ak-kinds').value='';
+    document.getElementById('ak-models').value='';
+    document.getElementById('ak-scenes').value='';
+    document.getElementById('ak-resolutions').value='';
+    document.getElementById('ak-durations').value='';
+    document.getElementById('ak-allow-uploads').checked=true;
+    document.getElementById('ak-allow-experimental').checked=false;
     await loadClients();
     await loadApiKeys();
   } else alert('创建失败: '+JSON.stringify(r));
@@ -5851,6 +6333,13 @@ async function updateApiKeyPolicy(id){
     rate_limit_per_minute:document.getElementById('ak-rate-'+id).value || null,
     daily_request_limit:document.getElementById('ak-req-'+id).value || null,
     daily_point_limit:document.getElementById('ak-point-'+id).value || null,
+    allowed_kinds:document.getElementById('ak-kinds-'+id).value || '',
+    allowed_models:document.getElementById('ak-models-'+id).value || '',
+    allowed_scenes:document.getElementById('ak-scenes-'+id).value || '',
+    allowed_resolutions:document.getElementById('ak-resolutions-'+id).value || '',
+    allowed_durations:document.getElementById('ak-durations-'+id).value || '',
+    allow_uploads:document.getElementById('ak-uploads-'+id).checked,
+    allow_experimental:document.getElementById('ak-experimental-'+id).checked,
   };
   await api('PATCH','/api/admin/apikeys/'+id,body);
   await loadClients();
@@ -5863,6 +6352,27 @@ async function loadUsage(){const r=await api('GET','/api/admin/usage');state.usa
 function renderUsage(){
   document.getElementById('usage-tbody').innerHTML = state.usage.slice(0,50).map(u => {
     return `<tr><td>${u.id}</td><td><span class="tag ${u.kind==='image'?'tag-blue':'tag-green'}">${u.kind}</span></td><td>${u.account_email||u.account_id||'-'}</td><td>${u.model_name||'-'}</td><td>${u.estimated_point_cost ?? '-'}</td><td>${u.error_code||'-'}</td><td>${u.status}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${(u.prompt||'').substring(0,40)}</td><td style="font-size:11px">${new Date((u.created_at||0)*1000).toLocaleString()}</td></tr>`;
+  }).join('');
+}
+
+async function loadCostReport(){
+  const params=new URLSearchParams();
+  const dateFrom=document.getElementById('cost-date-from')?.value||'';
+  const dateTo=document.getElementById('cost-date-to')?.value||'';
+  const modelName=document.getElementById('cost-model-name')?.value||'';
+  if(dateFrom) params.set('date_from', dateFrom);
+  if(dateTo) params.set('date_to', dateTo);
+  if(modelName) params.set('model_name', modelName);
+  const query=params.toString();
+  const r=await api('GET','/api/admin/cost-report'+(query?`?${query}`:''));
+  state.costReport=r.items||[];
+  renderCostReport();
+}
+function renderCostReport(){
+  const tbody=document.getElementById('cost-report-tbody');
+  if(!tbody) return;
+  tbody.innerHTML = (state.costReport||[]).map(item => {
+    return `<tr><td>${escapeHtml(item.report_date||'-')}</td><td>${escapeHtml(item.client_name||'-')}</td><td>${escapeHtml(item.api_key_name||'-')}</td><td>${escapeHtml(item.account_email||'-')}</td><td>${escapeHtml(item.model_name||'-')}</td><td>${item.request_count ?? 0}</td><td>${item.estimated_point_cost ?? 0}</td><td>${item.actual_point_cost ?? 0}</td><td>${item.success_actual_point_cost ?? 0}</td><td>${item.failed_actual_point_cost ?? 0}</td></tr>`;
   }).join('');
 }
 

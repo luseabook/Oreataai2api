@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 
 import server
 
+TEST_ENCRYPTION_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
 
 class GatewayHardeningTests(unittest.TestCase):
     def setUp(self):
@@ -27,7 +29,12 @@ class GatewayHardeningTests(unittest.TestCase):
             server.deep_merge(
                 base_cfg,
                 {
-                    "server": {"host": "127.0.0.1", "admin_username": "admin", "admin_password": "test-admin-password"},
+                    "server": {
+                        "host": "127.0.0.1",
+                        "admin_username": "admin",
+                        "admin_password": "test-admin-password",
+                        "encryption_key": TEST_ENCRYPTION_KEY,
+                    },
                     "gateway": {"enable_background_worker": False},
                 },
             ),
@@ -2062,12 +2069,21 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("rate_limit_per_minute", html)
         self.assertIn("daily_request_limit", html)
         self.assertIn("daily_point_limit", html)
+        self.assertIn("allowed_kinds", html)
+        self.assertIn("allowed_models", html)
+        self.assertIn("allowed_scenes", html)
+        self.assertIn("allowed_resolutions", html)
+        self.assertIn("allowed_durations", html)
+        self.assertIn("allow_uploads", html)
+        self.assertIn("allow_experimental", html)
         self.assertIn("updateApiKeyPolicy", html)
         self.assertIn("estimated_point_cost", html)
         self.assertIn("actual_point_cost", html)
         self.assertIn("error_code", html)
         self.assertIn("createClient", html)
         self.assertIn("client_id", html)
+        self.assertIn("loadCostReport", html)
+        self.assertIn("/api/admin/cost-report", html)
         self.assertIn("loadAuditLogs", html)
         self.assertIn("audit-tbody", html)
         self.assertIn("/api/admin/logout", html)
@@ -2260,6 +2276,132 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(item["daily_request_limit"], 11)
         self.assertEqual(item["daily_point_limit"], 13)
 
+    def test_api_key_scope_columns_exist(self):
+        conn = server.db_conn()
+        api_key_cols = {r["name"] for r in conn.execute("PRAGMA table_info(api_keys)").fetchall()}
+        conn.close()
+
+        self.assertIn("allowed_kinds", api_key_cols)
+        self.assertIn("allowed_models", api_key_cols)
+        self.assertIn("allowed_scenes", api_key_cols)
+        self.assertIn("allow_uploads", api_key_cols)
+        self.assertIn("allow_experimental", api_key_cols)
+        self.assertIn("allowed_resolutions", api_key_cols)
+        self.assertIn("allowed_durations", api_key_cols)
+
+    def test_admin_can_update_api_key_scope_policy(self):
+        key_id = self.seed_api_key("scoped-policy-key")
+
+        response = self.client.patch(
+            f"/api/admin/apikeys/{key_id}",
+            headers=self.admin_headers(),
+            json={
+                "allowed_kinds": ["video"],
+                "allowed_models": ["Seedance 2.0 Mini"],
+                "allowed_scenes": ["text_or_image"],
+                "allow_uploads": False,
+                "allow_experimental": False,
+                "allowed_resolutions": ["480"],
+                "allowed_durations": [5],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        item = response.json()["item"]
+        self.assertEqual(item["allowed_kinds"], ["video"])
+        self.assertEqual(item["allowed_models"], ["Seedance 2.0 Mini"])
+        self.assertEqual(item["allowed_scenes"], ["text_or_image"])
+        self.assertFalse(item["allow_uploads"])
+        self.assertFalse(item["allow_experimental"])
+        self.assertEqual(item["allowed_resolutions"], ["480"])
+        self.assertEqual(item["allowed_durations"], [5])
+
+    def test_generate_rejects_request_outside_api_key_scope(self):
+        self.seed_account_with_capabilities()
+        key_id = self.seed_api_key("scoped-generate-key")
+        cases = [
+            (
+                {"allowed_kinds": ["video"]},
+                self.valid_image_request(),
+                "API_KEY_KIND_FORBIDDEN",
+            ),
+            (
+                {"allowed_kinds": ["video"], "allowed_models": ["Different Model"]},
+                self.valid_video_request(),
+                "API_KEY_MODEL_FORBIDDEN",
+            ),
+            (
+                {"allowed_kinds": ["video"], "allowed_models": ["Seedance 2.0 Mini"], "allowed_scenes": ["reference"]},
+                self.valid_video_request(),
+                "API_KEY_SCENE_FORBIDDEN",
+            ),
+            (
+                {
+                    "allowed_kinds": ["video"],
+                    "allowed_models": ["Seedance 2.0 Mini"],
+                    "allowed_scenes": ["text_or_image"],
+                    "allowed_resolutions": ["720"],
+                },
+                self.valid_video_request(),
+                "API_KEY_RESOLUTION_FORBIDDEN",
+            ),
+            (
+                {
+                    "allowed_kinds": ["video"],
+                    "allowed_models": ["Seedance 2.0 Mini"],
+                    "allowed_scenes": ["text_or_image"],
+                    "allowed_resolutions": ["480"],
+                    "allowed_durations": [10],
+                },
+                self.valid_video_request(),
+                "API_KEY_DURATION_FORBIDDEN",
+            ),
+        ]
+
+        for policy, body, expected_code in cases:
+            patch_response = self.client.patch(
+                f"/api/admin/apikeys/{key_id}",
+                headers=self.admin_headers(),
+                json=policy,
+            )
+            self.assertEqual(patch_response.status_code, 200)
+            response = self.client.post("/v1/generate", headers={"Authorization": "Bearer scoped-generate-key"}, json=body)
+            self.assertEqual(response.status_code, 403)
+            self.assertEqual(response.json()["error"]["code"], expected_code)
+
+    def test_upload_rejects_when_api_key_disallows_uploads(self):
+        self.seed_account_with_capabilities()
+        key_id = self.seed_api_key("scoped-upload-key")
+        patch_response = self.client.patch(
+            f"/api/admin/apikeys/{key_id}",
+            headers=self.admin_headers(),
+            json={
+                "allowed_kinds": ["video"],
+                "allow_uploads": False,
+            },
+        )
+        self.assertEqual(patch_response.status_code, 200)
+
+        with patch.object(
+            server.CLIENT,
+            "upload_file_bytes",
+            return_value={
+                "fileName": "sample",
+                "fileExt": "png",
+                "originSize": 4,
+                "object": "uploads/sample.png",
+                "status": "completed",
+            },
+        ):
+            response = self.client.post(
+                "/v1/uploads",
+                headers={"Authorization": "Bearer scoped-upload-key"},
+                files={"file": ("sample.png", b"data", "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["code"], "API_KEY_UPLOAD_FORBIDDEN")
+
     def test_admin_can_create_client_and_bind_api_key(self):
         client_response = self.client.post(
             "/api/admin/clients",
@@ -2285,6 +2427,85 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(keys[0]["client_name"], "Acme")
         clients = self.client.get("/api/admin/clients", headers=self.admin_headers()).json()["items"]
         self.assertEqual(clients[0]["name"], "Acme")
+
+    def test_admin_cost_report_aggregates_by_customer_key_account_model_and_status(self):
+        account_id = self.seed_account_with_capabilities("billing@example.com")
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute("INSERT INTO clients(name,contact,status,created_at) VALUES(?,?,?,?)", ("Acme", "ops@acme.test", "active", now))
+        client_id = conn.execute("SELECT id FROM clients WHERE name='Acme'").fetchone()[0]
+        conn.execute("INSERT INTO api_keys(client_id,key,name,enabled,created_at) VALUES(?,?,?,?,?)", (client_id, "billing-key", "billing-key", 1, now))
+        api_key_id = conn.execute("SELECT id FROM api_keys WHERE key='billing-key'").fetchone()[0]
+        conn.executemany(
+            """
+            INSERT INTO usage_log(
+                api_key_id,task_id,kind,account_id,prompt,status,response_summary,actual_point_cost,request_id,idempotency_key,
+                model_name,resolution,ratio,duration,scene_id,estimated_point_cost,error_code,status_code,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            [
+                (
+                    api_key_id,
+                    None,
+                    "video",
+                    account_id,
+                    "success row",
+                    "completed",
+                    "",
+                    8,
+                    "req-success",
+                    "",
+                    "Seedance 2.0 Mini",
+                    "480",
+                    "16:9",
+                    5,
+                    "text_or_image",
+                    10,
+                    "",
+                    200,
+                    now,
+                ),
+                (
+                    api_key_id,
+                    None,
+                    "video",
+                    account_id,
+                    "failed charged row",
+                    "failed",
+                    "",
+                    3,
+                    "req-failed",
+                    "",
+                    "Seedance 2.0 Mini",
+                    "480",
+                    "16:9",
+                    5,
+                    "text_or_image",
+                    10,
+                    "100003",
+                    503,
+                    now,
+                ),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        response = self.client.get("/api/admin/cost-report", headers=self.admin_headers())
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["items"])
+        row = payload["items"][0]
+        self.assertEqual(row["client_name"], "Acme")
+        self.assertEqual(row["api_key_name"], "billing-key")
+        self.assertEqual(row["account_email"], "billing@example.com")
+        self.assertEqual(row["model_name"], "Seedance 2.0 Mini")
+        self.assertEqual(row["request_count"], 2)
+        self.assertEqual(row["estimated_point_cost"], 20)
+        self.assertEqual(row["actual_point_cost"], 11)
+        self.assertEqual(row["success_actual_point_cost"], 8)
+        self.assertEqual(row["failed_actual_point_cost"], 3)
 
     def test_admin_can_patch_scene_policy_and_reflect_in_capabilities(self):
         self.seed_account_with_capabilities()
