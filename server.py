@@ -1,25 +1,29 @@
 import asyncio
+import io
 import base64
 import hashlib
 import json
 import os
 import secrets
 import sqlite3
+import shutil
+import tempfile
 import threading
 import time
+import zipfile
 from urllib.parse import parse_qs, quote, urlparse
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
 import re
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect, Depends
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
@@ -37,6 +41,7 @@ DEFAULT_CONFIG = {
         "port": 8890,
         "admin_username": "admin",
         "admin_password": "",
+        "admin_session_ttl_hours": 12,
     },
     "oreate": {
         "base_url": "https://www.oreateai.com",
@@ -78,6 +83,11 @@ DEFAULT_CONFIG = {
         "sync_wait_seconds": 0,
         "enable_background_worker": True,
         "task_worker_poll_interval_seconds": 1,
+        "task_hydration_attempt_timeout_seconds": 0,
+        "submitted_task_retry_interval_seconds": 10,
+        "hydrating_task_retry_interval_seconds": 10,
+        "submitted_task_expire_seconds": 600,
+        "hydrating_task_expire_seconds": 600,
         "scene_policies": {
             "text_or_image": {
                 "enabled": True,
@@ -140,6 +150,20 @@ def oreate_cfg() -> Dict[str, Any]:
 
 def tls_verify_enabled() -> bool:
     return bool(oreate_cfg().get("verify_tls", True))
+
+
+def float_or_default(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def int_or_default(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def default_model_verification_status(kind: str) -> str:
@@ -209,8 +233,14 @@ def public_account(row: sqlite3.Row) -> Dict[str, Any]:
     item = dict(row)
     item["has_password"] = bool(item.get("password"))
     item["ouid_preview"] = (item.get("ouid") or "")[:12]
-    for key in ("password", "ouid", "ouss", "model_info_json", "video_info_json"):
+    for key in ("password", "ouid", "ouss", "model_info_json", "video_info_json", "point_balance_json"):
         item.pop(key, None)
+    now = time.time()
+    item["cooling"] = account_cooldown_remaining_seconds(item, now) > 0
+    item["cooldown_remaining_seconds"] = int(account_cooldown_remaining_seconds(item, now))
+    item["balance_status"] = account_balance_status(item)
+    item["risk_status"] = account_risk_status(item)
+    item["health_status"] = account_health_status(item, now)
     return item
 
 
@@ -220,9 +250,413 @@ def public_api_key(row: sqlite3.Row, reveal: bool = False) -> Dict[str, Any]:
     item["key_preview"] = f"{key[:16]}..." if key else ""
     item["deleted"] = bool(item.get("deleted_at"))
     item["status"] = "deleted" if item["deleted"] else ("enabled" if item.get("enabled") else "disabled")
+    if item.get("client_name") is None and item.get("client_id") is not None:
+        item["client_name"] = ""
+    item["client_name"] = item.get("client_name") or ""
     if not reveal:
         item.pop("key", None)
     return item
+
+
+def public_client(row: sqlite3.Row) -> Dict[str, Any]:
+    item = dict(row)
+    item["status"] = item.get("status") or "active"
+    return item
+
+
+def public_admin_audit(row: sqlite3.Row) -> Dict[str, Any]:
+    item = dict(row)
+    item["details"] = json_value_from_db(item.pop("details_json", None)) or {}
+    return item
+
+
+def redact_nested_fields(value: Any, keys: Iterable[str]) -> Any:
+    sensitive = set(keys)
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key in sensitive and item not in (None, ""):
+                out[key] = SECRET_PLACEHOLDER
+            else:
+                out[key] = redact_nested_fields(item, sensitive)
+        return out
+    if isinstance(value, list):
+        return [redact_nested_fields(item, sensitive) for item in value]
+    return value
+
+
+def public_registration_result(item: Dict[str, Any]) -> Dict[str, Any]:
+    out = json.loads(json.dumps(item))
+    out.pop("password", None)
+    out = redact_nested_fields(
+        out,
+        {
+            "password",
+            "token",
+            "tokenID",
+            "tokenId",
+            "token_id",
+            "jt",
+            "cookies",
+            "cookie",
+            "OUID",
+            "ouss",
+            "session",
+            "sessionkey",
+            "accessToken",
+        },
+    )
+    artifact = out.get("verification_artifact")
+    if isinstance(artifact, dict):
+        for key in ("code", "link", "token", "tokenID", "tokenId"):
+            if artifact.get(key) not in (None, ""):
+                artifact[key] = SECRET_PLACEHOLDER
+    mailbox = out.get("mailbox")
+    if isinstance(mailbox, dict):
+        mailbox.pop("token", None)
+    return out
+
+
+def normalize_account_point_detail(raw: Any) -> Dict[str, Any]:
+    source = raw.get("data") if isinstance(raw, dict) and isinstance(raw.get("data"), dict) else raw
+    source = source if isinstance(source, dict) else {}
+    daily = source.get("daily")
+    if daily in (None, ""):
+        daily = source.get("dailyPoint")
+    if daily in (None, ""):
+        daily = source.get("daily_point")
+    bonus = source.get("bonus")
+    if bonus in (None, ""):
+        bonus = source.get("bonusPoint")
+    if bonus in (None, ""):
+        bonus = source.get("bonus_point")
+    rest = source.get("restPoint")
+    if rest in (None, ""):
+        rest = source.get("rest_point")
+    if rest in (None, ""):
+        rest = source.get("restpoint")
+    if rest in (None, "") and (daily not in (None, "") or bonus not in (None, "")):
+        rest = int_or_default(daily, 0) + int_or_default(bonus, 0)
+    return {
+        "point_balance_json": {
+            "daily_point": None if daily in (None, "") else int_or_default(daily, 0),
+            "bonus_point": None if bonus in (None, "") else int_or_default(bonus, 0),
+            "rest_point": None if rest in (None, "") else int_or_default(rest, 0),
+        },
+        "daily_point": None if daily in (None, "") else int_or_default(daily, 0),
+        "bonus_point": None if bonus in (None, "") else int_or_default(bonus, 0),
+        "rest_point": None if rest in (None, "") else int_or_default(rest, 0),
+    }
+
+
+def account_balance_value(row: sqlite3.Row) -> Optional[int]:
+    item = dict(row)
+    if item.get("rest_point") not in (None, ""):
+        return int_or_default(item.get("rest_point"), 0)
+    if item.get("daily_point") not in (None, "") or item.get("bonus_point") not in (None, ""):
+        return int_or_default(item.get("daily_point"), 0) + int_or_default(item.get("bonus_point"), 0)
+    raw = json_value_from_db(item.get("point_balance_json")) or {}
+    source = raw.get("data") if isinstance(raw, dict) and isinstance(raw.get("data"), dict) else raw
+    if isinstance(source, dict):
+        if source.get("restPoint") not in (None, ""):
+            return int_or_default(source.get("restPoint"), 0)
+        if source.get("rest_point") not in (None, ""):
+            return int_or_default(source.get("rest_point"), 0)
+        if source.get("restpoint") not in (None, ""):
+            return int_or_default(source.get("restpoint"), 0)
+        if source.get("daily") not in (None, "") or source.get("bonus") not in (None, ""):
+            return int_or_default(source.get("daily"), 0) + int_or_default(source.get("bonus"), 0)
+        if source.get("dailyPoint") not in (None, "") or source.get("bonusPoint") not in (None, ""):
+            return int_or_default(source.get("dailyPoint"), 0) + int_or_default(source.get("bonusPoint"), 0)
+        if source.get("daily_point") not in (None, "") or source.get("bonus_point") not in (None, ""):
+            return int_or_default(source.get("daily_point"), 0) + int_or_default(source.get("bonus_point"), 0)
+    return None
+
+
+def account_has_sufficient_balance(row: sqlite3.Row, estimated_point_cost: Optional[int]) -> bool:
+    if estimated_point_cost in (None, ""):
+        return True
+    try:
+        cost = int(float(estimated_point_cost))
+    except (TypeError, ValueError):
+        return True
+    if cost <= 0:
+        return True
+    balance = account_balance_value(row)
+    if balance is None:
+        return True
+    return balance >= cost
+
+
+def account_cooldown_remaining_seconds(row: sqlite3.Row, now: Optional[float] = None) -> float:
+    now = time.time() if now is None else now
+    cooldown_until = row.get("cooldown_until") if isinstance(row, dict) else row["cooldown_until"]
+    if cooldown_until in (None, ""):
+        return 0.0
+    try:
+        remaining = float(cooldown_until) - float(now)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, remaining)
+
+
+def account_balance_status(row: sqlite3.Row) -> str:
+    balance = account_balance_value(row)
+    if balance is None:
+        return "unknown"
+    if balance <= 0:
+        return "empty"
+    if balance < 10:
+        return "low"
+    return "ok"
+
+
+def account_risk_status(row: sqlite3.Row) -> str:
+    status = str(row["status"] or "")
+    if status == "invalid":
+        return "risk_control" if "212361" in str(row["last_error"] or "") else "invalid"
+    if str(row["last_error"] or "").find("212361") >= 0:
+        return "risk_control"
+    return "clean"
+
+
+def account_health_status(row: sqlite3.Row, now: Optional[float] = None) -> str:
+    if str(row["status"] or "") == "invalid":
+        return "invalid"
+    if account_cooldown_remaining_seconds(row, now) > 0:
+        return "cooling"
+    if account_risk_status(row) == "risk_control":
+        return "risk_control"
+    if account_balance_status(row) in {"empty", "low"}:
+        return "low_balance"
+    return "healthy"
+
+
+def account_has_schedulable_capability(row: sqlite3.Row) -> bool:
+    caps = capabilities_from_account(row)
+    image_models = [model for model in caps.get("image", {}).get("models") or [] if model.get("enabled", True)]
+    video_models = [model for model in caps.get("video", {}).get("models") or [] if model.get("enabled", True)]
+    video_scenes = [scene for scene in caps.get("video", {}).get("scenes") or [] if scene.get("enabled", True)]
+    return bool(image_models or (video_models and video_scenes))
+
+
+def account_is_ready_schedulable(row: sqlite3.Row) -> bool:
+    return str(row["status"] or "") in {"verified", "active"} and account_has_schedulable_capability(row)
+
+
+def account_pool_summary(rows: List[sqlite3.Row], now: Optional[float] = None) -> Dict[str, int]:
+    current = time.time() if now is None else now
+    summary = {
+        "total": 0,
+        "verified": 0,
+        "healthy": 0,
+        "cooling": 0,
+        "low_balance": 0,
+        "invalid": 0,
+        "risk_control": 0,
+        "balance_known": 0,
+    }
+    for row in rows:
+        summary["total"] += 1
+        if str(row["status"] or "") in {"verified", "active"}:
+            summary["verified"] += 1
+        if account_balance_value(row) is not None:
+            summary["balance_known"] += 1
+        health = account_health_status(row, current)
+        schedulable = account_is_ready_schedulable(row)
+        if health == "risk_control":
+            pass
+        elif health == "healthy":
+            if schedulable:
+                summary["healthy"] += 1
+        elif health == "cooling":
+            if schedulable:
+                summary["cooling"] += 1
+        elif health in summary:
+            summary[health] += 1
+        if account_risk_status(row) == "risk_control":
+            summary["risk_control"] += 1
+    return summary
+
+
+def task_metrics_summary(rows: List[sqlite3.Row]) -> Dict[str, Any]:
+    statuses = {
+        "queued": 0,
+        "running": 0,
+        "submitted": 0,
+        "hydrating": 0,
+        "completed": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "expired": 0,
+    }
+    error_codes: Dict[str, int] = {}
+    for row in rows:
+        status = str(row["status"] or "")
+        if status in statuses:
+            statuses[status] += 1
+        error_code = str(row["error_code"] or "")
+        if error_code:
+            error_codes[error_code] = error_codes.get(error_code, 0) + 1
+    queue_length = sum(statuses[key] for key in ("queued", "running", "submitted", "hydrating"))
+    completed = statuses["completed"]
+    failed = statuses["failed"] + statuses["cancelled"] + statuses["expired"]
+    success_base = completed + failed
+    success_rate = round((completed / success_base) * 100, 2) if success_base else 100.0
+    return {
+        **statuses,
+        "queue_length": queue_length,
+        "success_rate": success_rate,
+        "error_codes": error_codes,
+        "total": len(rows),
+    }
+
+
+def usage_metrics_summary() -> Dict[str, Any]:
+    start = day_start_timestamp(time.time())
+    conn = db_conn()
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) as request_count,
+            COALESCE(SUM(COALESCE(estimated_point_cost, 0)), 0) as estimated_point_cost,
+            COALESCE(SUM(COALESCE(actual_point_cost, 0)), 0) as actual_point_cost
+        FROM usage_log
+        WHERE created_at>=?
+        """,
+        (start,),
+    ).fetchone()
+    error_rows = conn.execute(
+        """
+        SELECT COALESCE(error_code, '') as error_code, COUNT(*) as count
+        FROM usage_log
+        WHERE created_at>=? AND COALESCE(error_code, '') != ''
+        GROUP BY error_code
+        ORDER BY count DESC, error_code ASC
+        """,
+        (start,),
+    ).fetchall()
+    conn.close()
+    error_codes = {r["error_code"]: r["count"] for r in error_rows}
+    return {
+        "today_requests": row["request_count"] if row else 0,
+        "today_estimated_point_cost": row["estimated_point_cost"] if row else 0,
+        "today_actual_point_cost": row["actual_point_cost"] if row else 0,
+        "error_codes": error_codes,
+    }
+
+
+
+def update_account_balance_snapshot(account_id: int, balance_detail: Any) -> sqlite3.Row:
+    snapshot = normalize_account_point_detail(balance_detail)
+    now = time.time()
+    conn = db_conn()
+    conn.execute(
+        """
+        UPDATE accounts
+        SET point_balance_json=?, rest_point=?, daily_point=?, bonus_point=?, balance_updated_at=?, updated_at=?
+        WHERE id=?
+        """,
+        (
+            encode_json_value(snapshot["point_balance_json"]),
+            snapshot["rest_point"],
+            snapshot["daily_point"],
+            snapshot["bonus_point"],
+            now,
+            now,
+            account_id,
+        ),
+    )
+    row = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "account not found")
+    return row
+
+
+def capture_account_balance_snapshot(account: sqlite3.Row) -> Optional[Dict[str, Any]]:
+    try:
+        session = CLIENT.session_from_account(account)
+        detail = CLIENT.fetch_account_point_detail(session, account)
+    except Exception:
+        return None
+    return normalize_account_point_detail(detail)
+
+
+def balance_snapshot_fields(snapshot: Optional[Dict[str, Any]], prefix: str) -> Dict[str, Any]:
+    if not snapshot:
+        return {}
+    return {
+        f"{prefix}_json": snapshot.get("point_balance_json"),
+        f"{prefix}_rest_point": snapshot.get("rest_point"),
+        f"{prefix}_daily_point": snapshot.get("daily_point"),
+        f"{prefix}_bonus_point": snapshot.get("bonus_point"),
+    }
+
+
+def balance_snapshot_from_row(row: Optional[Any], prefix: str) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    raw_json = row.get(f"{prefix}_json") if isinstance(row, dict) else row[f"{prefix}_json"]
+    rest = row.get(f"{prefix}_rest_point") if isinstance(row, dict) else row[f"{prefix}_rest_point"]
+    daily = row.get(f"{prefix}_daily_point") if isinstance(row, dict) else row[f"{prefix}_daily_point"]
+    bonus = row.get(f"{prefix}_bonus_point") if isinstance(row, dict) else row[f"{prefix}_bonus_point"]
+    point_balance_json = json_value_from_db(raw_json)
+    if not isinstance(point_balance_json, dict):
+        if rest in (None, "") and daily in (None, "") and bonus in (None, ""):
+            return None
+        point_balance_json = {
+            "rest_point": None if rest in (None, "") else int_or_default(rest, 0),
+            "daily_point": None if daily in (None, "") else int_or_default(daily, 0),
+            "bonus_point": None if bonus in (None, "") else int_or_default(bonus, 0),
+        }
+    return {
+        "point_balance_json": point_balance_json,
+        "rest_point": point_balance_json.get("rest_point"),
+        "daily_point": point_balance_json.get("daily_point"),
+        "bonus_point": point_balance_json.get("bonus_point"),
+    }
+
+
+def actual_point_cost_from_balance_snapshots(before: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not before or not after:
+        return None
+    before_rest = before.get("rest_point")
+    after_rest = after.get("rest_point")
+    if before_rest in (None, "") or after_rest in (None, ""):
+        return None
+    return max(0, int_or_default(before_rest, 0) - int_or_default(after_rest, 0))
+
+
+def fetch_account_row(account_id: int) -> Optional[sqlite3.Row]:
+    conn = db_conn()
+    row = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def build_failed_task_result_payload(task_id: int, account_id: Optional[int], error_code: str, message: str, status_code: int = 503) -> Dict[str, Any]:
+    task_row = fetch_task_row(task_id)
+    balance_before = balance_snapshot_from_row(task_row, "balance_before")
+    balance_after = None
+    if account_id:
+        account_row = fetch_account_row(int(account_id))
+        if account_row:
+            balance_after = capture_account_balance_snapshot(account_row)
+            if balance_after:
+                update_account_balance_snapshot(account_row["id"], balance_after["point_balance_json"])
+    payload = {
+        "account_id": account_id,
+        "error_code": error_code,
+        "error_message": message,
+        "response_summary": json.dumps({"code": error_code, "message": message}, ensure_ascii=False),
+        "status_code": status_code,
+        "actual_point_cost": actual_point_cost_from_balance_snapshots(balance_before, balance_after),
+    }
+    payload.update(balance_snapshot_fields(balance_before, "balance_before"))
+    payload.update(balance_snapshot_fields(balance_after, "balance_after"))
+    return payload
 
 
 def extract_token_id_from_link(link: str) -> str:
@@ -948,6 +1382,10 @@ class UpstreamGenerationError(RuntimeError):
         super().__init__(f"{error.get('code')}: {error.get('message')}")
 
 
+class TaskCancelledError(RuntimeError):
+    pass
+
+
 def request_hash_for_generation(body: Any) -> str:
     data = model_data(body) if isinstance(body, BaseModel) else dict(body)
     stable = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -1056,7 +1494,7 @@ def check_daily_quota(api_key_id: int, estimated_point_cost: Optional[int], poli
         )
 
 
-def pick_account_for_generation(kind: str, requested_account_id: Optional[int] = None) -> Optional[sqlite3.Row]:
+def candidate_accounts_for_generation(kind: str, requested_account_id: Optional[int] = None) -> List[sqlite3.Row]:
     now = time.time()
     capability_clause = "model_info_json IS NOT NULL AND model_info_json != ''" if kind == "image" else "video_info_json IS NOT NULL AND video_info_json != ''"
     params: List[Any] = [now]
@@ -1065,7 +1503,7 @@ def pick_account_for_generation(kind: str, requested_account_id: Optional[int] =
         account_clause = "AND id=?"
         params.append(requested_account_id)
     conn = db_conn()
-    row = conn.execute(
+    rows = conn.execute(
         f"""
         SELECT * FROM accounts
         WHERE status IN ('verified', 'active')
@@ -1073,12 +1511,45 @@ def pick_account_for_generation(kind: str, requested_account_id: Optional[int] =
           AND (cooldown_until IS NULL OR cooldown_until <= ?)
           {account_clause}
         ORDER BY COALESCE(failure_count, 0) ASC, COALESCE(last_used_at, 0) ASC, updated_at DESC, id ASC
-        LIMIT 1
         """,
         tuple(params),
-    ).fetchone()
+    ).fetchall()
     conn.close()
-    return row
+    return list(rows)
+
+
+def pick_account_for_generation(kind: str, requested_account_id: Optional[int] = None) -> Optional[sqlite3.Row]:
+    rows = candidate_accounts_for_generation(kind, requested_account_id)
+    return rows[0] if rows else None
+
+
+def select_generation_account(body: Any, request_id: str = "") -> Tuple[sqlite3.Row, Dict[str, Any], Dict[str, Any], Optional[int]]:
+    candidates = candidate_accounts_for_generation(body.kind, getattr(body, "account_id", None))
+    last_validation_error: Optional[GatewayAPIError] = None
+    had_balance_miss = False
+    for account in candidates:
+        caps = capabilities_from_account(account)
+        try:
+            options = effective_generation_options(body, caps)
+            validate_generation_options(body.kind, options, caps)
+        except GatewayAPIError as exc:
+            last_validation_error = exc
+            continue
+        estimated_point_cost = estimate_point_cost(body.kind, options, caps)
+        if not account_has_sufficient_balance(account, estimated_point_cost):
+            had_balance_miss = True
+            continue
+        return account, caps, options, estimated_point_cost
+    if last_validation_error is not None and not had_balance_miss and candidates:
+        if request_id:
+            last_validation_error.request_id = request_id
+        raise last_validation_error
+    raise GatewayAPIError(
+        503,
+        "NO_ACCOUNT_AVAILABLE",
+        "no verified account available with enough balance",
+        request_id=request_id,
+    )
 
 
 def mark_account_success(account_id: int) -> None:
@@ -1176,6 +1647,11 @@ def init_db():
             ouss TEXT,
             model_info_json TEXT,
             video_info_json TEXT,
+            point_balance_json TEXT,
+            rest_point INTEGER,
+            daily_point INTEGER,
+            bonus_point INTEGER,
+            balance_updated_at REAL,
             last_error TEXT,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
@@ -1197,6 +1673,14 @@ def init_db():
             duration INTEGER,
             estimated_point_cost INTEGER,
             actual_point_cost INTEGER,
+            balance_before_json TEXT,
+            balance_after_json TEXT,
+            balance_before_rest_point INTEGER,
+            balance_before_daily_point INTEGER,
+            balance_before_bonus_point INTEGER,
+            balance_after_rest_point INTEGER,
+            balance_after_daily_point INTEGER,
+            balance_after_bonus_point INTEGER,
             request_id TEXT,
             payload_json TEXT,
             response_json TEXT,
@@ -1208,6 +1692,7 @@ def init_db():
             error_message TEXT,
             attempt_count INTEGER NOT NULL DEFAULT 0,
             cancel_requested_at REAL,
+            next_attempt_at REAL,
             started_at REAL,
             finished_at REAL,
             created_at REAL NOT NULL,
@@ -1243,6 +1728,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS api_keys (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_id INTEGER,
             key TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL DEFAULT '',
             enabled INTEGER NOT NULL DEFAULT 1,
@@ -1250,6 +1736,17 @@ def init_db():
             disabled_reason TEXT,
             created_at REAL NOT NULL,
             last_used_at REAL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            contact TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at REAL NOT NULL
         )
         """
     )
@@ -1264,9 +1761,44 @@ def init_db():
             prompt TEXT,
             status TEXT NOT NULL,
             response_summary TEXT,
+            actual_point_cost INTEGER,
             created_at REAL NOT NULL,
             FOREIGN KEY(api_key_id) REFERENCES api_keys(id),
             FOREIGN KEY(task_id) REFERENCES tasks(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS admin_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_hash TEXT NOT NULL UNIQUE,
+            username TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            last_used_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            revoked_at REAL,
+            revoked_reason TEXT,
+            remote_addr TEXT,
+            user_agent TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS admin_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_username TEXT NOT NULL,
+            action TEXT NOT NULL,
+            method TEXT NOT NULL,
+            path TEXT NOT NULL,
+            status_code INTEGER,
+            entity_type TEXT,
+            entity_id TEXT,
+            details_json TEXT,
+            remote_addr TEXT,
+            user_agent TEXT,
+            created_at REAL NOT NULL
         )
         """
     )
@@ -1290,12 +1822,20 @@ def init_db():
     add_column_if_missing(conn, "api_keys", "rate_limit_per_minute", "INTEGER")
     add_column_if_missing(conn, "api_keys", "daily_request_limit", "INTEGER")
     add_column_if_missing(conn, "api_keys", "daily_point_limit", "INTEGER")
+    add_column_if_missing(conn, "api_keys", "client_id", "INTEGER")
     add_column_if_missing(conn, "api_keys", "deleted_at", "REAL")
     add_column_if_missing(conn, "api_keys", "disabled_reason", "TEXT")
+    add_column_if_missing(conn, "clients", "contact", "TEXT NOT NULL DEFAULT ''")
+    add_column_if_missing(conn, "clients", "status", "TEXT NOT NULL DEFAULT 'active'")
     add_column_if_missing(conn, "tasks", "api_key_id", "INTEGER")
     add_column_if_missing(conn, "accounts", "last_used_at", "REAL")
     add_column_if_missing(conn, "accounts", "failure_count", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "accounts", "cooldown_until", "REAL")
+    add_column_if_missing(conn, "accounts", "point_balance_json", "TEXT")
+    add_column_if_missing(conn, "accounts", "rest_point", "INTEGER")
+    add_column_if_missing(conn, "accounts", "daily_point", "INTEGER")
+    add_column_if_missing(conn, "accounts", "bonus_point", "INTEGER")
+    add_column_if_missing(conn, "accounts", "balance_updated_at", "REAL")
     add_column_if_missing(conn, "tasks", "model_name", "TEXT")
     add_column_if_missing(conn, "tasks", "scene_id", "TEXT")
     add_column_if_missing(conn, "tasks", "resolution", "TEXT")
@@ -1303,6 +1843,14 @@ def init_db():
     add_column_if_missing(conn, "tasks", "duration", "INTEGER")
     add_column_if_missing(conn, "tasks", "estimated_point_cost", "INTEGER")
     add_column_if_missing(conn, "tasks", "actual_point_cost", "INTEGER")
+    add_column_if_missing(conn, "tasks", "balance_before_json", "TEXT")
+    add_column_if_missing(conn, "tasks", "balance_after_json", "TEXT")
+    add_column_if_missing(conn, "tasks", "balance_before_rest_point", "INTEGER")
+    add_column_if_missing(conn, "tasks", "balance_before_daily_point", "INTEGER")
+    add_column_if_missing(conn, "tasks", "balance_before_bonus_point", "INTEGER")
+    add_column_if_missing(conn, "tasks", "balance_after_rest_point", "INTEGER")
+    add_column_if_missing(conn, "tasks", "balance_after_daily_point", "INTEGER")
+    add_column_if_missing(conn, "tasks", "balance_after_bonus_point", "INTEGER")
     add_column_if_missing(conn, "tasks", "request_id", "TEXT")
     add_column_if_missing(conn, "tasks", "response_json", "TEXT")
     add_column_if_missing(conn, "tasks", "assets_json", "TEXT")
@@ -1311,6 +1859,7 @@ def init_db():
     add_column_if_missing(conn, "tasks", "error_message", "TEXT")
     add_column_if_missing(conn, "tasks", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "tasks", "cancel_requested_at", "REAL")
+    add_column_if_missing(conn, "tasks", "next_attempt_at", "REAL")
     add_column_if_missing(conn, "tasks", "started_at", "REAL")
     add_column_if_missing(conn, "tasks", "finished_at", "REAL")
     add_column_if_missing(conn, "task_attempts", "phase", "TEXT NOT NULL DEFAULT 'generation'")
@@ -1333,8 +1882,17 @@ def init_db():
     add_column_if_missing(conn, "usage_log", "duration", "INTEGER")
     add_column_if_missing(conn, "usage_log", "scene_id", "TEXT")
     add_column_if_missing(conn, "usage_log", "estimated_point_cost", "INTEGER")
+    add_column_if_missing(conn, "usage_log", "actual_point_cost", "INTEGER")
     add_column_if_missing(conn, "usage_log", "error_code", "TEXT")
     add_column_if_missing(conn, "usage_log", "status_code", "INTEGER")
+    conn.execute(
+        """
+        UPDATE tasks
+        SET next_attempt_at=COALESCE(next_attempt_at, updated_at, created_at)
+        WHERE status IN ('submitted', 'hydrating')
+          AND next_attempt_at IS NULL
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -1775,6 +2333,19 @@ class OreateClient:
         except Exception:
             return {"email": fallback_email, "vip": "", "reg_ts": ""}
 
+    def fetch_account_point_detail(self, s: requests.Session, account: Optional[sqlite3.Row] = None) -> Dict[str, Any]:
+        try:
+            r = s.get(self.base + "/oreate/account/getpointdetail", headers=self.headers, timeout=self.timeout)
+            r.raise_for_status()
+            body = r.json()
+            status = body.get("status") if isinstance(body, dict) else None
+            if isinstance(status, dict) and status.get("code") not in (None, 0):
+                raise RuntimeError(f"getpointdetail failed: {body}")
+            return body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else body
+        except Exception as exc:
+            fallback = account["email"] if account is not None and "email" in account.keys() else ""
+            raise RuntimeError(f"getpointdetail failed for {fallback or 'account'}: {exc}") from exc
+
     def upload_file_bytes(
         self,
         s: requests.Session,
@@ -1935,6 +2506,7 @@ class OreateClient:
         attachments: Optional[List[Dict[str, Any]]] = None,
         account: Optional[sqlite3.Row] = None,
         jt: Optional[str] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         banti_artifacts: Dict[str, Any] = {"jt": jt or "", "cookies": {}}
         if jt is None:
@@ -1989,6 +2561,9 @@ class OreateClient:
             )
             response.raise_for_status()
             for raw in response.iter_lines(decode_unicode=True):
+                if should_stop is not None and should_stop():
+                    completion_reason = "cancelled"
+                    break
                 event = parse_sse_line(raw)
                 if event is None:
                     continue
@@ -2016,6 +2591,8 @@ class OreateClient:
         error = classify_sse_error(events)
         if error:
             status = "failed"
+        elif completion_reason == "cancelled":
+            status = "cancelled"
         elif is_video and events and completion_reason in ("read_timeout", "video_stream_wait_elapsed", "eof"):
             status = "submitted"
         else:
@@ -2045,6 +2622,7 @@ class OreateClient:
         timeout_sec: Optional[float] = None,
         poll_interval_sec: Optional[float] = None,
         chat_type: str = "aiVideo",
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         timeout = float(
             CFG["oreate"].get("video_hydration_timeout_seconds") or 600
@@ -2060,12 +2638,19 @@ class OreateClient:
         attempts = 0
         last_result: Dict[str, Any] = {"raw": {}, "assets": []}
         while True:
+            if should_stop is not None and should_stop():
+                last_result["status"] = "cancelled"
+                last_result["attempts"] = attempts
+                return last_result
             attempts += 1
             last_result = self.hydrate_generation_result(s, chat_id, chat_type=chat_type)
             assets = last_result.get("assets") or []
             last_result["attempts"] = attempts
             if assets:
                 last_result["status"] = "completed"
+                return last_result
+            if should_stop is not None and should_stop():
+                last_result["status"] = "cancelled"
                 return last_result
             history_error = classify_history_error(last_result.get("raw"), ignored_codes=["110012"])
             if history_error:
@@ -2076,7 +2661,19 @@ class OreateClient:
             if remaining <= 0:
                 last_result["status"] = "submitted"
                 return last_result
-            time.sleep(min(max(interval, 0.0), remaining))
+            sleep_for = min(max(interval, 0.0), remaining)
+            if should_stop is None or sleep_for <= 0:
+                time.sleep(sleep_for)
+                continue
+            sleep_deadline = time.monotonic() + sleep_for
+            while True:
+                if should_stop():
+                    last_result["status"] = "cancelled"
+                    return last_result
+                remaining_sleep = sleep_deadline - time.monotonic()
+                if remaining_sleep <= 0:
+                    break
+                time.sleep(min(0.5, remaining_sleep))
 
     def create_chat(self, s: requests.Session, payload: Dict[str, Any]) -> Dict[str, Any]:
         r = s.post(
@@ -2215,7 +2812,7 @@ def update_task_record(task_id: int, **fields: Any) -> None:
     now = fields.pop("updated_at", time.time())
     payload = dict(fields)
     payload["updated_at"] = now
-    for key in ("payload_json", "response_json", "assets_json"):
+    for key in ("payload_json", "response_json", "assets_json", "balance_before_json", "balance_after_json"):
         if key in payload:
             payload[key] = encode_json_value(payload[key])
     assignments = ", ".join(f"{key}=?" for key in payload)
@@ -2237,6 +2834,9 @@ def update_task_status(task_id: int, status: str, response: Optional[Dict[str, A
             fields["focus_id"] = chat.get("focusId") or fields["chat_id"]
     if status in TASK_TERMINAL_STATUSES:
         fields["finished_at"] = now
+        fields["next_attempt_at"] = None
+    elif status in {"submitted", "hydrating"}:
+        fields["next_attempt_at"] = now
     update_task_record(task_id, **fields)
 
 
@@ -2260,10 +2860,13 @@ def save_task(
     error_code: str = "",
     error_message: str = "",
     cancel_requested_at: Optional[float] = None,
+    next_attempt_at: Optional[float] = None,
     started_at: Optional[float] = None,
     finished_at: Optional[float] = None,
 ) -> int:
     now = time.time()
+    if next_attempt_at is None and status in {"submitted", "hydrating"}:
+        next_attempt_at = now
     chat = task_response_chat(response)
     assets = task_response_assets(response)
     conn = db_conn()
@@ -2273,9 +2876,10 @@ def save_task(
             api_key_id, account_id, kind, prompt, model_name, scene_id, resolution, ratio, duration,
             estimated_point_cost, actual_point_cost, request_id, payload_json, response_json, assets_json,
             chat_id, focus_id, status, error_code, error_message, attempt_count, cancel_requested_at,
+            next_attempt_at,
             started_at, finished_at, created_at, updated_at
         )
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             api_key_id,
@@ -2300,6 +2904,7 @@ def save_task(
             error_message or "",
             0,
             cancel_requested_at,
+            next_attempt_at,
             started_at,
             finished_at,
             now,
@@ -2423,12 +3028,21 @@ def claim_next_task() -> Optional[Dict[str, Any]]:
     conn = db_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        now = time.time()
         row = conn.execute(
             """
             SELECT *
             FROM tasks
-            WHERE status IN ('queued', 'submitted', 'hydrating')
-              AND cancel_requested_at IS NULL
+            WHERE
+              (
+                status='queued'
+                OR (
+                  status IN ('submitted', 'hydrating')
+                  AND cancel_requested_at IS NULL
+                  AND next_attempt_at IS NOT NULL
+                  AND next_attempt_at <= ?
+                )
+              )
             ORDER BY
                 CASE status
                     WHEN 'queued' THEN 0
@@ -2436,19 +3050,25 @@ def claim_next_task() -> Optional[Dict[str, Any]]:
                     WHEN 'submitted' THEN 2
                     ELSE 3
                 END,
-                updated_at ASC,
+                COALESCE(next_attempt_at, updated_at) ASC,
                 id ASC
             LIMIT 1
             """
+            ,
+            (now,),
         ).fetchone()
         if not row:
             conn.commit()
             return None
         task = dict(row)
-        now = time.time()
+        claimed_from_status = task.get("status") or ""
         next_status = "running" if task.get("status") == "queued" else "hydrating"
         result = conn.execute(
-            "UPDATE tasks SET status=?, started_at=COALESCE(started_at, ?), updated_at=?, attempt_count=attempt_count+1 WHERE id=?",
+            """
+            UPDATE tasks
+            SET status=?, started_at=COALESCE(started_at, ?), updated_at=?, attempt_count=attempt_count+1, next_attempt_at=NULL
+            WHERE id=?
+            """,
             (next_status, now, now, task["id"]),
         )
         if result.rowcount != 1:
@@ -2457,6 +3077,8 @@ def claim_next_task() -> Optional[Dict[str, Any]]:
         conn.commit()
         task["status"] = next_status
         task["started_at"] = task.get("started_at") or now
+        task["claimed_from_status"] = claimed_from_status
+        task["next_attempt_at"] = None
         return task
     finally:
         conn.close()
@@ -2488,6 +3110,117 @@ def task_hydratable_status(status: str) -> bool:
     return status in {"submitted", "hydrating"}
 
 
+def task_retry_interval_seconds(status: str) -> float:
+    key = "hydrating_task_retry_interval_seconds" if status == "hydrating" else "submitted_task_retry_interval_seconds"
+    default = float_or_default(oreate_cfg().get("video_hydration_poll_interval_seconds"), 10.0)
+    return max(0.0, float_or_default(gateway_cfg().get(key), default))
+
+
+def task_expire_seconds(status: str) -> float:
+    key = "hydrating_task_expire_seconds" if status == "hydrating" else "submitted_task_expire_seconds"
+    default = float_or_default(oreate_cfg().get("video_hydration_timeout_seconds"), 600.0)
+    return max(0.0, float_or_default(gateway_cfg().get(key), default))
+
+
+def task_hydration_attempt_timeout_seconds() -> float:
+    return max(0.0, float_or_default(gateway_cfg().get("task_hydration_attempt_timeout_seconds"), 0.0))
+
+
+def task_poll_interval_seconds() -> float:
+    return max(0.0, float_or_default(oreate_cfg().get("video_hydration_poll_interval_seconds"), 10.0))
+
+
+def task_live_snapshot(task_id: int) -> Optional[Dict[str, Any]]:
+    row = fetch_task_row(task_id)
+    return dict(row) if row else None
+
+
+def task_cancel_requested(task_id: int) -> bool:
+    row = task_live_snapshot(task_id)
+    if not row:
+        return True
+    return row.get("status") == "cancelled" or bool(row.get("cancel_requested_at"))
+
+
+def task_expired(task: Dict[str, Any]) -> bool:
+    base_status = task.get("claimed_from_status") or task.get("status") or ""
+    if base_status not in {"submitted", "hydrating"}:
+        return False
+    max_age = task_expire_seconds(base_status)
+    if max_age <= 0:
+        return False
+    started_at = task.get("started_at") or task.get("created_at") or time.time()
+    return (time.time() - float(started_at)) >= max_age
+
+
+def task_next_attempt_at(task: Dict[str, Any], phase: str, status: str) -> Optional[float]:
+    if status not in {"submitted", "hydrating"}:
+        return None
+    now = time.time()
+    if phase == "generation":
+        return now
+    base_status = task.get("claimed_from_status") or status
+    return now + task_retry_interval_seconds(base_status)
+
+
+def cancel_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "task cancelled") -> None:
+    now = time.time()
+    update_task_attempt(
+        attempt_id,
+        status="cancelled",
+        error_code="TASK_CANCELLED",
+        error_message=message,
+        assets_json=[],
+        finished_at=now,
+    )
+    update_task_record(
+        task["id"],
+        status="cancelled",
+        error_code="TASK_CANCELLED",
+        error_message=message,
+        finished_at=now,
+        next_attempt_at=None,
+    )
+    if task.get("api_key_id"):
+        update_usage_log_for_task(
+            task["id"],
+            task.get("api_key_id"),
+            status="cancelled",
+            response_summary="cancelled",
+            error_code="TASK_CANCELLED",
+            status_code=499,
+        )
+
+
+def expire_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "task expired while waiting for upstream assets") -> None:
+    now = time.time()
+    update_task_attempt(
+        attempt_id,
+        status="expired",
+        error_code="TASK_EXPIRED",
+        error_message=message,
+        assets_json=[],
+        finished_at=now,
+    )
+    update_task_record(
+        task["id"],
+        status="expired",
+        error_code="TASK_EXPIRED",
+        error_message=message,
+        finished_at=now,
+        next_attempt_at=None,
+    )
+    if task.get("api_key_id"):
+        update_usage_log_for_task(
+            task["id"],
+            task.get("api_key_id"),
+            status="expired",
+            response_summary=message,
+            error_code="TASK_EXPIRED",
+            status_code=504,
+        )
+
+
 def run_generation_attempt(task: sqlite3.Row, attempt_id: int) -> Dict[str, Any]:
     body = resolve_task_body(task)
     conn = db_conn()
@@ -2495,15 +3228,38 @@ def run_generation_attempt(task: sqlite3.Row, attempt_id: int) -> Dict[str, Any]
     conn.close()
     if not account_row:
         raise HTTPException(503, "no verified account available")
+    balance_before = capture_account_balance_snapshot(account_row)
+    if balance_before:
+        update_task_record(
+            task["id"],
+            **balance_snapshot_fields(balance_before, "balance_before"),
+        )
+        update_account_balance_snapshot(account_row["id"], balance_before["point_balance_json"])
     caps = capabilities_from_account(account_row)
     options = effective_generation_options(body, caps)
     validate_generation_options(body.kind, options, caps)
-    generation = submit_generation_for_account(account_row, body.kind, body.prompt, options)
+    generation = submit_generation_for_account(
+        account_row,
+        body.kind,
+        body.prompt,
+        options,
+        hydration_timeout_sec=task_hydration_attempt_timeout_seconds(),
+        hydration_poll_interval_sec=task_poll_interval_seconds(),
+        should_stop=lambda: task_cancel_requested(task["id"]),
+    )
+    balance_after = capture_account_balance_snapshot(account_row)
+    if balance_after:
+        update_account_balance_snapshot(account_row["id"], balance_after["point_balance_json"])
     return {
         "account_id": account_row["id"],
         "body": body,
         "options": options,
         "generation": generation,
+        "balance_before": balance_before,
+        "balance_after": balance_after,
+        "actual_point_cost": actual_point_cost_from_balance_snapshots(balance_before, balance_after)
+        if generation.get("status") == "completed"
+        else None,
     }
 
 
@@ -2514,6 +3270,13 @@ def run_hydration_attempt(task: sqlite3.Row, attempt_id: int) -> Dict[str, Any]:
     conn.close()
     if not account_row:
         raise HTTPException(503, "no verified account available")
+    balance_before = capture_account_balance_snapshot(account_row)
+    if balance_before:
+        update_task_record(
+            task["id"],
+            **balance_snapshot_fields(balance_before, "balance_before"),
+        )
+        update_account_balance_snapshot(account_row["id"], balance_before["point_balance_json"])
     session = CLIENT.session_from_account(account_row)
     response_data = json_value_from_db(task.get("response_json")) or {}
     chat = task_response_chat(response_data)
@@ -2521,13 +3284,25 @@ def run_hydration_attempt(task: sqlite3.Row, attempt_id: int) -> Dict[str, Any]:
     if not chat_id:
         raise RuntimeError("task chat_id missing for hydration")
     if body.kind == "video":
-        hydration = CLIENT.hydrate_generation_result_until_assets(session, chat_id, chat_type="aiVideo")
+        hydration = CLIENT.hydrate_generation_result_until_assets(
+            session,
+            chat_id,
+            timeout_sec=task_hydration_attempt_timeout_seconds(),
+            poll_interval_sec=task_poll_interval_seconds(),
+            chat_type="aiVideo",
+            should_stop=lambda: task_cancel_requested(task["id"]),
+        )
     else:
         hydration = CLIENT.hydrate_generation_result(session, chat_id)
     if hydration.get("error"):
         raise UpstreamGenerationError(hydration["error"])
+    if hydration.get("status") == "cancelled":
+        raise TaskCancelledError("task cancelled")
     assets = hydration.get("assets") or []
     result_status = "completed" if assets else "submitted"
+    balance_after = capture_account_balance_snapshot(account_row)
+    if balance_after:
+        update_account_balance_snapshot(account_row["id"], balance_after["point_balance_json"])
     return {
         "account_id": account_row["id"],
         "body": body,
@@ -2535,11 +3310,20 @@ def run_hydration_attempt(task: sqlite3.Row, attempt_id: int) -> Dict[str, Any]:
         "assets": assets,
         "status": result_status,
         "chat_id": chat_id,
+        "balance_before": balance_before,
+        "balance_after": balance_after,
+        "actual_point_cost": actual_point_cost_from_balance_snapshots(balance_before, balance_after)
+        if result_status == "completed"
+        else None,
     }
 
 
 def finalize_task_attempt(task: sqlite3.Row, attempt_id: int, phase: str, result: Dict[str, Any], status: str) -> None:
     now = time.time()
+    if task_cancel_requested(task["id"]):
+        cancel_task_attempt(task, attempt_id, result.get("error_message") or "task cancelled")
+        return
+    next_attempt_at = task_next_attempt_at(task, phase, status)
     update_task_attempt(
         attempt_id,
         status=status,
@@ -2560,6 +3344,16 @@ def finalize_task_attempt(task: sqlite3.Row, attempt_id: int, phase: str, result
         assets_json=result.get("assets") or [],
         error_code=result.get("error_code") or "",
         error_message=result.get("error_message") or "",
+        actual_point_cost=result.get("actual_point_cost"),
+        balance_before_json=result.get("balance_before_json"),
+        balance_after_json=result.get("balance_after_json"),
+        balance_before_rest_point=result.get("balance_before_rest_point"),
+        balance_before_daily_point=result.get("balance_before_daily_point"),
+        balance_before_bonus_point=result.get("balance_before_bonus_point"),
+        balance_after_rest_point=result.get("balance_after_rest_point"),
+        balance_after_daily_point=result.get("balance_after_daily_point"),
+        balance_after_bonus_point=result.get("balance_after_bonus_point"),
+        next_attempt_at=next_attempt_at,
         finished_at=now if status in TASK_TERMINAL_STATUSES else None,
     )
     if task.get("api_key_id"):
@@ -2569,6 +3363,7 @@ def finalize_task_attempt(task: sqlite3.Row, attempt_id: int, phase: str, result
             status=status,
             response_summary=result.get("response_summary") or status,
             error_code=result.get("error_code") or "",
+            actual_point_cost=result.get("actual_point_cost"),
             status_code=result.get("status_code") or (200 if status == "completed" else 202 if status in {"queued", "submitted", "hydrating"} else 503),
         )
 
@@ -2577,12 +3372,21 @@ def execute_task(task: sqlite3.Row) -> bool:
     phase = "generation" if task.get("status") == "running" else "hydration"
     attempt_id = create_task_attempt(task, phase, status="running")
     try:
+        if task_cancel_requested(task["id"]):
+            raise TaskCancelledError("task cancelled")
+        if phase == "hydration" and task_expired(task):
+            expire_task_attempt(task, attempt_id)
+            return True
         if phase == "generation":
             result = run_generation_attempt(task, attempt_id)
             generation = result["generation"]
+            if task_cancel_requested(task["id"]) or generation.get("status") == "cancelled":
+                raise TaskCancelledError("task cancelled")
             assets = generation.get("assets") or []
             status = generation.get("status") or ("completed" if assets else "submitted")
             response = generation.get("response") or {}
+            balance_before = result.get("balance_before")
+            balance_after = result.get("balance_after")
             result_payload = {
                 "account_id": result.get("account_id"),
                 "response_json": response,
@@ -2593,7 +3397,10 @@ def execute_task(task: sqlite3.Row) -> bool:
                 "hydration_summary": generation.get("hydration"),
                 "response_summary": json.dumps({"status": status, "assets": len(assets)}, ensure_ascii=False),
                 "status_code": 200 if status == "completed" else 202,
+                "actual_point_cost": result.get("actual_point_cost"),
             }
+            result_payload.update(balance_snapshot_fields(balance_before, "balance_before"))
+            result_payload.update(balance_snapshot_fields(balance_after, "balance_after"))
             if status == "completed":
                 mark_account_success(result["account_id"])
             else:
@@ -2602,6 +3409,8 @@ def execute_task(task: sqlite3.Row) -> bool:
             return True
 
         hydration_result = run_hydration_attempt(task, attempt_id)
+        if task_cancel_requested(task["id"]) or hydration_result.get("status") == "cancelled":
+            raise TaskCancelledError("task cancelled")
         status = hydration_result.get("status") or ("completed" if hydration_result.get("assets") else "submitted")
         result_payload = {
             "account_id": hydration_result.get("account_id"),
@@ -2612,74 +3421,43 @@ def execute_task(task: sqlite3.Row) -> bool:
             "hydration_summary": hydration_result.get("hydration"),
             "response_summary": json.dumps({"status": status, "assets": len(hydration_result.get("assets") or [])}, ensure_ascii=False),
             "status_code": 200 if status == "completed" else 202,
+            "actual_point_cost": hydration_result.get("actual_point_cost"),
         }
+        result_payload.update(balance_snapshot_fields(hydration_result.get("balance_before"), "balance_before"))
+        result_payload.update(balance_snapshot_fields(hydration_result.get("balance_after"), "balance_after"))
         mark_account_success(result_payload["account_id"])
         finalize_task_attempt(task, attempt_id, phase, result_payload, status)
         return True
+    except TaskCancelledError as exc:
+        cancel_task_attempt(task, attempt_id, str(exc) or "task cancelled")
+        return True
     except UpstreamGenerationError as exc:
+        if task_cancel_requested(task["id"]):
+            cancel_task_attempt(task, attempt_id, "task cancelled")
+            return True
         error = exc.error if isinstance(exc.error, dict) else {}
         code = error.get("code") or "UPSTREAM_ERROR"
         message = error.get("message") or str(exc)
-        result_payload = {
-            "account_id": task.get("account_id"),
-            "error_code": code,
-            "error_message": message,
-            "response_summary": json.dumps({"code": code, "message": message}, ensure_ascii=False),
-            "status_code": 503,
-        }
+        result_payload = build_failed_task_result_payload(task["id"], task.get("account_id"), code, message, status_code=503)
         if task.get("account_id"):
             mark_account_failure(task["account_id"], exc)
-        update_task_attempt(
-            attempt_id,
-            status="failed",
-            error_code=code,
-            error_message=message,
-            finished_at=time.time(),
-        )
-        update_task_record(
-            task["id"],
-            status="failed",
-            error_code=code,
-            error_message=message,
-            finished_at=time.time(),
-        )
-        if task.get("api_key_id"):
-            update_usage_log_for_task(
-                task["id"],
-                task.get("api_key_id"),
-                status="failed",
-                response_summary=message,
-                error_code=code,
-                status_code=503,
-            )
+        finalize_task_attempt(task, attempt_id, phase, result_payload, "failed")
         return False
     except Exception as exc:
+        if task_cancel_requested(task["id"]):
+            cancel_task_attempt(task, attempt_id, "task cancelled")
+            return True
         if task.get("account_id"):
             mark_account_failure(task["account_id"], exc)
         message = str(exc)
-        update_task_attempt(
-            attempt_id,
-            status="failed",
-            error_code="UPSTREAM_ERROR",
-            error_message=message,
-            finished_at=time.time(),
-        )
-        update_task_record(
+        result_payload = build_failed_task_result_payload(
             task["id"],
-            status="failed",
-            error_code="UPSTREAM_ERROR",
-            error_message=message,
-            finished_at=time.time(),
+            task.get("account_id"),
+            "UPSTREAM_ERROR",
+            message,
+            status_code=503,
         )
-        if task.get("api_key_id"):
-            update_usage_log_for_task(
-                task["id"],
-                task.get("api_key_id"),
-                status="failed",
-                response_summary=message,
-                error_code="UPSTREAM_ERROR",
-                status_code=503,
-            )
+        finalize_task_attempt(task, attempt_id, phase, result_payload, "failed")
         return False
 
 
@@ -2797,7 +3575,15 @@ def refresh_capabilities_from_pool() -> Dict[str, Any]:
     return {"ok": True, "source_account_id": account["id"], **caps}
 
 
-def submit_generation_for_account(account: sqlite3.Row, kind: str, prompt: str, options: Dict[str, Any]) -> Dict[str, Any]:
+def submit_generation_for_account(
+    account: sqlite3.Row,
+    kind: str,
+    prompt: str,
+    options: Dict[str, Any],
+    hydration_timeout_sec: Optional[float] = None,
+    hydration_poll_interval_sec: Optional[float] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> Dict[str, Any]:
     s = CLIENT.session_from_account(account)
     chat_type = "aiImage" if kind == "image" else "aiVideo"
     caps = capabilities_from_account(account)
@@ -2829,11 +3615,21 @@ def submit_generation_for_account(account: sqlite3.Row, kind: str, prompt: str, 
         video_config=video_config,
         attachments=attachments,
         account=account,
+        should_stop=should_stop,
     )
     if stream.get("error"):
         raise UpstreamGenerationError(stream["error"])
-    if kind == "video" and stream.get("status") == "submitted":
-        hydration = CLIENT.hydrate_generation_result_until_assets(s, chat["chatId"], chat_type=chat_type)
+    if stream.get("status") == "cancelled":
+        hydration = {"raw": {}, "assets": [], "status": "cancelled"}
+    elif kind == "video" and stream.get("status") == "submitted":
+        hydration = CLIENT.hydrate_generation_result_until_assets(
+            s,
+            chat["chatId"],
+            timeout_sec=hydration_timeout_sec,
+            poll_interval_sec=hydration_poll_interval_sec,
+            chat_type=chat_type,
+            should_stop=should_stop,
+        )
     elif kind == "video":
         hydration = CLIENT.hydrate_generation_result(s, chat["chatId"], chat_type=chat_type)
     else:
@@ -2990,6 +3786,37 @@ class GatewayAPIError(Exception):
         self.request_id = request_id
 
 
+@app.middleware("http")
+async def admin_audit_middleware(request: Request, call_next):
+    try:
+        response = await call_next(request)
+    except Exception:
+        admin_username = getattr(request.state, "admin_username", None)
+        if admin_username and request.url.path.startswith("/api/"):
+            try:
+                write_admin_audit(
+                    f"{request.method} {request.url.path}",
+                    admin_username,
+                    request,
+                    status_code=500,
+                )
+            except Exception:
+                pass
+        raise
+    admin_username = getattr(request.state, "admin_username", None)
+    if admin_username and request.url.path.startswith("/api/"):
+        try:
+            write_admin_audit(
+                f"{request.method} {request.url.path}",
+                admin_username,
+                request,
+                status_code=response.status_code,
+            )
+        except Exception:
+            pass
+    return response
+
+
 def gateway_request_id(request: Optional[Request] = None) -> str:
     if request is not None:
         incoming = request.headers.get("X-Request-ID")
@@ -3128,31 +3955,335 @@ def log_usage(
     return row[0] if row else None
 
 
+def admin_session_ttl_seconds() -> float:
+    ttl_hours = float_or_default(CFG.get("server", {}).get("admin_session_ttl_hours"), 12.0)
+    return max(0.0, ttl_hours * 3600.0)
+
+
+def admin_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _admin_session_row(conn: sqlite3.Connection, token: str) -> Optional[sqlite3.Row]:
+    token_hash = admin_token_hash(token)
+    return conn.execute("SELECT * FROM admin_sessions WHERE token_hash=?", (token_hash,)).fetchone()
+
+
+def create_admin_session(token: str, username: str, request: Optional[Request] = None) -> None:
+    now = time.time()
+    expires_at = now + admin_session_ttl_seconds()
+    conn = db_conn()
+    conn.execute(
+        """
+        INSERT INTO admin_sessions(
+            token_hash, username, created_at, last_used_at, expires_at, revoked_at, revoked_reason, remote_addr, user_agent
+        ) VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            admin_token_hash(token),
+            username,
+            now,
+            now,
+            expires_at,
+            None,
+            None,
+            request.client.host if request and request.client else "",
+            request.headers.get("user-agent", "") if request else "",
+        ),
+    )
+    conn.commit()
+    conn.close()
+    ADMIN_TOKENS[token] = username
+
+
+def revoke_admin_session(token: str, reason: str = "logout") -> None:
+    now = time.time()
+    conn = db_conn()
+    conn.execute(
+        "UPDATE admin_sessions SET revoked_at=?, revoked_reason=? WHERE token_hash=? AND revoked_at IS NULL",
+        (now, reason, admin_token_hash(token)),
+    )
+    conn.commit()
+    conn.close()
+    ADMIN_TOKENS.pop(token, None)
+
+
+def revoke_all_admin_sessions(reason: str = "credentials_updated") -> None:
+    now = time.time()
+    conn = db_conn()
+    conn.execute(
+        "UPDATE admin_sessions SET revoked_at=COALESCE(revoked_at, ?), revoked_reason=COALESCE(revoked_reason, ?) WHERE revoked_at IS NULL",
+        (now, reason),
+    )
+    conn.commit()
+    conn.close()
+    ADMIN_TOKENS.clear()
+
+
+def write_admin_audit(
+    action: str,
+    admin_username: str,
+    request: Optional[Request] = None,
+    *,
+    status_code: Optional[int] = None,
+    entity_type: str = "",
+    entity_id: Optional[Any] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    payload: Any = details or {}
+    if payload:
+        payload = redact_nested_fields(
+            json.loads(json.dumps(payload, ensure_ascii=False)),
+            {"password", "current_password", "new_password", "confirm_password", "token", "token_id", "tokenID", "tokenId", "api_key", "secret", "cookie", "cookies"},
+        )
+    try:
+        details_json = json.dumps(payload, ensure_ascii=False)
+    except TypeError:
+        details_json = json.dumps({"value": str(payload)}, ensure_ascii=False)
+    conn = db_conn()
+    conn.execute(
+        """
+        INSERT INTO admin_audit_log(
+            admin_username, action, method, path, status_code, entity_type, entity_id,
+            details_json, remote_addr, user_agent, created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            admin_username,
+            action,
+            request.method if request else "",
+            request.url.path if request else "",
+            status_code,
+            entity_type,
+            None if entity_id is None else str(entity_id),
+            details_json,
+            request.client.host if request and request.client else "",
+            request.headers.get("user-agent", "") if request else "",
+            time.time(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_admin_audit_rows(limit: int = 100) -> List[sqlite3.Row]:
+    conn = db_conn()
+    rows = conn.execute(
+        "SELECT * FROM admin_audit_log ORDER BY id DESC LIMIT ?",
+        (max(1, min(int(limit), 500)),),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def build_backup_zip_bytes() -> bytes:
+    temp_db_handle = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    temp_db_handle.close()
+    temp_db_path = Path(temp_db_handle.name)
+    source = db_conn()
+    dest = sqlite3.connect(temp_db_path)
+    try:
+        source.backup(dest)
+        dest.commit()
+    finally:
+        dest.close()
+        source.close()
+    manifest = {
+        "created_at": time.time(),
+        "db_filename": "accounts.db",
+        "config_filename": "config.json",
+        "server_host": CFG.get("server", {}).get("host", ""),
+        "server_port": CFG.get("server", {}).get("port", 0),
+    }
+    try:
+        db_bytes = temp_db_path.read_bytes()
+    finally:
+        try:
+            temp_db_path.unlink()
+        except FileNotFoundError:
+            pass
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("accounts.db", db_bytes)
+        archive.writestr("config.json", json.dumps(CFG, ensure_ascii=False, indent=2))
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+    return buffer.getvalue()
+
+
+def restore_backup_zip_bytes(payload: bytes) -> Dict[str, Any]:
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        names = set(archive.namelist())
+        if "accounts.db" not in names or "config.json" not in names:
+            raise HTTPException(400, "backup archive missing required files")
+        temp_dir = Path(tempfile.mkdtemp(prefix="oreate-restore-"))
+        try:
+            db_path = temp_dir / "accounts.db"
+            config_path = temp_dir / "config.json"
+            db_path.write_bytes(archive.read("accounts.db"))
+            config_path.write_bytes(archive.read("config.json"))
+            restored_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            if not isinstance(restored_cfg, dict):
+                raise HTTPException(400, "backup config is invalid")
+            global CFG
+            CFG = deep_merge(DEFAULT_CONFIG, restored_cfg)
+            save_config(CFG)
+            if DB_PATH.exists():
+                DB_PATH.unlink()
+            shutil.copyfile(db_path, DB_PATH)
+            init_db()
+            revoke_all_admin_sessions("backup_restored")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    return {"ok": True, "restored": True, "requires_relogin": True, "message": "恢复完成，请重新登录。"}
+
+
 # === API Key Management (admin only) ===
 def require_admin(request: Request):
     auth = request.headers.get("Authorization", "")
     token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else auth
-    if token not in ADMIN_TOKENS:
+    if not token:
         raise HTTPException(401, "admin login required")
-    return token
+    conn = db_conn()
+    row = _admin_session_row(conn, token)
+    now = time.time()
+    if row and (row["revoked_at"] is not None or float(row["expires_at"] or 0) <= now):
+        if row["revoked_at"] is None:
+            conn.execute(
+                "UPDATE admin_sessions SET revoked_at=?, revoked_reason=? WHERE id=?",
+                (now, "expired", row["id"]),
+            )
+            conn.commit()
+        conn.close()
+        ADMIN_TOKENS.pop(token, None)
+        raise HTTPException(401, "admin login required")
+    if not row:
+        conn.close()
+        raise HTTPException(401, "admin login required")
+    conn.execute("UPDATE admin_sessions SET last_used_at=? WHERE id=?", (now, row["id"]))
+    conn.commit()
+    conn.close()
+    request.state.admin_username = row["username"]
+    request.state.admin_session_token = token
+    ADMIN_TOKENS[token] = row["username"]
+    return row["username"]
+
+
+def update_policy_override(section: str, key: str, body: Dict[str, Any], allowed_keys: Iterable[str]) -> Dict[str, Any]:
+    global CFG
+    patch = {name: body[name] for name in allowed_keys if name in body}
+    gateway_cfg_section = CFG.setdefault("gateway", {})
+    policies = gateway_cfg_section.setdefault(section, {})
+    current = policies.get(key, {})
+    if not isinstance(current, dict):
+        current = {}
+    merged = resolve_policy(current, patch)
+    policies[key] = merged
+    save_config(CFG)
+    return merged
+
+
+def get_client_record(client_id: int) -> sqlite3.Row:
+    conn = db_conn()
+    row = conn.execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "client not found")
+    return row
 
 
 @app.get("/api/admin/apikeys")
 def list_api_keys(_=Depends(require_admin)):
     conn = db_conn()
-    rows = conn.execute("SELECT * FROM api_keys ORDER BY id DESC").fetchall()
+    rows = conn.execute(
+        """
+        SELECT api_keys.*, clients.name AS client_name, clients.contact AS client_contact, clients.status AS client_status
+        FROM api_keys
+        LEFT JOIN clients ON clients.id=api_keys.client_id
+        ORDER BY api_keys.id DESC
+        """
+    ).fetchall()
     conn.close()
     return {"items": [public_api_key(r) for r in rows]}
 
 
+@app.get("/api/admin/clients")
+def list_clients(_=Depends(require_admin)):
+    conn = db_conn()
+    rows = conn.execute("SELECT * FROM clients ORDER BY id DESC").fetchall()
+    conn.close()
+    return {"items": [public_client(r) for r in rows]}
+
+
+@app.post("/api/admin/clients")
+def create_client(body: Dict[str, Any] = None, _=Depends(require_admin)):
+    payload = body or {}
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "client name is required")
+    contact = str(payload.get("contact") or "").strip()
+    status = str(payload.get("status") or "active").strip() or "active"
+    now = time.time()
+    conn = db_conn()
+    conn.execute(
+        "INSERT INTO clients(name, contact, status, created_at) VALUES(?,?,?,?)",
+        (name, contact, status, now),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM clients WHERE id=last_insert_rowid()").fetchone()
+    conn.close()
+    return {"ok": True, "item": public_client(row)}
+
+
+@app.patch("/api/models/{model_name}/policy")
+def patch_model_policy(model_name: str, body: Dict[str, Any], _=Depends(require_admin)):
+    policy = update_policy_override(
+        "model_policies",
+        model_name,
+        body or {},
+        {"enabled", "experimental", "verification_status", "risk_level"},
+    )
+    return {"ok": True, "model_name": model_name, "policy": policy}
+
+
+@app.patch("/api/video-scenes/{scene_id}/policy")
+def patch_video_scene_policy(scene_id: str, body: Dict[str, Any], _=Depends(require_admin)):
+    policy = update_policy_override(
+        "scene_policies",
+        scene_id,
+        body or {},
+        {"enabled", "experimental", "verification_status", "risk_level"},
+    )
+    return {"ok": True, "scene_id": scene_id, "policy": policy}
+
+
 @app.post("/api/admin/apikeys")
 def create_api_key(body: Dict[str, Any] = None, _=Depends(require_admin)):
-    name = (body or {}).get("name", "")
+    payload = body or {}
+    name = payload.get("name", "")
+    client_id = payload.get("client_id")
+    client_id_value = None
+    if client_id not in (None, ""):
+        try:
+            client_id_value = int(client_id)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "client_id must be an integer")
+        get_client_record(client_id_value)
     key = "oreate_" + secrets.token_hex(24)
     conn = db_conn()
-    conn.execute("INSERT INTO api_keys (key, name, enabled, created_at) VALUES (?,?,1,?)", (key, name, time.time()))
+    conn.execute(
+        "INSERT INTO api_keys (client_id, key, name, enabled, created_at) VALUES (?,?,?,?,?)",
+        (client_id_value, key, name, 1, time.time()),
+    )
     conn.commit()
-    row = conn.execute("SELECT * FROM api_keys WHERE key=?", (key,)).fetchone()
+    row = conn.execute(
+        """
+        SELECT api_keys.*, clients.name AS client_name, clients.contact AS client_contact, clients.status AS client_status
+        FROM api_keys
+        LEFT JOIN clients ON clients.id=api_keys.client_id
+        WHERE api_keys.key=?
+        """,
+        (key,),
+    ).fetchone()
     conn.close()
     return {"ok": True, "item": public_api_key(row, reveal=True) if row else None}
 
@@ -3169,13 +4300,29 @@ def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_a
         return value
 
     conn = db_conn()
+    current = conn.execute("SELECT client_id FROM api_keys WHERE id=?", (key_id,)).fetchone()
+    if not current:
+        conn.close()
+        raise HTTPException(404, "api key not found")
+    client_id = body.get("client_id") if isinstance(body, dict) else None
+    client_id_value: Optional[int]
+    if client_id in (None, ""):
+        client_id_value = current["client_id"]
+    else:
+        try:
+            client_id_value = int(client_id)
+        except (TypeError, ValueError):
+            conn.close()
+            raise HTTPException(400, "client_id must be an integer")
+        get_client_record(client_id_value)
     conn.execute(
         """
         UPDATE api_keys
-        SET rate_limit_per_minute=?, daily_request_limit=?, daily_point_limit=?
+        SET client_id=?, rate_limit_per_minute=?, daily_request_limit=?, daily_point_limit=?
         WHERE id=?
         """,
         (
+            client_id_value,
             limit_value("rate_limit_per_minute"),
             limit_value("daily_request_limit"),
             limit_value("daily_point_limit"),
@@ -3183,7 +4330,15 @@ def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_a
         ),
     )
     conn.commit()
-    row = conn.execute("SELECT * FROM api_keys WHERE id=?", (key_id,)).fetchone()
+    row = conn.execute(
+        """
+        SELECT api_keys.*, clients.name AS client_name, clients.contact AS client_contact, clients.status AS client_status
+        FROM api_keys
+        LEFT JOIN clients ON clients.id=api_keys.client_id
+        WHERE api_keys.id=?
+        """,
+        (key_id,),
+    ).fetchone()
     conn.close()
     if not row:
         raise HTTPException(404, "api key not found")
@@ -3341,13 +4496,7 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
     check_rate_limit(api_key_id, policy, now, request_id)
     if body.kind not in ("image", "video"):
         raise GatewayAPIError(400, "UNSUPPORTED_KIND", f"unsupported kind: {body.kind}", {"field": "kind"}, request_id=request_id)
-    account = pick_account_for_generation(body.kind, body.account_id)
-    if not account:
-        raise GatewayAPIError(503, "NO_ACCOUNT_AVAILABLE", "no verified account available")
-    caps = capabilities_from_account(account)
-    options = effective_generation_options(body, caps)
-    validate_generation_options(body.kind, options, caps)
-    estimated_point_cost = estimate_point_cost(body.kind, options, caps)
+    account, caps, options, estimated_point_cost = select_generation_account(body, request_id=request_id)
     check_daily_quota(api_key_id, estimated_point_cost, policy, now, request_id)
 
     task_id = queue_generation_task(api_key_id, request_id, account, body, options, estimated_point_cost)
@@ -3462,11 +4611,67 @@ def gateway_tasks(api_key_id: int = Depends(require_api_key)):
 @app.get("/v1/accounts/status")
 def gateway_account_status(api_key_id: int = Depends(require_api_key)):
     """Get pool status."""
+    rows = list_accounts()
+    summary = account_pool_summary(rows)
+    return {
+        "ok": True,
+        "total_accounts": summary["total"],
+        "verified_accounts": summary["verified"],
+        "healthy_accounts": summary["healthy"],
+        "cooling_accounts": summary["cooling"],
+        "low_balance_accounts": summary["low_balance"],
+        "invalid_accounts": summary["invalid"],
+        "risk_control_accounts": summary["risk_control"],
+        "balance_known_accounts": summary["balance_known"],
+    }
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "status": "ok"}
+
+
+@app.get("/readyz")
+def readyz():
+    try:
+        conn = db_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.rollback()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(503, f"database not ready: {exc}")
+    if not isinstance(CFG, dict) or not isinstance(gateway_cfg(), dict):
+        raise HTTPException(503, "config not ready")
+    rows = list_accounts()
+    summary = account_pool_summary(rows)
+    if summary["healthy"] <= 0:
+        raise HTTPException(503, "no healthy account available")
+    return {
+        "ok": True,
+        "status": "ready",
+        "db": True,
+        "config": True,
+        "healthy_accounts": summary["healthy"],
+        "usable_accounts": summary["healthy"] + summary["cooling"],
+        "total_accounts": summary["total"],
+    }
+
+
+@app.get("/metrics")
+def metrics():
+    rows = list_accounts()
+    account_summary = account_pool_summary(rows)
     conn = db_conn()
-    total = conn.execute("SELECT COUNT(*) as c FROM accounts").fetchone()["c"]
-    verified = conn.execute("SELECT COUNT(*) as c FROM accounts WHERE status='verified'").fetchone()["c"]
+    task_rows = conn.execute("SELECT status,error_code FROM tasks").fetchall()
     conn.close()
-    return {"ok": True, "total_accounts": total, "verified_accounts": verified}
+    task_summary = task_metrics_summary(task_rows)
+    usage_summary = usage_metrics_summary()
+    return {
+        "ok": True,
+        "accounts": account_summary,
+        "tasks": task_summary,
+        "usage": usage_summary,
+    }
 
 
 @app.get("/v1/capabilities")
@@ -3519,6 +4724,7 @@ def retry_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[st
         chat_id="",
         focus_id="",
         cancel_requested_at=None,
+        next_attempt_at=None,
         started_at=None,
         finished_at=None,
     )
@@ -3546,7 +4752,10 @@ def cancel_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[s
     update_task_record(
         task_id,
         status="cancelled",
+        error_code="TASK_CANCELLED",
+        error_message="task cancelled",
         cancel_requested_at=now,
+        next_attempt_at=None,
         finished_at=now,
     )
     if task.get("api_key_id"):
@@ -3555,7 +4764,7 @@ def cancel_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[s
             task.get("api_key_id"),
             status="cancelled",
             response_summary="cancelled",
-            error_code="",
+            error_code="TASK_CANCELLED",
             status_code=499,
         )
     return gateway_task_detail_payload(task_id, api_key_id)
@@ -3574,6 +4783,8 @@ def hydrate_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[
         error_code="",
         error_message="",
         cancel_requested_at=None,
+        next_attempt_at=time.time(),
+        finished_at=None,
     )
     if task.get("api_key_id"):
         update_usage_log_for_task(
@@ -3632,7 +4843,7 @@ def root():
 
 
 @app.post("/api/admin/login")
-def admin_login(body: LoginIn):
+def admin_login(body: LoginIn, request: Request):
     expected_user = str(CFG["server"].get("admin_username") or "")
     expected_password = str(CFG["server"].get("admin_password") or "")
     if is_unsafe_admin_password(expected_password):
@@ -3640,7 +4851,8 @@ def admin_login(body: LoginIn):
     if not secrets.compare_digest(body.username, expected_user) or not secrets.compare_digest(body.password, expected_password):
         raise HTTPException(401, "invalid admin credentials")
     token = secrets.token_hex(24)
-    ADMIN_TOKENS[token] = body.username
+    create_admin_session(token, body.username, request)
+    write_admin_audit("login", body.username, request, status_code=200, details={"username": body.username})
     return {"ok": True, "token": token}
 
 
@@ -3659,8 +4871,42 @@ def update_admin_credentials(body: AdminCredentialsIn, _=Depends(require_admin))
         raise HTTPException(400, "new password is too weak")
     CFG = deep_merge(CFG, {"server": {"admin_username": new_username, "admin_password": body.new_password}})
     save_config(CFG)
-    ADMIN_TOKENS.clear()
+    revoke_all_admin_sessions("credentials_updated")
     return {"ok": True}
+
+
+@app.post("/api/admin/logout")
+def admin_logout(request: Request, _=Depends(require_admin)):
+    token = getattr(request.state, "admin_session_token", "")
+    if token:
+        revoke_admin_session(token, "logout")
+    return {"ok": True}
+
+
+@app.get("/api/admin/audit-logs")
+def list_admin_audit_logs(limit: int = 100, _=Depends(require_admin)):
+    return {"items": [public_admin_audit(row) for row in list_admin_audit_rows(limit)]}
+
+
+@app.get("/api/admin/backup")
+def download_admin_backup(_=Depends(require_admin)):
+    payload = build_backup_zip_bytes()
+    headers = {"Content-Disposition": f'attachment; filename="oreate-backup-{int(time.time())}.zip"'}
+    return StreamingResponse(io.BytesIO(payload), media_type="application/zip", headers=headers)
+
+
+@app.post("/api/admin/restore")
+def upload_admin_restore(
+    confirm: bool = Form(False),
+    file: UploadFile = File(...),
+    _=Depends(require_admin),
+):
+    if not confirm:
+        raise HTTPException(400, "restore confirmation is required")
+    payload = file.file.read()
+    if not payload:
+        raise HTTPException(400, "backup file is empty")
+    return restore_backup_zip_bytes(payload)
 
 
 @app.get("/api/admin/settings")
@@ -3682,6 +4928,22 @@ def api_accounts(_=Depends(require_admin)):
     return {"items": [public_account(row) for row in list_accounts()]}
 
 
+@app.post("/api/accounts/{account_id}/refresh-balance")
+def refresh_account_balance(account_id: int, _=Depends(require_admin)):
+    conn = db_conn()
+    account = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+    conn.close()
+    if not account:
+        raise HTTPException(404, "account not found")
+    try:
+        session = CLIENT.session_from_account(account)
+        detail = CLIENT.fetch_account_point_detail(session, account)
+    except Exception as exc:
+        raise HTTPException(503, str(exc))
+    row = update_account_balance_snapshot(account_id, detail)
+    return {"ok": True, "item": public_account(row)}
+
+
 @app.get("/api/models/capabilities")
 def admin_model_capabilities(_=Depends(require_admin)):
     return load_capabilities_from_pool()
@@ -3699,12 +4961,12 @@ def mail_test(_=Depends(require_admin)):
 
 @app.post("/api/register/one")
 def register_one(_=Depends(require_admin)):
-    return {"items": auto_register_accounts(1)}
+    return {"items": [public_registration_result(item) for item in auto_register_accounts(1)]}
 
 
 @app.post("/api/register/batch")
 def register_batch(body: AutoRegisterIn, _=Depends(require_admin)):
-    return {"items": auto_register_accounts(body.count)}
+    return {"items": [public_registration_result(item) for item in auto_register_accounts(body.count)]}
 
 
 @app.post("/api/accounts/import")
@@ -3728,9 +4990,6 @@ def import_account(body: Dict[str, str], _=Depends(require_admin)):
 def generate_media(body: MediaTaskIn, request: Request, _=Depends(require_admin)):
     if body.kind not in ("image", "video"):
         raise HTTPException(400, f"unsupported kind: {body.kind}")
-    account = pick_account_for_generation(body.kind, body.account_id)
-    if not account:
-        raise HTTPException(503, "no verified account available")
     gateway_body = GatewayGenerateIn(
         kind=body.kind,
         prompt=body.prompt,
@@ -3754,13 +5013,10 @@ def generate_media(body: MediaTaskIn, request: Request, _=Depends(require_admin)
         is_audio=body.is_audio,
         ai_type=body.ai_type,
     )
-    caps = capabilities_from_account(account)
-    options = effective_generation_options(gateway_body, caps)
     try:
-        validate_generation_options(body.kind, options, caps)
+        account, caps, options, estimated_point_cost = select_generation_account(gateway_body)
     except GatewayAPIError as exc:
         raise HTTPException(exc.status_code, exc.message)
-    estimated_point_cost = estimate_point_cost(body.kind, options, caps)
     task_id = queue_generation_task(None, gateway_request_id(request), account, gateway_body, options, estimated_point_cost)
     return {"ok": True, "task_id": task_id, "status": "queued", "account_id": account["id"], "estimated_point_cost": estimated_point_cost}
 
@@ -3814,7 +5070,7 @@ def pool_maintain(body: MaintainIn, _=Depends(require_admin)):
         "ok": True,
         "accounts_total": len(accounts),
         "verified_total": len(verified),
-        "created": created,
+        "created": [public_registration_result(item) for item in created],
     }
 
 
@@ -3951,7 +5207,7 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
   <div class="table-wrap">
     <table>
       <thead><tr>
-        <th>ID</th><th>邮箱</th><th>状态</th><th>来源</th><th>OUID</th><th>创建时间</th><th>操作</th>
+        <th>ID</th><th>邮箱</th><th>状态</th><th>健康</th><th>来源</th><th>OUID</th><th>余额</th><th>更新时间</th><th>创建时间</th><th>操作</th>
       </tr></thead>
       <tbody id="accounts-tbody"></tbody>
     </table>
@@ -4010,6 +5266,12 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
 <!-- Tab: API Keys -->
 <div id="tab-apikeys" class="section hidden">
   <h2>🔑 API Keys</h2>
+  <h3 style="margin-top:0;font-size:14px">客户</h3>
+  <div class="row" style="margin-bottom:16px">
+    <div class="col"><input id="client-name" placeholder="客户名称"></div>
+    <div class="col"><input id="client-contact" placeholder="联系方式"></div>
+    <div><button class="btn-primary" onclick="createClient()">创建客户</button></div>
+  </div>
   <div style="margin-bottom:16px">
     <div class="endpoint-box">
       <div class="url">POST /v1/generate</div>
@@ -4018,6 +5280,7 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
   </div>
   <div class="row" style="margin-bottom:16px">
     <div class="col"><input id="ak-name" placeholder="名称（可选）"></div>
+    <div class="col"><select id="ak-client"></select></div>
     <div><button class="btn-primary" onclick="createApiKey()">创建 Key</button></div>
   </div>
   <div id="ak-new" class="hidden" style="background:#e8f5e9;padding:12px;border-radius:10px;margin-bottom:12px">
@@ -4026,8 +5289,15 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
   </div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>Key</th><th>名称</th><th>状态</th><th>每分钟</th><th>每日请求</th><th>每日点数</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead>
+      <thead><tr><th>ID</th><th>Key</th><th>名称</th><th>客户</th><th>状态</th><th>每分钟</th><th>每日请求</th><th>每日点数</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead>
       <tbody id="apikeys-tbody"></tbody>
+    </table>
+  </div>
+  <h2 style="margin-top:24px">👥 客户列表</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>名称</th><th>联系方式</th><th>状态</th><th>创建时间</th></tr></thead>
+      <tbody id="clients-tbody"></tbody>
     </table>
   </div>
   <h2 style="margin-top:24px">📊 用量日志</h2>
@@ -4080,6 +5350,21 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
     <button class="btn-secondary" onclick="refreshCapabilities()">刷新模型能力</button>
     <span style="font-size:12px;color:#86868b" id="cap-status">未加载</span>
   </div>
+
+  <h3 style="margin-top:20px;font-size:14px">🧾 审计日志</h3>
+  <div class="table-wrap" style="margin-top:8px">
+    <table>
+      <thead><tr><th>时间</th><th>用户</th><th>动作</th><th>路径</th><th>状态</th><th>详情</th></tr></thead>
+      <tbody id="audit-tbody"></tbody>
+    </table>
+  </div>
+
+  <h3 style="margin-top:20px;font-size:14px">🗄 备份与恢复</h3>
+  <div class="row" style="margin-top:8px">
+    <div class="col"><button class="btn-secondary" onclick="downloadBackup()">下载备份</button></div>
+    <div class="col"><label>恢复包</label><input id="restore-file" type="file" accept=".zip,application/zip"></div>
+    <div class="col" style="align-self:end"><button class="btn-danger" onclick="restoreBackup()">恢复备份</button></div>
+  </div>
 </div>
 
 </div>
@@ -4123,9 +5408,48 @@ async function adminLogin(){
   await init();
 }
 function logout(){
+  if (adminToken) {
+    fetch(BASE + '/api/admin/logout', {
+      method:'POST',
+      headers: authHeaders()
+    }).catch(()=>{});
+  }
   adminToken = '';
   localStorage.removeItem('oreate_admin_token');
   showLogin();
+}
+async function downloadBackup(){
+  const r=await fetch(BASE + '/api/admin/backup', {headers: authHeaders()});
+  if(!r.ok) throw new Error('backup failed');
+  const blob=await r.blob();
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url;
+  a.download='oreate-backup.zip';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 1000);
+}
+async function restoreBackup(){
+  const input=document.getElementById('restore-file');
+  const file=input?.files?.[0];
+  if(!file){ alert('请选择备份文件'); return; }
+  if(!confirm('确认恢复备份？当前数据库和配置将被替换。')) return;
+  const form=new FormData();
+  form.append('confirm', 'true');
+  form.append('file', file);
+  const r=await fetch(BASE + '/api/admin/restore', {
+    method:'POST',
+    headers: adminToken ? {Authorization:'Bearer ' + adminToken} : {},
+    body: form
+  });
+  const data=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(data.detail || 'restore failed');
+  alert('恢复完成，请重新登录');
+  adminToken='';
+  localStorage.removeItem('oreate_admin_token');
+  showLogin('恢复完成，请重新登录');
 }
 function switchTab(name) {
   document.querySelectorAll('#tab-pool,#tab-generate,#tab-tasks,#tab-apikeys,#tab-settings').forEach(el => {
@@ -4142,7 +5466,8 @@ async function init() {
   showApp();
   document.getElementById('status-text').textContent = '加载中...';
   try {
-    await Promise.all([loadAccounts(), loadTasks(), loadApiKeys(), loadUsage(), loadSettings()]);
+    await loadClients();
+    await Promise.all([loadAccounts(), loadTasks(), loadApiKeys(), loadUsage(), loadAuditLogs(), loadSettings()]);
     await loadCapabilities();
   } catch (e) {
     document.getElementById('status-text').textContent = '未授权';
@@ -4158,7 +5483,7 @@ async function init() {
 function copyExample() { copyText(document.getElementById('gw-example').textContent); }
 
 // === Accounts ===
-let state = {accounts:[],tasks:[],apikeys:[],usage:[],settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}}};
+let state = {accounts:[],tasks:[],apikeys:[],clients:[],usage:[],auditLogs:[],settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}}};
 async function api(m,u,b){
   const o={method:m,headers:authHeaders()};
   if(b) o.body=JSON.stringify(b);
@@ -4247,19 +5572,40 @@ async function loadAccounts(){
   const r=await api('GET','/api/accounts');
   state.accounts=r.items||[]; renderAccounts(); updateStats();
 }
+async function loadClients(){
+  const r=await api('GET','/api/admin/clients');
+  state.clients=r.items||[];
+  renderClients();
+  renderClientSelect();
+}
+function renderClientSelect(){
+  setSelectOptions(
+    'ak-client',
+    (state.clients||[]).map(c => ({value:String(c.id), label:`${c.name}${c.contact ? ` · ${c.contact}` : ''}`})),
+    '',
+    '未绑定'
+  );
+}
 function renderAccounts(){
   const tbody=document.getElementById('accounts-tbody');
   tbody.innerHTML = state.accounts.map(a => {
     const sc = a.status==='verified'?'tag-green':a.status==='new'?'tag-blue':'tag-gray';
+    const hc = a.health_status==='healthy'?'tag-green':a.health_status==='cooling'?'tag-blue':a.health_status==='low_balance'?'tag-red':a.health_status==='invalid'?'tag-gray':'tag-blue';
     const em = a.email||'';
+    const restPoint = a.rest_point ?? '-';
+    const balanceUpdatedAt = a.balance_updated_at ? new Date((a.balance_updated_at||0)*1000).toLocaleString() : '-';
+    const healthMeta = `${a.risk_status||'clean'}${a.cooling ? ` · ${a.cooldown_remaining_seconds || 0}s` : ''}`;
     return `<tr>
       <td>${a.id}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis">${em}<button class="copy-btn" onclick="copyText('${em.replace(/'/g,"\\'")}')">📋</button></td>
       <td><span class="tag ${sc}">${a.status}</span></td>
+      <td><span class="tag ${hc}">${a.health_status || '-'}</span><div style="font-size:11px;color:#86868b">${healthMeta}</div></td>
       <td>${a.source||'-'}</td>
       <td style="font-family:monospace;font-size:11px">${a.ouid_preview||''}</td>
+      <td>${restPoint}</td>
+      <td style="font-size:11px">${balanceUpdatedAt}</td>
       <td style="font-size:11px">${new Date((a.created_at||0)*1000).toLocaleString()}</td>
-      <td><button class="btn-sm btn-secondary" onclick="generateWith(${a.id})">生成</button></td>
+      <td><button class="btn-sm btn-secondary" onclick="generateWith(${a.id})">生成</button> <button class="btn-sm btn-secondary" onclick="refreshAccountBalance(${a.id})">刷新余额</button></td>
     </tr>`;
   }).join('');
   document.getElementById('pool-count').textContent = state.accounts.filter(a=>a.status==='verified').length;
@@ -4270,6 +5616,7 @@ async function maintainPool(){const r=await api('POST','/api/pool/maintain',{for
 function toggleImport(){document.getElementById('import-area').classList.toggle('hidden');}
 async function doImport(){const r=await api('POST','/api/accounts/import',{email:document.getElementById('imp-email').value,password:document.getElementById('imp-pwd').value});await loadAccounts();alert(r.ok?'✅ 导入成功':'❌ 失败');}
 function generateWith(aid){switchTab('generate');document.getElementById('g-account').value=aid;}
+async function refreshAccountBalance(aid){await api('POST',`/api/accounts/${aid}/refresh-balance`);await loadAccounts();}
 
 // === Generate ===
 async function loadCapabilities(){
@@ -4419,6 +5766,8 @@ function renderTaskPreview(task){
         <div><strong>验证</strong> ${escapeHtml(scene?.verification_status || model?.verification_status || task?.verification_status || '-')}</div>
         <div><strong>实验性</strong> ${(scene?.experimental ?? model?.experimental ?? task?.experimental) ? '是' : '否'}</div>
         <div><strong>点数</strong> ${task?.estimated_point_cost ?? '-'}</div>
+        <div><strong>实际</strong> ${task?.actual_point_cost ?? '-'}</div>
+        <div><strong>前后余额</strong> ${task?.balance_before_rest_point ?? '-'} → ${task?.balance_after_rest_point ?? '-'}</div>
         <div><strong>错误码</strong> ${escapeHtml(task?.error_code || '-')}</div>
       </div>
       <div style="margin-top:12px" class="task-actions">
@@ -4466,15 +5815,33 @@ async function loadApiKeys(){const r=await api('GET','/api/admin/apikeys');state
 function renderApiKeys(){
   document.getElementById('apikeys-tbody').innerHTML = state.apikeys.map(k => {
     const kp=k.key_preview||'';
-    return `<tr><td>${k.id}</td><td style="font-family:monospace;font-size:11px">${kp}</td><td>${k.name||'-'}</td><td><span class="tag ${k.enabled?'tag-green':'tag-gray'}">${k.enabled?'启用':'停用'}</span></td><td><input id="ak-rate-${k.id}" data-field="rate_limit_per_minute" value="${k.rate_limit_per_minute||''}" style="width:84px"></td><td><input id="ak-req-${k.id}" data-field="daily_request_limit" value="${k.daily_request_limit||''}" style="width:84px"></td><td><input id="ak-point-${k.id}" data-field="daily_point_limit" value="${k.daily_point_limit||''}" style="width:84px"></td><td style="font-size:11px">${new Date((k.created_at||0)*1000).toLocaleString()}</td><td style="font-size:11px">${k.last_used_at?new Date(k.last_used_at*1000).toLocaleString():'-'}</td><td><button class="btn-sm btn-secondary" onclick="updateApiKeyPolicy(${k.id})">保存</button> <button class="btn-sm btn-danger" onclick="deleteKey(${k.id})">删除</button></td></tr>`;
+    return `<tr><td>${k.id}</td><td style="font-family:monospace;font-size:11px">${kp}</td><td>${k.name||'-'}</td><td>${k.client_name||'-'}</td><td><span class="tag ${k.enabled?'tag-green':'tag-gray'}">${k.enabled?'启用':'停用'}</span></td><td><input id="ak-rate-${k.id}" data-field="rate_limit_per_minute" value="${k.rate_limit_per_minute||''}" style="width:84px"></td><td><input id="ak-req-${k.id}" data-field="daily_request_limit" value="${k.daily_request_limit||''}" style="width:84px"></td><td><input id="ak-point-${k.id}" data-field="daily_point_limit" value="${k.daily_point_limit||''}" style="width:84px"></td><td style="font-size:11px">${new Date((k.created_at||0)*1000).toLocaleString()}</td><td style="font-size:11px">${k.last_used_at?new Date(k.last_used_at*1000).toLocaleString():'-'}</td><td><button class="btn-sm btn-secondary" onclick="updateApiKeyPolicy(${k.id})">保存</button> <button class="btn-sm btn-danger" onclick="deleteKey(${k.id})">删除</button></td></tr>`;
   }).join('');
+}
+function renderClients(){
+  const tbody=document.getElementById('clients-tbody');
+  if(!tbody) return;
+  tbody.innerHTML = (state.clients||[]).map(c => {
+    return `<tr><td>${c.id}</td><td>${c.name||'-'}</td><td>${c.contact||'-'}</td><td><span class="tag ${c.status==='active'?'tag-green':'tag-gray'}">${c.status||'active'}</span></td><td style="font-size:11px">${new Date((c.created_at||0)*1000).toLocaleString()}</td></tr>`;
+  }).join('');
+}
+async function createClient(){
+  const r=await api('POST','/api/admin/clients',{name:document.getElementById('client-name').value,contact:document.getElementById('client-contact').value});
+  document.getElementById('client-name').value='';
+  document.getElementById('client-contact').value='';
+  await loadClients();
+  alert(r.ok?'✅ 客户已创建':'❌ 创建失败');
 }
 async function createApiKey(){
   const name=document.getElementById('ak-name').value;
-  const r=await api('POST','/api/admin/apikeys',{name:name});
+  const clientValue=document.getElementById('ak-client').value;
+  const body={name:name};
+  if(clientValue) body.client_id=Number(clientValue);
+  const r=await api('POST','/api/admin/apikeys',body);
   if(r.item){
     document.getElementById('ak-new').classList.remove('hidden');
     document.getElementById('ak-new-value').textContent=r.item.key;
+    await loadClients();
     await loadApiKeys();
   } else alert('创建失败: '+JSON.stringify(r));
 }
@@ -4486,6 +5853,7 @@ async function updateApiKeyPolicy(id){
     daily_point_limit:document.getElementById('ak-point-'+id).value || null,
   };
   await api('PATCH','/api/admin/apikeys/'+id,body);
+  await loadClients();
   await loadApiKeys();
 }
 async function deleteKey(id){if(!confirm('确认删除此 API Key？')) return; await api('DELETE','/api/admin/apikeys/'+id);await loadApiKeys();}
@@ -4495,6 +5863,15 @@ async function loadUsage(){const r=await api('GET','/api/admin/usage');state.usa
 function renderUsage(){
   document.getElementById('usage-tbody').innerHTML = state.usage.slice(0,50).map(u => {
     return `<tr><td>${u.id}</td><td><span class="tag ${u.kind==='image'?'tag-blue':'tag-green'}">${u.kind}</span></td><td>${u.account_email||u.account_id||'-'}</td><td>${u.model_name||'-'}</td><td>${u.estimated_point_cost ?? '-'}</td><td>${u.error_code||'-'}</td><td>${u.status}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${(u.prompt||'').substring(0,40)}</td><td style="font-size:11px">${new Date((u.created_at||0)*1000).toLocaleString()}</td></tr>`;
+  }).join('');
+}
+
+async function loadAuditLogs(){const r=await api('GET','/api/admin/audit-logs');state.auditLogs=r.items||[];renderAuditLogs();}
+function renderAuditLogs(){
+  const tbody=document.getElementById('audit-tbody');
+  if(!tbody) return;
+  tbody.innerHTML = (state.auditLogs||[]).slice(0,50).map(a => {
+    return `<tr><td style="font-size:11px">${new Date((a.created_at||0)*1000).toLocaleString()}</td><td>${escapeHtml(a.admin_username||'-')}</td><td>${escapeHtml(a.action||'-')}</td><td style="font-size:11px">${escapeHtml(a.path||'-')}</td><td>${a.status_code ?? '-'}</td><td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;font-size:11px">${escapeHtml(JSON.stringify(a.details || {}))}</td></tr>`;
   }).join('');
 }
 

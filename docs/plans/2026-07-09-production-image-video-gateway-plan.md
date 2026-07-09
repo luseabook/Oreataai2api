@@ -802,8 +802,15 @@ API Key 页面：
 
 ### 实施记录（2026-07-09）
 
-- Phase 0 已落地：`reference`、`frame_based`、`motion` 默认关闭，API Key 删除改为软删除，TLS verify 改为配置化。
-- Phase 1 已落地：`POST /v1/generate` 默认异步排队，任务状态机、attempt 记录、worker、`/v1/tasks/{id}`、retry/cancel/hydrate 和后台任务中心已补齐。
+- Phase 0 已关闭并通过回归：`reference`、`frame_based`、`motion` 默认关闭，API Key 删除保持软删除，TLS verify 配置化，自动注册/后台接口已脱敏，不再返回明文密码、token。
+- Phase 1 具备基础骨架：`POST /v1/generate` 默认异步排队，已存在任务状态机、attempt 记录、worker、`/v1/tasks/{id}`、retry/cancel/hydrate 和后台任务中心。
+- Phase 2 已落地最小切片：账号余额快照、后台刷新余额、列表安全展示、低余额调度跳过。
+- 下一步继续补 Phase 2 剩余运营面：成本对账的最小闭环，以及 API Key 客户治理的最小骨架。
+- 测试约束：凡是会修改 `server.CFG` 的用例，必须先深拷贝再做 `deep_merge`，避免 scene/model policy 修改回流到共享嵌套字典，导致跨测试泄漏。
+- 当前 P4 最小切片优先做 admin session 过期 + revoke/logout + admin audit log，补上后台最小安全闭环；备份/恢复继续放在后续最小增量。
+- 上述 P4 最小切片已落地并回归通过：`admin_sessions` 表、session TTL、`/api/admin/logout`、`/api/admin/audit-logs`、后台审计面板、以及 admin 请求审计中间件已完成；下一段仅剩备份/恢复与更细的会话治理收口。
+- 备份/恢复最小切片将仅提供本地 SQLite + `config.json` 打包下载和管理员手动恢复，不引入定时调度、对象存储或跨机复制。
+- 备份/恢复最小切片已落地并回归通过：`/api/admin/backup`、`/api/admin/restore`、后台按钮、以及 zip 里的 `accounts.db` / `config.json` / `manifest.json` 已验证；当前 P4 仅剩更细的会话治理收口与恢复演练文档补充。
 
 ## Phase 2：号池健康与余额
 
@@ -818,6 +825,32 @@ API Key 页面：
 - 手动重登/刷新余额/刷新能力/禁用/启用/解除冷却。
 - 调度前检查余额覆盖成本。
 - 定时维护任务。
+
+本轮优先最小切片：
+
+- 仅落地余额快照字段、后台刷新余额接口、`/api/accounts` 安全展示、调度前低余额跳过。
+- 先不扩展到完整健康分、风控矩阵、定时维护编排。
+
+已完成后，后续最小增量改为：
+
+- 给账号列表补 derived `health_status` / `risk_status` / 冷却剩余时间。
+- 给 `/v1/accounts/status` 补池内健康统计，便于运营看板直接使用。
+
+当前下一段优先级：
+
+- 给任务记录和用量日志补前后余额快照与实际点数。
+- 给 API Key 增加客户归属的最小骨架，先能创建/查看客户并给 Key 绑定客户。
+- 保留现有账号健康字段，不做更大范围的池治理重构。
+
+下一阶段最小切片：
+
+- `healthz` / `readyz` / `metrics`
+- 先把部署系统能直接用的健康信号补齐，不扩到备份、审计和会话过期的完整方案。
+
+再下一阶段最小切片：
+
+- 模型/场景 policy 的后台 patch 路由
+- 先补 `PATCH /api/models/{model_id}/policy` 和 `PATCH /api/video-scenes/{scene_id}/policy`，把现有默认关闭/实验性开关真正做成后台可写控制。
 
 验收：
 
@@ -868,10 +901,11 @@ API Key 页面：
 
 任务：
 
+- admin session 过期和 revoke/logout。
+- admin audit log 落库与查询。
 - 敏感字段加密。
-- admin session 过期和审计。
 - healthz/readyz/metrics。
-- 备份与恢复文档。
+- 备份与恢复实现与文档。
 - 部署文档。
 - 压测与故障演练。
 
@@ -962,6 +996,7 @@ API Key 页面：
 - Phase 3 至少完成场景开关和未验证场景禁用。
 - Phase 4 至少完成 Key 权限范围和成本统计。
 - Phase 5 至少完成 healthz/readyz、备份、admin session 过期。
+- Phase 5 已补齐 healthz/readyz、备份/恢复、admin session 过期与审计；剩余是更细的恢复演练和敏感字段加密。
 
 ### 完整生产门槛
 
@@ -1002,12 +1037,12 @@ git diff --check
 
 ## 11. 推荐下一步
 
-建议下一轮先做 Phase 0 和 Phase 1：
+建议下一轮先做 Phase 2 最小切片：
 
-1. 先加模型/场景开关，默认关闭未验证高级视频场景。
-2. 禁止删除 API Key 时删除用量日志。
-3. 把任务改成异步状态机。
-4. 后台任务中心补详情、重试、取消、重新水合。
+1. 先补账号余额快照和后台刷新余额接口。
+2. 让 `/api/accounts` 和后台号池展示安全余额。
+3. 调度前跳过明显低于 `estimated_point_cost` 的账号。
+4. 再继续扩展健康、风控、冷却和对账闭环。
 
 理由：
 

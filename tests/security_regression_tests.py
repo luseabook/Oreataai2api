@@ -1,9 +1,12 @@
 import json
+import hashlib
+import io
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import zipfile
 
 from fastapi.testclient import TestClient
 
@@ -19,11 +22,12 @@ class SecurityRegressionTests(unittest.TestCase):
         self.db_patch.start()
         self.config_patch = patch.object(server, "CONFIG_PATH", self.config_path)
         self.config_patch.start()
+        base_cfg = json.loads(json.dumps(server.CFG))
         self.cfg_patch = patch.object(
             server,
             "CFG",
             server.deep_merge(
-                server.CFG,
+                base_cfg,
                 {
                     "server": {"host": "127.0.0.1", "admin_username": "admin", "admin_password": "test-admin-password"},
                     "gateway": {"enable_background_worker": False},
@@ -152,6 +156,10 @@ class SecurityRegressionTests(unittest.TestCase):
             ("get", "/api/admin/settings", None),
             ("put", "/api/admin/settings", {"server": {"port": 9999}}),
             ("post", "/api/admin/credentials", {"current_password": "x", "new_username": "admin", "new_password": "new-password-123", "confirm_password": "new-password-123"}),
+            ("post", "/api/admin/logout", None),
+            ("get", "/api/admin/audit-logs", None),
+            ("get", "/api/admin/backup", None),
+            ("post", "/api/admin/restore", {"confirm": "true"}),
             ("get", "/api/accounts", None),
             ("get", "/api/mail/test", None),
             ("get", "/api/models/capabilities", None),
@@ -226,6 +234,143 @@ class SecurityRegressionTests(unittest.TestCase):
         saved = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["server"]["admin_username"], "new-admin")
 
+    def test_admin_logout_revokes_current_session(self):
+        headers = self.admin_headers()
+
+        logout_response = self.client.post("/api/admin/logout", headers=headers)
+        self.assertEqual(logout_response.status_code, 200)
+        self.assertTrue(logout_response.json()["ok"])
+
+        second_response = self.client.get("/api/admin/settings", headers=headers)
+        self.assertEqual(second_response.status_code, 401)
+
+    def test_admin_audit_log_records_admin_actions(self):
+        headers = self.admin_headers()
+        create_response = self.client.post(
+            "/api/admin/clients",
+            headers=headers,
+            json={"name": "Audit Corp", "contact": "audit@example.com"},
+        )
+        self.assertEqual(create_response.status_code, 200)
+
+        audit_response = self.client.get("/api/admin/audit-logs", headers=headers)
+        self.assertEqual(audit_response.status_code, 200)
+        items = audit_response.json()["items"]
+        self.assertTrue(any(item["path"] == "/api/admin/clients" and item["method"] == "POST" for item in items))
+
+    def test_admin_session_expiration_rejects_stale_token(self):
+        login = self.client.post(
+            "/api/admin/login",
+            json={"username": server.CFG["server"]["admin_username"], "password": server.CFG["server"]["admin_password"]},
+        )
+        self.assertEqual(login.status_code, 200)
+        token = login.json()["token"]
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        conn = server.db_conn()
+        try:
+            conn.execute("UPDATE admin_sessions SET expires_at=? WHERE token_hash=?", (time.time() - 1, token_hash))
+            conn.commit()
+        finally:
+            conn.close()
+
+        response = self.client.get("/api/admin/settings", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(response.status_code, 401)
+
+    def test_admin_backup_exports_config_and_database_snapshot(self):
+        self.seed_account()
+        headers = self.admin_headers()
+
+        response = self.client.get("/api/admin/backup", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("application/zip", response.headers.get("content-type", ""))
+        archive = zipfile.ZipFile(io.BytesIO(response.content))
+        names = set(archive.namelist())
+        self.assertIn("accounts.db", names)
+        self.assertIn("config.json", names)
+        self.assertIn("manifest.json", names)
+
+    def test_admin_restore_replaces_database_and_config_from_backup(self):
+        original_ttl = server.CFG["server"]["admin_session_ttl_hours"]
+        original_min_accounts = server.CFG["pool"]["min_accounts"]
+        self.seed_account()
+        headers = self.admin_headers()
+
+        backup = self.client.get("/api/admin/backup", headers=headers)
+        self.assertEqual(backup.status_code, 200)
+
+        conn = server.db_conn()
+        try:
+            conn.execute(
+                """
+                INSERT INTO accounts(email,password,status,source,ouid,ouss,model_info_json,video_info_json,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "restore-extra@example.com",
+                    "plain-password",
+                    "verified",
+                    "manual",
+                    "ouid-extra",
+                    "ouss-extra",
+                    "{}",
+                    "{}",
+                    time.time(),
+                    time.time(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        server.CFG["server"]["admin_session_ttl_hours"] = 99
+        server.CFG["pool"]["min_accounts"] = 99
+        save_response = self.client.post(
+            "/api/admin/restore",
+            headers=headers,
+            data={"confirm": "true"},
+            files={"file": ("backup.zip", backup.content, "application/zip")},
+        )
+
+        self.assertEqual(save_response.status_code, 200)
+        self.assertTrue(save_response.json()["requires_relogin"])
+        self.assertIn("重新登录", save_response.json()["message"])
+        self.assertEqual(server.CFG["server"]["admin_session_ttl_hours"], original_ttl)
+        self.assertEqual(server.CFG["pool"]["min_accounts"], original_min_accounts)
+        restored_accounts = self.client.get("/api/accounts", headers=self.admin_headers()).json()["items"]
+        emails = {item["email"] for item in restored_accounts}
+        self.assertIn("user@example.com", emails)
+        self.assertNotIn("restore-extra@example.com", emails)
+
+    def test_admin_restore_revokes_existing_sessions_and_requires_relogin(self):
+        self.seed_account()
+        headers = self.admin_headers()
+
+        backup = self.client.get("/api/admin/backup", headers=headers)
+        self.assertEqual(backup.status_code, 200)
+
+        restore = self.client.post(
+            "/api/admin/restore",
+            headers=headers,
+            data={"confirm": "true"},
+            files={"file": ("backup.zip", backup.content, "application/zip")},
+        )
+
+        self.assertEqual(restore.status_code, 200)
+        self.assertTrue(restore.json()["requires_relogin"])
+        self.assertIn("重新登录", restore.json()["message"])
+        self.assertEqual(server.ADMIN_TOKENS, {})
+
+        stale = self.client.get("/api/admin/settings", headers=headers)
+        self.assertEqual(stale.status_code, 401)
+
+        conn = server.db_conn()
+        active_sessions = conn.execute(
+            "SELECT COUNT(*) AS c FROM admin_sessions WHERE revoked_at IS NULL AND COALESCE(expires_at, 0) > ?",
+            (time.time(),),
+        ).fetchone()["c"]
+        conn.close()
+        self.assertEqual(active_sessions, 0)
+
     def test_admin_settings_update_cannot_change_credentials(self):
         headers = self.admin_headers()
         response = self.client.put(
@@ -271,6 +416,7 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertNotIn("ouss", account)
         self.assertNotIn("model_info_json", account)
         self.assertNotIn("video_info_json", account)
+        self.assertNotIn("point_balance_json", account)
         self.assertEqual(account["email"], "user@example.com")
 
     def test_gateway_task_detail_is_scoped_to_own_api_key(self):
@@ -413,6 +559,71 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertIsNotNone(key_row["deleted_at"])
         self.assertEqual(key_row["disabled_reason"], "deleted")
         self.assertEqual(usage_count, 1)
+
+    def test_register_endpoint_redacts_passwords_and_mail_tokens(self):
+        fake_result = {
+            "ok": True,
+            "status": "verified",
+            "account_id": 1,
+            "email": "user@example.com",
+            "password": "Aa1@secret123",
+            "signup_status": 200,
+            "signup_response": {"status": {"code": 0}},
+            "verification": {
+                "confirm": {
+                    "status_code": 200,
+                    "cookies": {"OUID": "confirm-ouid", "ouss": "confirm-ouss"},
+                    "accessToken": "confirm-access-token",
+                    "session": "confirm-session",
+                }
+            },
+            "verification_artifact": {
+                "link": "https://www.oreateai.com/passport/confirm?tokenID=abc123",
+                "code": "abc123",
+            },
+            "trace": [
+                {
+                    "step": "extract_token_from_link",
+                    "tokenID": "abc123",
+                    "cookie": "trace-cookie-secret",
+                    "cookies": {"OUID": "trace-ouid", "ouss": "trace-ouss"},
+                    "sessionkey": "trace-session-key",
+                }
+            ],
+            "mailbox": {"address": "user@example.com", "token": "mail-token"},
+            "cookies": {"OUID": "root-ouid", "ouss": "root-ouss"},
+        }
+
+        with patch.object(server, "auto_register_accounts", return_value=[fake_result]):
+            response = self.client.post("/api/register/one", headers=self.admin_headers())
+
+        self.assertEqual(response.status_code, 200)
+        item = response.json()["items"][0]
+        self.assertEqual(item["email"], "user@example.com")
+        self.assertNotIn("password", item)
+        self.assertEqual(item["mailbox"]["address"], "user@example.com")
+        self.assertNotIn("token", item["mailbox"])
+        self.assertEqual(item["verification_artifact"]["link"], server.SECRET_PLACEHOLDER)
+        self.assertEqual(item["verification_artifact"]["code"], server.SECRET_PLACEHOLDER)
+        self.assertEqual(item["trace"][0]["tokenID"], server.SECRET_PLACEHOLDER)
+        body_text = json.dumps(item, ensure_ascii=False)
+        for secret in (
+            "Aa1@secret123",
+            "mail-token",
+            "abc123",
+            "confirm-ouid",
+            "confirm-ouss",
+            "confirm-access-token",
+            "confirm-session",
+            "trace-cookie-secret",
+            "trace-ouid",
+            "trace-ouss",
+            "trace-session-key",
+            "root-ouid",
+            "root-ouss",
+        ):
+            self.assertNotIn(secret, body_text)
+        self.assertIn(server.SECRET_PLACEHOLDER, body_text)
 
     def test_admin_html_sends_bearer_token_for_api_calls(self):
         html = server.ADMIN_HTML

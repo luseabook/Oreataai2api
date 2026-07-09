@@ -1,4 +1,5 @@
 import json
+import threading
 import tempfile
 import time
 import unittest
@@ -19,11 +20,12 @@ class GatewayHardeningTests(unittest.TestCase):
         self.db_patch.start()
         self.config_patch = patch.object(server, "CONFIG_PATH", self.config_path)
         self.config_patch.start()
+        base_cfg = json.loads(json.dumps(server.CFG))
         self.cfg_patch = patch.object(
             server,
             "CFG",
             server.deep_merge(
-                server.CFG,
+                base_cfg,
                 {
                     "server": {"host": "127.0.0.1", "admin_username": "admin", "admin_password": "test-admin-password"},
                     "gateway": {"enable_background_worker": False},
@@ -222,6 +224,37 @@ class GatewayHardeningTests(unittest.TestCase):
     def process_task_queue(self, limit=1):
         return server.process_task_queue(limit=limit)
 
+    def seed_task(
+        self,
+        *,
+        status="queued",
+        kind="video",
+        response=None,
+        chat_id="chat-seeded",
+        cancel_requested_at=None,
+        started_at=None,
+        finished_at=None,
+    ):
+        account_id = self.seed_account_with_capabilities(email=f"seeded-{time.time_ns()}@example.com")
+        body = self.valid_video_request() if kind == "video" else self.valid_image_request()
+        task_id = server.save_task(
+            account_id,
+            kind,
+            body["prompt"],
+            body,
+            response or {"status": status, "chat": {"chatId": chat_id, "focusId": f"{chat_id}-focus"}},
+            status=status,
+            model_name=body.get("model_name") or "",
+            scene_id=body.get("scene_id") or "",
+            resolution=body.get("resolution") or "",
+            ratio=body.get("ratio") or "",
+            duration=body.get("duration"),
+            cancel_requested_at=cancel_requested_at,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        return task_id
+
     def test_v1_errors_use_stable_envelope(self):
         response = self.client.get("/v1/capabilities")
 
@@ -279,6 +312,33 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("error_code", usage_cols)
         self.assertIn("status_code", usage_cols)
         self.assertIsNotNone(idem)
+
+    def test_gateway_hardening_schema_has_balance_snapshot_columns(self):
+        conn = server.db_conn()
+        account_cols = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+        task_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        usage_cols = {r["name"] for r in conn.execute("PRAGMA table_info(usage_log)").fetchall()}
+        api_key_cols = {r["name"] for r in conn.execute("PRAGMA table_info(api_keys)").fetchall()}
+        client_table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='clients'").fetchone()
+        conn.close()
+
+        self.assertIn("point_balance_json", account_cols)
+        self.assertIn("rest_point", account_cols)
+        self.assertIn("daily_point", account_cols)
+        self.assertIn("bonus_point", account_cols)
+        self.assertIn("balance_updated_at", account_cols)
+        self.assertIn("balance_before_json", task_cols)
+        self.assertIn("balance_after_json", task_cols)
+        self.assertIn("balance_before_rest_point", task_cols)
+        self.assertIn("balance_after_rest_point", task_cols)
+        self.assertIn("balance_before_daily_point", task_cols)
+        self.assertIn("balance_after_daily_point", task_cols)
+        self.assertIn("balance_before_bonus_point", task_cols)
+        self.assertIn("balance_after_bonus_point", task_cols)
+        self.assertIn("actual_point_cost", task_cols)
+        self.assertIn("actual_point_cost", usage_cols)
+        self.assertIn("client_id", api_key_cols)
+        self.assertIsNotNone(client_table)
 
     def test_capabilities_expose_scene_policy_metadata(self):
         self.seed_account_with_capabilities()
@@ -478,6 +538,151 @@ class GatewayHardeningTests(unittest.TestCase):
             task = refreshed.json()["task"]
             self.assertEqual(task["status"], "completed")
             self.assertEqual(task["assets"], ["https://cdn.oreateai.com/aivideo/videodownload/1899992928.mp4"])
+
+    def test_cancelled_running_task_does_not_write_completed_result_after_worker_returns(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("cancel-midflight-key")
+        proceed = threading.Event()
+        release = threading.Event()
+
+        def slow_generation(task, attempt_id):
+            proceed.set()
+            self.assertTrue(release.wait(timeout=2), "test worker was not released")
+            return {
+                "account_id": task["account_id"],
+                "body": server.GatewayGenerateIn(**self.valid_image_request()),
+                "options": {
+                    "model_name": "Google Nano Banana 2",
+                    "resolution": "4K",
+                    "ratio": "16:9",
+                },
+                "generation": {
+                    "response": {"chat": {"chatId": "chat-cancelled", "focusId": "focus-cancelled"}},
+                    "assets": ["https://cdn.oreateai.com/static/result/should-not-stick.jpg"],
+                    "stream": {"events": [{"event": "end"}]},
+                    "hydration": {"assets": ["https://cdn.oreateai.com/static/result/should-not-stick.jpg"]},
+                    "status": "completed",
+                },
+            }
+
+        with patch.object(server, "run_generation_attempt", side_effect=slow_generation):
+            created = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer cancel-midflight-key"},
+                json=self.valid_image_request(),
+            )
+            self.assertEqual(created.status_code, 202)
+            task_id = created.json()["task_id"]
+
+            worker = threading.Thread(target=self.process_task_queue, kwargs={"limit": 1})
+            worker.start()
+            self.assertTrue(proceed.wait(timeout=2), "worker did not enter generation attempt")
+
+            cancelled = self.client.post(f"/v1/tasks/{task_id}/cancel", headers={"Authorization": "Bearer cancel-midflight-key"})
+            self.assertEqual(cancelled.status_code, 200)
+            self.assertEqual(cancelled.json()["task"]["status"], "cancelled")
+
+            release.set()
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive(), "worker thread did not finish")
+
+            detail = self.client.get(f"/v1/tasks/{task_id}", headers={"Authorization": "Bearer cancel-midflight-key"})
+            self.assertEqual(detail.status_code, 200)
+            task = detail.json()["task"]
+            self.assertEqual(task["status"], "cancelled")
+            self.assertEqual(task["assets"], [])
+
+    def test_submitted_task_expires_after_hydration_deadline(self):
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "gateway": {
+                    "submitted_task_expire_seconds": 60,
+                    "hydrating_task_expire_seconds": 60,
+                }
+            },
+        )
+        try:
+            task_id = self.seed_task(
+                status="submitted",
+                started_at=time.time() - 120,
+                response={"status": "submitted", "chat": {"chatId": "chat-expired", "focusId": "focus-expired"}},
+                chat_id="chat-expired",
+            )
+            with patch.object(server, "run_hydration_attempt", side_effect=AssertionError("expired task should not hydrate")):
+                processed = self.process_task_queue(limit=1)
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(processed, 1)
+        row = server.fetch_task_row(task_id)
+        self.assertIsNotNone(row)
+        task = server.task_detail_for_row(row)
+        self.assertEqual(task["status"], "expired")
+        self.assertEqual(task["error_code"], "TASK_EXPIRED")
+        self.assertTrue(task["finished_at"])
+        self.assertEqual(task["attempts"][-1]["status"], "expired")
+
+    def test_submitted_task_obeys_hydration_backoff_before_requeue(self):
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "gateway": {
+                    "submitted_task_retry_interval_seconds": 60,
+                    "hydrating_task_retry_interval_seconds": 60,
+                }
+            },
+        )
+        now = time.time()
+        try:
+            task_id = self.seed_task(
+                status="submitted",
+                started_at=now - 10,
+                response={"status": "submitted", "chat": {"chatId": "chat-backoff", "focusId": "focus-backoff"}},
+                chat_id="chat-backoff",
+            )
+            conn = server.db_conn()
+            conn.execute(
+                """
+                INSERT INTO task_attempts(
+                    task_id, attempt_no, phase, account_id, status, error_code, error_message,
+                    request_payload_json, stream_summary_json, hydration_summary_json, assets_json,
+                    started_at, finished_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    task_id,
+                    1,
+                    "hydration",
+                    None,
+                    "submitted",
+                    "",
+                    "",
+                    json.dumps(self.valid_video_request()),
+                    None,
+                    json.dumps({"status": "submitted"}),
+                    json.dumps([]),
+                    now - 5,
+                    now - 5,
+                ),
+            )
+            conn.commit()
+            conn.close()
+            server.update_task_record(task_id, next_attempt_at=now + 60)
+
+            with patch.object(server, "run_hydration_attempt", side_effect=AssertionError("backoff task should not hydrate")):
+                processed = self.process_task_queue(limit=1)
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(processed, 0)
+        row = server.fetch_task_row(task_id)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "submitted")
+        task = server.task_detail_for_row(row)
+        self.assertEqual(len(task["attempts"]), 1)
 
     def test_generate_rejects_invalid_video_options_before_upstream_call(self):
         self.seed_account_with_capabilities()
@@ -1405,6 +1610,117 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(row["estimated_point_cost"], 12)
         self.assertEqual(row["status_code"], 202)
 
+    def test_generate_records_balance_snapshots_and_actual_cost(self):
+        account_id = self.seed_account_with_capabilities()
+        key_id = self.seed_api_key("actual-cost-key")
+
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "fetch_account_point_detail", side_effect=[
+                {"data": {"daily": 27, "bonus": 100, "restPoint": 127}},
+                {"data": {"daily": 24, "bonus": 100, "restPoint": 124}},
+            ]),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-cost"} ),
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": ["https://cdn.oreateai.com/static/result/cost.jpg"]}),
+        ):
+            response = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer actual-cost-key"},
+                json=self.valid_image_request(sync_wait_seconds=1),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["task"]["actual_point_cost"], 3)
+        self.assertEqual(payload["task"]["balance_before_rest_point"], 127)
+        self.assertEqual(payload["task"]["balance_after_rest_point"], 124)
+        self.assertEqual(payload["task"]["balance_before_daily_point"], 27)
+        self.assertEqual(payload["task"]["balance_after_daily_point"], 24)
+        self.assertEqual(payload["task"]["balance_before_bonus_point"], 100)
+        self.assertEqual(payload["task"]["balance_after_bonus_point"], 100)
+
+        conn = server.db_conn()
+        task_row = conn.execute(
+            "SELECT actual_point_cost,balance_before_json,balance_after_json,balance_before_rest_point,balance_after_rest_point FROM tasks ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        usage_row = conn.execute(
+            "SELECT actual_point_cost,estimated_point_cost,status_code FROM usage_log WHERE api_key_id=? ORDER BY id DESC LIMIT 1",
+            (key_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(task_row["actual_point_cost"], 3)
+        self.assertEqual(task_row["balance_before_rest_point"], 127)
+        self.assertEqual(task_row["balance_after_rest_point"], 124)
+        self.assertEqual(json.loads(task_row["balance_before_json"])["rest_point"], 127)
+        self.assertEqual(json.loads(task_row["balance_after_json"])["rest_point"], 124)
+        self.assertEqual(usage_row["actual_point_cost"], 3)
+        self.assertEqual(usage_row["estimated_point_cost"], 12)
+        self.assertEqual(usage_row["status_code"], 200)
+
+    def test_failed_generation_records_actual_cost_for_failed_upstream_error(self):
+        self.seed_account_with_capabilities()
+        key_id = self.seed_api_key("failed-actual-cost-key")
+        client = TestClient(server.app, raise_server_exceptions=False)
+
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(
+                server.CLIENT,
+                "fetch_account_point_detail",
+                side_effect=[
+                    {"data": {"daily": 0, "bonus": 100, "restPoint": 100}},
+                    {"data": {"daily": 0, "bonus": 90, "restPoint": 90}},
+                ],
+            ),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-failed-cost"}),
+            patch.object(
+                server.CLIENT,
+                "stream_generation",
+                return_value={
+                    "events": [{"event": "error"}],
+                    "error": {"code": "100003", "message": "point deducted on failure"},
+                    "status": "failed",
+                },
+            ),
+        ):
+            response = client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer failed-actual-cost-key"},
+                json=self.valid_image_request(sync_wait_seconds=1),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        payload = response.json()
+        self.assertEqual(payload["error"]["code"], "100003")
+        task_id = payload["error"]["details"]["task_id"]
+
+        conn = server.db_conn()
+        task_row = conn.execute(
+            """
+            SELECT status,error_code,actual_point_cost,balance_before_rest_point,balance_after_rest_point
+            FROM tasks
+            WHERE id=?
+            """,
+            (task_id,),
+        ).fetchone()
+        usage_row = conn.execute(
+            "SELECT status,error_code,actual_point_cost,status_code FROM usage_log WHERE api_key_id=? ORDER BY id DESC LIMIT 1",
+            (key_id,),
+        ).fetchone()
+        conn.close()
+
+        self.assertEqual(task_row["status"], "failed")
+        self.assertEqual(task_row["error_code"], "100003")
+        self.assertEqual(task_row["actual_point_cost"], 10)
+        self.assertEqual(task_row["balance_before_rest_point"], 100)
+        self.assertEqual(task_row["balance_after_rest_point"], 90)
+        self.assertEqual(usage_row["status"], "failed")
+        self.assertEqual(usage_row["error_code"], "100003")
+        self.assertEqual(usage_row["actual_point_cost"], 10)
+        self.assertEqual(usage_row["status_code"], 503)
+
     def test_idempotency_key_replays_same_response_without_second_task(self):
         self.seed_account_with_capabilities()
         self.seed_api_key("idem-key")
@@ -1527,6 +1843,83 @@ class GatewayHardeningTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["account_id"], ready_id)
+
+    def test_scheduler_skips_low_balance_account_for_expensive_request(self):
+        low_id = self.seed_account_with_capabilities("low-balance@example.com")
+        ready_id = self.seed_account_with_capabilities("ready-balance@example.com")
+        self.seed_api_key("balance-key")
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET rest_point=?, daily_point=?, bonus_point=?, balance_updated_at=?, updated_at=? WHERE id=?",
+            (2, 0, 2, now, now + 100, low_id),
+        )
+        conn.execute(
+            "UPDATE accounts SET rest_point=?, daily_point=?, bonus_point=?, balance_updated_at=?, updated_at=? WHERE id=?",
+            (127, 27, 100, now, now, ready_id),
+        )
+        conn.commit()
+        conn.close()
+
+        selected_accounts = []
+
+        def session_from_account(account):
+            selected_accounts.append(account["id"])
+            return object()
+
+        with (
+            patch.object(server.CLIENT, "session_from_account", side_effect=session_from_account),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-ready"}),
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": ["https://cdn.oreateai.com/static/result/ready.jpg"]}),
+        ):
+            response = self.client.post("/v1/generate", headers={"Authorization": "Bearer balance-key"}, json=self.valid_image_request(sync_wait_seconds=1))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["account_id"], ready_id)
+        self.assertTrue(selected_accounts)
+        self.assertTrue(all(account_id == ready_id for account_id in selected_accounts))
+
+    def test_admin_can_refresh_account_balance_and_list_safe_snapshot(self):
+        account_id = self.seed_account_with_capabilities(email=f"balance-{time.time_ns()}@example.com")
+
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()) as session_mock,
+            patch.object(
+                server.CLIENT,
+                "fetch_account_point_detail",
+                return_value={"data": {"daily": 27, "bonus": 100, "restPoint": 127}},
+            ) as fetch_mock,
+        ):
+            response = self.client.post(f"/api/accounts/{account_id}/refresh-balance", headers=self.admin_headers())
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        item = payload["item"]
+        self.assertEqual(item["rest_point"], 127)
+        self.assertEqual(item["daily_point"], 27)
+        self.assertEqual(item["bonus_point"], 100)
+        self.assertIn("balance_updated_at", item)
+        self.assertNotIn("point_balance_json", item)
+        session_mock.assert_called_once()
+        fetch_mock.assert_called_once()
+
+        conn = server.db_conn()
+        row = conn.execute(
+            "SELECT rest_point,daily_point,bonus_point,balance_updated_at,point_balance_json FROM accounts WHERE id=?",
+            (account_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row["rest_point"], 127)
+        self.assertEqual(row["daily_point"], 27)
+        self.assertEqual(row["bonus_point"], 100)
+        self.assertIsNotNone(row["balance_updated_at"])
+        self.assertEqual(json.loads(row["point_balance_json"])["rest_point"], 127)
+
+        accounts = self.client.get("/api/accounts", headers=self.admin_headers()).json()["items"]
+        self.assertEqual(accounts[0]["rest_point"], 127)
+        self.assertNotIn("point_balance_json", accounts[0])
 
     def test_upstream_failure_marks_account_cooldown(self):
         account_id = self.seed_account_with_capabilities()
@@ -1671,7 +2064,182 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("daily_point_limit", html)
         self.assertIn("updateApiKeyPolicy", html)
         self.assertIn("estimated_point_cost", html)
+        self.assertIn("actual_point_cost", html)
         self.assertIn("error_code", html)
+        self.assertIn("createClient", html)
+        self.assertIn("client_id", html)
+        self.assertIn("loadAuditLogs", html)
+        self.assertIn("audit-tbody", html)
+        self.assertIn("/api/admin/logout", html)
+        self.assertIn("/api/admin/audit-logs", html)
+        self.assertIn("downloadBackup", html)
+        self.assertIn("restoreBackup", html)
+        self.assertIn("/api/admin/backup", html)
+        self.assertIn("/api/admin/restore", html)
+
+    def test_admin_html_contains_balance_refresh_controls(self):
+        html = server.ADMIN_HTML
+        self.assertIn("refreshAccountBalance", html)
+        self.assertIn("刷新余额", html)
+        self.assertIn("health_status", html)
+
+    def test_accounts_response_includes_health_summary_fields(self):
+        healthy_id = self.seed_account_with_capabilities("healthy@example.com")
+        cooling_id = self.seed_account_with_capabilities("cooling@example.com")
+        low_balance_id = self.seed_account_with_capabilities("low@example.com")
+        risk_id = self.seed_account_with_capabilities("risk@example.com")
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute("UPDATE accounts SET rest_point=?, daily_point=?, bonus_point=?, balance_updated_at=? WHERE id=?", (127, 27, 100, now, healthy_id))
+        conn.execute("UPDATE accounts SET rest_point=?, daily_point=?, bonus_point=?, balance_updated_at=?, cooldown_until=?, failure_count=? WHERE id=?", (127, 27, 100, now, now + 300, 1, cooling_id))
+        conn.execute("UPDATE accounts SET rest_point=?, daily_point=?, bonus_point=?, balance_updated_at=? WHERE id=?", (5, 0, 5, now, low_balance_id))
+        conn.execute("UPDATE accounts SET status='invalid', failure_count=?, cooldown_until=NULL, last_error=? WHERE id=?", (1, "212361: risk control", risk_id))
+        conn.commit()
+        conn.close()
+
+        response = self.client.get("/api/accounts", headers=self.admin_headers())
+        self.assertEqual(response.status_code, 200)
+        items = {item["email"]: item for item in response.json()["items"]}
+
+        self.assertEqual(items["healthy@example.com"]["health_status"], "healthy")
+        self.assertEqual(items["healthy@example.com"]["risk_status"], "clean")
+        self.assertEqual(items["healthy@example.com"]["balance_status"], "ok")
+        self.assertFalse(items["healthy@example.com"]["cooling"])
+
+        self.assertEqual(items["cooling@example.com"]["health_status"], "cooling")
+        self.assertTrue(items["cooling@example.com"]["cooling"])
+        self.assertGreater(items["cooling@example.com"]["cooldown_remaining_seconds"], 0)
+
+        self.assertEqual(items["low@example.com"]["health_status"], "low_balance")
+        self.assertEqual(items["low@example.com"]["balance_status"], "low")
+
+        self.assertEqual(items["risk@example.com"]["health_status"], "invalid")
+        self.assertEqual(items["risk@example.com"]["risk_status"], "risk_control")
+
+    def test_gateway_account_status_reports_health_counts(self):
+        self.seed_account_with_capabilities("healthy@example.com")
+        cooling_id = self.seed_account_with_capabilities("cooling@example.com")
+        low_id = self.seed_account_with_capabilities("low@example.com")
+        risk_id = self.seed_account_with_capabilities("risk@example.com")
+        self.seed_api_key("pool-status-key")
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute("UPDATE accounts SET cooldown_until=?, failure_count=? WHERE id=?", (now + 300, 1, cooling_id))
+        conn.execute("UPDATE accounts SET rest_point=?, daily_point=?, bonus_point=?, balance_updated_at=? WHERE id=?", (5, 0, 5, now, low_id))
+        conn.execute("UPDATE accounts SET status='invalid', failure_count=?, cooldown_until=NULL, last_error=? WHERE id=?", (1, "212361: risk control", risk_id))
+        conn.commit()
+        conn.close()
+
+        response = self.client.get("/v1/accounts/status", headers={"Authorization": "Bearer pool-status-key"})
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total_accounts"], 4)
+        self.assertEqual(payload["verified_accounts"], 3)
+        self.assertEqual(payload["healthy_accounts"], 1)
+        self.assertEqual(payload["cooling_accounts"], 1)
+        self.assertEqual(payload["low_balance_accounts"], 1)
+        self.assertEqual(payload["invalid_accounts"], 1)
+        self.assertEqual(payload["risk_control_accounts"], 1)
+
+    def test_healthz_readyz_and_metrics_report_operational_state(self):
+        health = self.client.get("/healthz")
+        self.assertEqual(health.status_code, 200)
+        self.assertTrue(health.json()["ok"])
+
+        ready_before = self.client.get("/readyz")
+        self.assertEqual(ready_before.status_code, 503)
+
+        healthy_id = self.seed_account_with_capabilities("healthy@example.com")
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute("UPDATE accounts SET rest_point=?, daily_point=?, bonus_point=?, balance_updated_at=? WHERE id=?", (127, 27, 100, now, healthy_id))
+        conn.commit()
+        conn.close()
+        self.seed_api_key("metrics-key")
+
+        ready_after = self.client.get("/readyz")
+        self.assertEqual(ready_after.status_code, 200)
+        self.assertTrue(ready_after.json()["ok"])
+        self.assertGreaterEqual(ready_after.json()["healthy_accounts"], 1)
+
+        now = time.time()
+        server.save_task(
+            healthy_id,
+            "image",
+            "queued prompt",
+            self.valid_image_request(),
+            {"status": "queued"},
+            status="queued",
+            request_id="req-queued",
+        )
+        server.save_task(
+            healthy_id,
+            "image",
+            "failed prompt",
+            self.valid_image_request(),
+            {"status": "failed", "error": {"code": "UPSTREAM_ERROR"}},
+            status="failed",
+            error_code="UPSTREAM_ERROR",
+            error_message="upstream error",
+            request_id="req-failed",
+            finished_at=now,
+        )
+        server.save_task(
+            healthy_id,
+            "video",
+            "done prompt",
+            self.valid_video_request(),
+            {"status": "completed", "chat": {"chatId": "chat-metrics", "focusId": "focus-metrics"}, "assets": ["https://cdn.oreateai.com/static/result/metrics.mp4"]},
+            status="completed",
+            request_id="req-done",
+            actual_point_cost=3,
+            finished_at=now,
+        )
+
+        metrics = self.client.get("/metrics")
+        self.assertEqual(metrics.status_code, 200)
+        payload = metrics.json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["accounts"]["healthy"], 1)
+        self.assertEqual(payload["tasks"]["queued"], 1)
+        self.assertEqual(payload["tasks"]["failed"], 1)
+        self.assertEqual(payload["tasks"]["completed"], 1)
+        self.assertEqual(payload["tasks"]["queue_length"], 1)
+
+    def test_readyz_requires_schedulable_verified_or_active_account(self):
+        new_id = self.seed_account_with_capabilities("new@example.com")
+        disabled_id = self.seed_account_with_capabilities("disabled@example.com")
+        invalid_id = self.seed_account_with_capabilities("invalid@example.com")
+        cooling_id = self.seed_account_with_capabilities("cooling@example.com")
+        low_capability_id = self.seed_account_with_capabilities("low-cap@example.com")
+        empty_balance_id = self.seed_account_with_capabilities("empty-balance@example.com")
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute("UPDATE accounts SET status='new' WHERE id=?", (new_id,))
+        conn.execute("UPDATE accounts SET status='disabled' WHERE id=?", (disabled_id,))
+        conn.execute("UPDATE accounts SET status='invalid', last_error=? WHERE id=?", ("212361: risk control", invalid_id))
+        conn.execute("UPDATE accounts SET cooldown_until=?, failure_count=? WHERE id=?", (now + 300, 1, cooling_id))
+        conn.execute("UPDATE accounts SET model_info_json='{}', video_info_json='{}' WHERE id=?", (low_capability_id,))
+        conn.execute(
+            "UPDATE accounts SET rest_point=0, daily_point=0, bonus_point=0, balance_updated_at=? WHERE id=?",
+            (now, empty_balance_id),
+        )
+        conn.commit()
+        conn.close()
+
+        not_ready = self.client.get("/readyz")
+        self.assertEqual(not_ready.status_code, 503)
+
+        active_id = self.seed_account_with_capabilities("active@example.com")
+        conn = server.db_conn()
+        conn.execute("UPDATE accounts SET status='active' WHERE id=?", (active_id,))
+        conn.commit()
+        conn.close()
+
+        ready = self.client.get("/readyz")
+        self.assertEqual(ready.status_code, 200)
+        self.assertTrue(ready.json()["ok"])
+        self.assertGreaterEqual(ready.json()["healthy_accounts"], 1)
 
     def test_admin_can_update_api_key_policy(self):
         key_id = self.seed_api_key("admin-policy-key")
@@ -1691,3 +2259,90 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(item["rate_limit_per_minute"], 7)
         self.assertEqual(item["daily_request_limit"], 11)
         self.assertEqual(item["daily_point_limit"], 13)
+
+    def test_admin_can_create_client_and_bind_api_key(self):
+        client_response = self.client.post(
+            "/api/admin/clients",
+            headers=self.admin_headers(),
+            json={"name": "Acme", "contact": "ops@acme.test"},
+        )
+        self.assertEqual(client_response.status_code, 200)
+        client_item = client_response.json()["item"]
+        self.assertEqual(client_item["name"], "Acme")
+        self.assertEqual(client_item["contact"], "ops@acme.test")
+
+        key_response = self.client.post(
+            "/api/admin/apikeys",
+            headers=self.admin_headers(),
+            json={"name": "acme-key", "client_id": client_item["id"]},
+        )
+        self.assertEqual(key_response.status_code, 200)
+        key_item = key_response.json()["item"]
+        self.assertEqual(key_item["client_id"], client_item["id"])
+        self.assertEqual(key_item["client_name"], "Acme")
+
+        keys = self.client.get("/api/admin/apikeys", headers=self.admin_headers()).json()["items"]
+        self.assertEqual(keys[0]["client_name"], "Acme")
+        clients = self.client.get("/api/admin/clients", headers=self.admin_headers()).json()["items"]
+        self.assertEqual(clients[0]["name"], "Acme")
+
+    def test_admin_can_patch_scene_policy_and_reflect_in_capabilities(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("scene-policy-key")
+        original_cfg = json.loads(json.dumps(server.CFG))
+        try:
+            response = self.client.patch(
+                "/api/video-scenes/reference/policy",
+                headers=self.admin_headers(),
+                json={
+                    "enabled": True,
+                    "experimental": True,
+                    "verification_status": "unit_tested",
+                    "risk_level": "medium",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.json()["policy"]["enabled"])
+
+            caps = self.client.get("/v1/capabilities", headers={"Authorization": "Bearer scene-policy-key"})
+            self.assertEqual(caps.status_code, 200)
+            scenes = {scene["scene_id"]: scene for scene in caps.json()["video"]["scenes"]}
+            self.assertTrue(scenes["reference"]["enabled"])
+            self.assertEqual(scenes["reference"]["verification_status"], "unit_tested")
+            self.assertEqual(scenes["reference"]["risk_level"], "medium")
+        finally:
+            server.CFG = original_cfg
+
+    def test_admin_can_patch_model_policy_and_disable_generation(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("model-policy-key")
+        original_cfg = json.loads(json.dumps(server.CFG))
+        try:
+            response = self.client.patch(
+                f"/api/models/{server.quote('Seedance 2.0 Mini', safe='')}/policy",
+                headers=self.admin_headers(),
+                json={
+                    "enabled": False,
+                    "experimental": True,
+                    "verification_status": "disabled",
+                    "risk_level": "high",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(response.json()["policy"]["enabled"])
+
+            with (
+                patch.object(server.CLIENT, "session_from_account", return_value=object()),
+                patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-policy"}) as create_chat,
+            ):
+                generated = self.client.post(
+                    "/v1/generate",
+                    headers={"Authorization": "Bearer model-policy-key"},
+                    json=self.valid_video_request(scene_id="text_or_image"),
+                )
+
+            self.assertEqual(generated.status_code, 422)
+            self.assertEqual(generated.json()["error"]["code"], "MODEL_DISABLED")
+            create_chat.assert_not_called()
+        finally:
+            server.CFG = original_cfg
