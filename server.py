@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
         "base_url": "https://www.oreateai.com",
         "default_fr": "main",
         "request_timeout": 30,
+        "verify_tls": True,
         "default_image_model": "Google Nano Banana 2",
         "default_image_ratio": "16:9",
         "default_image_resolution": "4K",
@@ -74,6 +75,36 @@ DEFAULT_CONFIG = {
         "idempotency_ttl_hours": 24,
         "account_cooldown_seconds": 300,
         "prompt_max_length": 4000,
+        "sync_wait_seconds": 0,
+        "enable_background_worker": True,
+        "task_worker_poll_interval_seconds": 1,
+        "scene_policies": {
+            "text_or_image": {
+                "enabled": True,
+                "experimental": False,
+                "verification_status": "live_verified",
+                "risk_level": "low",
+            },
+            "reference": {
+                "enabled": False,
+                "experimental": True,
+                "verification_status": "unverified",
+                "risk_level": "high",
+            },
+            "frame_based": {
+                "enabled": False,
+                "experimental": True,
+                "verification_status": "unverified",
+                "risk_level": "high",
+            },
+            "motion": {
+                "enabled": False,
+                "experimental": True,
+                "verification_status": "unverified",
+                "risk_level": "high",
+            },
+        },
+        "model_policies": {},
     },
 }
 
@@ -97,6 +128,54 @@ def load_config() -> Dict[str, Any]:
 
 def save_config(cfg: Dict[str, Any]) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def gateway_cfg() -> Dict[str, Any]:
+    return CFG.get("gateway", {}) if isinstance(CFG.get("gateway", {}), dict) else {}
+
+
+def oreate_cfg() -> Dict[str, Any]:
+    return CFG.get("oreate", {}) if isinstance(CFG.get("oreate", {}), dict) else {}
+
+
+def tls_verify_enabled() -> bool:
+    return bool(oreate_cfg().get("verify_tls", True))
+
+
+def default_model_verification_status(kind: str) -> str:
+    return "live_verified" if kind == "image" else "unit_tested"
+
+
+def policy_defaults_for_scene(scene_id: str) -> Dict[str, Any]:
+    defaults = {
+        "enabled": True,
+        "experimental": False,
+        "verification_status": "live_verified",
+        "risk_level": "low",
+    }
+    if scene_id in {"reference", "frame_based", "motion"}:
+        defaults.update(
+            {
+                "enabled": False,
+                "experimental": True,
+                "verification_status": "unverified",
+                "risk_level": "high",
+            }
+        )
+    return defaults
+
+
+def policy_defaults_for_model(kind: str) -> Dict[str, Any]:
+    return {
+        "enabled": True,
+        "experimental": False,
+        "verification_status": default_model_verification_status(kind),
+        "risk_level": "low",
+    }
+
+
+def resolve_policy(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return deep_merge(base, override or {})
 
 
 def model_data(model: BaseModel) -> Dict[str, Any]:
@@ -139,6 +218,8 @@ def public_api_key(row: sqlite3.Row, reveal: bool = False) -> Dict[str, Any]:
     item = dict(row)
     key = item.get("key", "")
     item["key_preview"] = f"{key[:16]}..." if key else ""
+    item["deleted"] = bool(item.get("deleted_at"))
+    item["status"] = "deleted" if item["deleted"] else ("enabled" if item.get("enabled") else "disabled")
     if not reveal:
         item.pop("key", None)
     return item
@@ -189,6 +270,28 @@ def normalize_option_values(value: Any, key: str = "value") -> List[Any]:
     return values
 
 
+def model_policy_for(kind: str, model_name: str) -> Dict[str, Any]:
+    policy_map = gateway_cfg().get("model_policies", {})
+    default_policy = policy_defaults_for_model(kind)
+    if not isinstance(policy_map, dict):
+        return default_policy
+    override = policy_map.get(model_name)
+    if isinstance(override, dict):
+        return resolve_policy(default_policy, override)
+    return default_policy
+
+
+def scene_policy_for(scene_id: str) -> Dict[str, Any]:
+    policy_map = gateway_cfg().get("scene_policies", {})
+    default_policy = policy_defaults_for_scene(scene_id)
+    if not isinstance(policy_map, dict):
+        return default_policy
+    override = policy_map.get(scene_id)
+    if isinstance(override, dict):
+        return resolve_policy(default_policy, override)
+    return default_policy
+
+
 def normalize_image_models(image_info: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     models = []
     factories = (image_info or {}).get("data", {}).get("factory", [])
@@ -204,6 +307,7 @@ def normalize_image_models(image_info: Optional[Dict[str, Any]]) -> List[Dict[st
             name = model.get("modelName", "")
             if not name:
                 continue
+            policy = model_policy_for("image", name)
             models.append({
                 "name": name,
                 "factory": factory_name,
@@ -212,6 +316,10 @@ def normalize_image_models(image_info: Optional[Dict[str, Any]]) -> List[Dict[st
                 "resolutions": model.get("resolution") if isinstance(model.get("resolution"), list) else [],
                 "ratios": normalize_ratios(model.get("size")),
                 "point_cost": model.get("pointCost") if isinstance(model.get("pointCost"), list) else [],
+                "enabled": bool(policy.get("enabled", True)),
+                "experimental": bool(policy.get("experimental", False)),
+                "verification_status": str(policy.get("verification_status") or default_model_verification_status("image")),
+                "risk_level": str(policy.get("risk_level") or "low"),
             })
     return models
 
@@ -228,6 +336,7 @@ def normalize_video_models(video_info: Optional[Dict[str, Any]]) -> List[Dict[st
         if not name:
             continue
         resolutions = model.get("videoResolution")
+        policy = model_policy_for("video", name)
         models.append({
             "name": name,
             "description": localized_text(model.get("description")),
@@ -241,6 +350,10 @@ def normalize_video_models(video_info: Optional[Dict[str, Any]]) -> List[Dict[st
             "point_cost_image": model.get("pointCostImage") if isinstance(model.get("pointCostImage"), list) else [],
             "point_cost_reference": model.get("pointCostReference") if isinstance(model.get("pointCostReference"), list) else [],
             "point_cost_motion": model.get("pointCostMotion") if isinstance(model.get("pointCostMotion"), list) else [],
+            "enabled": bool(policy.get("enabled", True)),
+            "experimental": bool(policy.get("experimental", False)),
+            "verification_status": str(policy.get("verification_status") or default_model_verification_status("video")),
+            "risk_level": str(policy.get("risk_level") or "low"),
         })
     return models
 
@@ -256,11 +369,16 @@ def normalize_video_scenes(video_info: Optional[Dict[str, Any]]) -> List[Dict[st
         scene_id = scene.get("sceneId", "")
         if not scene_id:
             continue
+        policy = scene_policy_for(scene_id)
         scenes.append({
             "scene_id": scene_id,
             "name": localized_text(scene.get("sceneName")),
             "description": localized_text(scene.get("description")),
             "icon": scene.get("sceneIcon") or "",
+            "enabled": bool(policy.get("enabled", True)),
+            "experimental": bool(policy.get("experimental", False)),
+            "verification_status": str(policy.get("verification_status") or "live_verified"),
+            "risk_level": str(policy.get("risk_level") or "low"),
         })
     return scenes
 
@@ -285,6 +403,15 @@ def json_from_db(raw: Optional[str]) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def json_value_from_db(raw: Optional[str]) -> Any:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
 def capabilities_from_account(account: sqlite3.Row) -> Dict[str, Any]:
     return normalize_capabilities(json_from_db(account["model_info_json"]), json_from_db(account["video_info_json"]))
 
@@ -293,6 +420,13 @@ def find_capability_model(models: List[Dict[str, Any]], name: str) -> Optional[D
     for model in models:
         if model.get("name") == name:
             return model
+    return None
+
+
+def find_capability_scene(scenes: List[Dict[str, Any]], scene_id: str) -> Optional[Dict[str, Any]]:
+    for scene in scenes:
+        if scene.get("scene_id") == scene_id:
+            return scene
     return None
 
 
@@ -366,13 +500,39 @@ def validate_generation_options(kind: str, options: Dict[str, Any], caps: Dict[s
             f"model_name is not supported for {kind} generation",
             {"field": "model_name", "value": options.get("model_name"), "allowed": [m.get("name") for m in models]},
         )
+    if not bool(model.get("enabled", True)):
+        raise GatewayAPIError(
+            422,
+            "MODEL_DISABLED",
+            f"model_name is disabled by policy: {options.get('model_name')}",
+            {"field": "model_name", "value": options.get("model_name"), "verification_status": model.get("verification_status"), "experimental": bool(model.get("experimental"))},
+        )
     ensure_capability_value("resolution", options.get("resolution"), model.get("resolutions") or [], "INVALID_RESOLUTION")
     ensure_capability_value("ratio", options.get("ratio"), model.get("ratios") or [], "INVALID_RATIO")
     if kind == "video":
-        ensure_capability_value("duration", options.get("duration"), model.get("durations") or [], "INVALID_DURATION")
+        scene_id = options.get("scene_id") or CFG["oreate"]["default_video_scene"]
         scenes = caps.get("video", {}).get("scenes") or []
-        scene_ids = [scene.get("scene_id") for scene in scenes if scene.get("scene_id")]
-        ensure_capability_value("scene_id", options.get("scene_id"), scene_ids, "INVALID_SCENE")
+        scene = find_capability_scene(scenes, scene_id)
+        if not scene:
+            raise GatewayAPIError(
+                422,
+                "INVALID_SCENE",
+                "scene_id is not supported for video generation",
+                {"field": "scene_id", "value": scene_id, "allowed": [s.get("scene_id") for s in scenes]},
+            )
+        if not bool(scene.get("enabled", True)):
+            raise GatewayAPIError(
+                422,
+                "EXPERIMENTAL_SCENE_DISABLED",
+                f"video scene is disabled by policy: {scene_id}",
+                {
+                    "field": "scene_id",
+                    "value": scene_id,
+                    "verification_status": scene.get("verification_status"),
+                    "experimental": bool(scene.get("experimental")),
+                },
+            )
+        ensure_capability_value("duration", options.get("duration"), model.get("durations") or [], "INVALID_DURATION")
 
 
 def video_cost_table_for_scene(model: Dict[str, Any], scene_id: str) -> List[Dict[str, Any]]:
@@ -984,6 +1144,10 @@ CFG = load_config()
 ADMIN_TOKENS: Dict[str, str] = {}
 WS_CLIENTS: List[WebSocket] = []
 RATE_BUCKETS: Dict[int, List[float]] = {}
+TASK_WORKER_LOCK = threading.Lock()
+TASK_WORKER_THREAD: Optional[threading.Thread] = None
+TASK_WORKER_STOP = threading.Event()
+TASK_WORKER_WAKE = threading.Event()
 
 
 def db_conn():
@@ -1022,15 +1186,55 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            api_key_id INTEGER,
             account_id INTEGER,
             kind TEXT NOT NULL,
             prompt TEXT,
+            model_name TEXT,
+            scene_id TEXT,
+            resolution TEXT,
+            ratio TEXT,
+            duration INTEGER,
+            estimated_point_cost INTEGER,
+            actual_point_cost INTEGER,
+            request_id TEXT,
             payload_json TEXT,
-            chat_id TEXT,
-            status TEXT NOT NULL DEFAULT 'created',
             response_json TEXT,
+            assets_json TEXT,
+            chat_id TEXT,
+            focus_id TEXT,
+            status TEXT NOT NULL DEFAULT 'created',
+            error_code TEXT,
+            error_message TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            cancel_requested_at REAL,
+            started_at REAL,
+            finished_at REAL,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
+            FOREIGN KEY(api_key_id) REFERENCES api_keys(id),
+            FOREIGN KEY(account_id) REFERENCES accounts(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            attempt_no INTEGER NOT NULL,
+            phase TEXT NOT NULL,
+            account_id INTEGER,
+            status TEXT NOT NULL,
+            error_code TEXT,
+            error_message TEXT,
+            request_payload_json TEXT,
+            stream_summary_json TEXT,
+            hydration_summary_json TEXT,
+            assets_json TEXT,
+            started_at REAL NOT NULL,
+            finished_at REAL,
+            FOREIGN KEY(task_id) REFERENCES tasks(id),
             FOREIGN KEY(account_id) REFERENCES accounts(id)
         )
         """
@@ -1042,6 +1246,8 @@ def init_db():
             key TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL DEFAULT '',
             enabled INTEGER NOT NULL DEFAULT 1,
+            deleted_at REAL,
+            disabled_reason TEXT,
             created_at REAL NOT NULL,
             last_used_at REAL
         )
@@ -1084,9 +1290,40 @@ def init_db():
     add_column_if_missing(conn, "api_keys", "rate_limit_per_minute", "INTEGER")
     add_column_if_missing(conn, "api_keys", "daily_request_limit", "INTEGER")
     add_column_if_missing(conn, "api_keys", "daily_point_limit", "INTEGER")
+    add_column_if_missing(conn, "api_keys", "deleted_at", "REAL")
+    add_column_if_missing(conn, "api_keys", "disabled_reason", "TEXT")
+    add_column_if_missing(conn, "tasks", "api_key_id", "INTEGER")
     add_column_if_missing(conn, "accounts", "last_used_at", "REAL")
     add_column_if_missing(conn, "accounts", "failure_count", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "accounts", "cooldown_until", "REAL")
+    add_column_if_missing(conn, "tasks", "model_name", "TEXT")
+    add_column_if_missing(conn, "tasks", "scene_id", "TEXT")
+    add_column_if_missing(conn, "tasks", "resolution", "TEXT")
+    add_column_if_missing(conn, "tasks", "ratio", "TEXT")
+    add_column_if_missing(conn, "tasks", "duration", "INTEGER")
+    add_column_if_missing(conn, "tasks", "estimated_point_cost", "INTEGER")
+    add_column_if_missing(conn, "tasks", "actual_point_cost", "INTEGER")
+    add_column_if_missing(conn, "tasks", "request_id", "TEXT")
+    add_column_if_missing(conn, "tasks", "response_json", "TEXT")
+    add_column_if_missing(conn, "tasks", "assets_json", "TEXT")
+    add_column_if_missing(conn, "tasks", "focus_id", "TEXT")
+    add_column_if_missing(conn, "tasks", "error_code", "TEXT")
+    add_column_if_missing(conn, "tasks", "error_message", "TEXT")
+    add_column_if_missing(conn, "tasks", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "tasks", "cancel_requested_at", "REAL")
+    add_column_if_missing(conn, "tasks", "started_at", "REAL")
+    add_column_if_missing(conn, "tasks", "finished_at", "REAL")
+    add_column_if_missing(conn, "task_attempts", "phase", "TEXT NOT NULL DEFAULT 'generation'")
+    add_column_if_missing(conn, "task_attempts", "account_id", "INTEGER")
+    add_column_if_missing(conn, "task_attempts", "status", "TEXT NOT NULL DEFAULT 'running'")
+    add_column_if_missing(conn, "task_attempts", "error_code", "TEXT")
+    add_column_if_missing(conn, "task_attempts", "error_message", "TEXT")
+    add_column_if_missing(conn, "task_attempts", "request_payload_json", "TEXT")
+    add_column_if_missing(conn, "task_attempts", "stream_summary_json", "TEXT")
+    add_column_if_missing(conn, "task_attempts", "hydration_summary_json", "TEXT")
+    add_column_if_missing(conn, "task_attempts", "assets_json", "TEXT")
+    add_column_if_missing(conn, "task_attempts", "started_at", "REAL")
+    add_column_if_missing(conn, "task_attempts", "finished_at", "REAL")
     add_column_if_missing(conn, "usage_log", "task_id", "INTEGER")
     add_column_if_missing(conn, "usage_log", "request_id", "TEXT")
     add_column_if_missing(conn, "usage_log", "idempotency_key", "TEXT")
@@ -1362,7 +1599,7 @@ class OreateClient:
 
     def new_session(self) -> requests.Session:
         s = requests.Session()
-        s.verify = False
+        s.verify = tls_verify_enabled()
         s.get(self.base + "/", headers=self.headers, timeout=self.timeout)
         return s
 
@@ -1901,28 +2138,170 @@ def list_accounts() -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def save_task(account_id: int, kind: str, prompt: str, payload: Dict[str, Any], response: Dict[str, Any], status: str = "created") -> int:
+TASK_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "expired"}
+
+
+def encode_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def task_response_assets(response: Any) -> List[Any]:
+    if not isinstance(response, dict):
+        return []
+    assets = response.get("assets")
+    if isinstance(assets, list):
+        return assets
+    hydration = response.get("hydration")
+    if isinstance(hydration, dict):
+        nested_assets = hydration.get("assets")
+        if isinstance(nested_assets, list):
+            return nested_assets
+    return []
+
+
+def task_response_chat(response: Any) -> Dict[str, Any]:
+    if not isinstance(response, dict):
+        return {}
+    chat = response.get("chat")
+    return chat if isinstance(chat, dict) else {}
+
+
+def task_row_to_public(row: sqlite3.Row) -> Dict[str, Any]:
+    item = dict(row)
+    payload = json_value_from_db(item.get("payload_json")) or {}
+    response = json_value_from_db(item.get("response_json")) or {}
+    assets = json_value_from_db(item.get("assets_json"))
+    if not isinstance(assets, list):
+        assets = task_response_assets(response)
+    item["payload"] = payload
+    item["response"] = response
+    item["assets"] = assets
+    chat = task_response_chat(response)
+    if not item.get("chat_id"):
+        item["chat_id"] = chat.get("chatId") or ""
+    if not item.get("focus_id"):
+        item["focus_id"] = chat.get("focusId") or item.get("chat_id") or ""
+    return item
+
+
+def task_attempts_for_task(task_id: int) -> List[Dict[str, Any]]:
+    conn = db_conn()
+    rows = conn.execute("SELECT * FROM task_attempts WHERE task_id=? ORDER BY attempt_no ASC, id ASC", (task_id,)).fetchall()
+    conn.close()
+    attempts = []
+    for row in rows:
+        item = dict(row)
+        item["request_payload"] = json_value_from_db(item.pop("request_payload_json", None))
+        item["stream_summary"] = json_value_from_db(item.pop("stream_summary_json", None))
+        item["hydration_summary"] = json_value_from_db(item.pop("hydration_summary_json", None))
+        assets = json_value_from_db(item.pop("assets_json", None))
+        item["assets"] = assets if isinstance(assets, list) else []
+        attempts.append(item)
+    return attempts
+
+
+def task_detail_for_row(row: sqlite3.Row) -> Dict[str, Any]:
+    task = task_row_to_public(row)
+    task["attempts"] = task_attempts_for_task(task["id"])
+    return task
+
+
+def update_task_record(task_id: int, **fields: Any) -> None:
+    if not fields:
+        return
+    conn = db_conn()
+    now = fields.pop("updated_at", time.time())
+    payload = dict(fields)
+    payload["updated_at"] = now
+    for key in ("payload_json", "response_json", "assets_json"):
+        if key in payload:
+            payload[key] = encode_json_value(payload[key])
+    assignments = ", ".join(f"{key}=?" for key in payload)
+    values = list(payload.values()) + [task_id]
+    conn.execute(f"UPDATE tasks SET {assignments} WHERE id=?", values)
+    conn.commit()
+    conn.close()
+
+
+def update_task_status(task_id: int, status: str, response: Optional[Dict[str, Any]] = None) -> None:
     now = time.time()
-    chat_id = (
-        response.get("chat", {}).get("chatId")
-        or response.get("data", {}).get("chatId")
-        or response.get("chatId")
-        or ""
-    )
+    fields: Dict[str, Any] = {"status": status, "updated_at": now}
+    if response is not None:
+        fields["response_json"] = response
+        fields["assets_json"] = task_response_assets(response)
+        chat = task_response_chat(response)
+        if chat:
+            fields["chat_id"] = chat.get("chatId") or ""
+            fields["focus_id"] = chat.get("focusId") or fields["chat_id"]
+    if status in TASK_TERMINAL_STATUSES:
+        fields["finished_at"] = now
+    update_task_record(task_id, **fields)
+
+
+def save_task(
+    account_id: int,
+    kind: str,
+    prompt: str,
+    payload: Dict[str, Any],
+    response: Dict[str, Any],
+    status: str = "created",
+    *,
+    api_key_id: Optional[int] = None,
+    request_id: str = "",
+    model_name: str = "",
+    scene_id: str = "",
+    resolution: str = "",
+    ratio: str = "",
+    duration: Optional[int] = None,
+    estimated_point_cost: Optional[int] = None,
+    actual_point_cost: Optional[int] = None,
+    error_code: str = "",
+    error_message: str = "",
+    cancel_requested_at: Optional[float] = None,
+    started_at: Optional[float] = None,
+    finished_at: Optional[float] = None,
+) -> int:
+    now = time.time()
+    chat = task_response_chat(response)
+    assets = task_response_assets(response)
     conn = db_conn()
     conn.execute(
         """
-        INSERT INTO tasks(account_id,kind,prompt,payload_json,chat_id,status,response_json,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?)
+        INSERT INTO tasks(
+            api_key_id, account_id, kind, prompt, model_name, scene_id, resolution, ratio, duration,
+            estimated_point_cost, actual_point_cost, request_id, payload_json, response_json, assets_json,
+            chat_id, focus_id, status, error_code, error_message, attempt_count, cancel_requested_at,
+            started_at, finished_at, created_at, updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
+            api_key_id,
             account_id,
             kind,
             prompt,
-            json.dumps(payload, ensure_ascii=False),
-            chat_id,
+            model_name or "",
+            scene_id or "",
+            resolution or "",
+            ratio or "",
+            duration,
+            estimated_point_cost,
+            actual_point_cost,
+            request_id or "",
+            encode_json_value(payload),
+            encode_json_value(response),
+            encode_json_value(assets),
+            chat.get("chatId") or "",
+            chat.get("focusId") or (chat.get("chatId") or ""),
             status,
-            json.dumps(response, ensure_ascii=False),
+            error_code or "",
+            error_message or "",
+            0,
+            cancel_requested_at,
+            started_at,
+            finished_at,
             now,
             now,
         ),
@@ -1934,15 +2313,406 @@ def save_task(account_id: int, kind: str, prompt: str, payload: Dict[str, Any], 
     return task_id
 
 
-def update_task_status(task_id: int, status: str, response: Optional[Dict[str, Any]] = None) -> None:
-    now = time.time()
+def update_usage_log_for_task(task_id: int, api_key_id: Optional[int] = None, **fields: Any) -> None:
+    if not fields:
+        return
     conn = db_conn()
-    conn.execute(
-        "UPDATE tasks SET status=?, response_json=?, updated_at=? WHERE id=?",
-        (status, json.dumps(response, ensure_ascii=False) if response is not None else None, now, task_id),
-    )
+    query = "SELECT id FROM usage_log WHERE task_id=?"
+    params: List[Any] = [task_id]
+    if api_key_id is not None:
+        query += " AND api_key_id=?"
+        params.append(api_key_id)
+    query += " ORDER BY id DESC LIMIT 1"
+    row = conn.execute(query, tuple(params)).fetchone()
+    if not row:
+        conn.close()
+        return
+    payload = dict(fields)
+    for key in ("response_summary",):
+        if key in payload and payload[key] is not None:
+            payload[key] = str(payload[key])[:200]
+    assignments = ", ".join(f"{key}=?" for key in payload)
+    values = list(payload.values()) + [row["id"]]
+    conn.execute(f"UPDATE usage_log SET {assignments} WHERE id=?", values)
     conn.commit()
     conn.close()
+
+
+def fetch_task_row(task_id: int, api_key_id: Optional[int] = None) -> Optional[sqlite3.Row]:
+    conn = db_conn()
+    if api_key_id is None:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM tasks WHERE id=? AND api_key_id=?", (task_id, api_key_id)).fetchone()
+        if not row:
+            legacy = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if legacy and legacy["api_key_id"] is None:
+                usage = conn.execute(
+                    "SELECT 1 FROM usage_log WHERE task_id=? AND api_key_id=? LIMIT 1",
+                    (task_id, api_key_id),
+                ).fetchone()
+                if usage:
+                    row = legacy
+    conn.close()
+    return row
+
+
+def fetch_task_attempt_row(task_id: int, attempt_no: int) -> Optional[sqlite3.Row]:
+    conn = db_conn()
+    row = conn.execute(
+        "SELECT * FROM task_attempts WHERE task_id=? AND attempt_no=? ORDER BY id DESC LIMIT 1",
+        (task_id, attempt_no),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def create_task_attempt(task: sqlite3.Row, phase: str, status: str = "running") -> int:
+    conn = db_conn()
+    next_no_row = conn.execute("SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_no FROM task_attempts WHERE task_id=?", (task["id"],)).fetchone()
+    attempt_no = int(next_no_row["next_no"] or 1)
+    now = time.time()
+    conn.execute(
+        """
+        INSERT INTO task_attempts(
+            task_id, attempt_no, phase, account_id, status, error_code, error_message,
+            request_payload_json, stream_summary_json, hydration_summary_json, assets_json,
+            started_at, finished_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            task["id"],
+            attempt_no,
+            phase,
+            task.get("account_id"),
+            status,
+            "",
+            "",
+            encode_json_value(json_value_from_db(task.get("payload_json")) or {}),
+            None,
+            None,
+            None,
+            now,
+            None,
+        ),
+    )
+    conn.commit()
+    row = conn.execute("SELECT last_insert_rowid()").fetchone()
+    attempt_id = row[0]
+    conn.close()
+    return attempt_id
+
+
+def update_task_attempt(attempt_id: int, **fields: Any) -> None:
+    if not fields:
+        return
+    conn = db_conn()
+    payload = dict(fields)
+    for key in ("request_payload_json", "stream_summary_json", "hydration_summary_json", "assets_json"):
+        if key in payload:
+            payload[key] = encode_json_value(payload[key])
+    assignments = ", ".join(f"{key}=?" for key in payload)
+    values = list(payload.values()) + [attempt_id]
+    conn.execute(f"UPDATE task_attempts SET {assignments} WHERE id=?", values)
+    conn.commit()
+    conn.close()
+
+
+def claim_next_task() -> Optional[Dict[str, Any]]:
+    conn = db_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT *
+            FROM tasks
+            WHERE status IN ('queued', 'submitted', 'hydrating')
+              AND cancel_requested_at IS NULL
+            ORDER BY
+                CASE status
+                    WHEN 'queued' THEN 0
+                    WHEN 'hydrating' THEN 1
+                    WHEN 'submitted' THEN 2
+                    ELSE 3
+                END,
+                updated_at ASC,
+                id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        if not row:
+            conn.commit()
+            return None
+        task = dict(row)
+        now = time.time()
+        next_status = "running" if task.get("status") == "queued" else "hydrating"
+        result = conn.execute(
+            "UPDATE tasks SET status=?, started_at=COALESCE(started_at, ?), updated_at=?, attempt_count=attempt_count+1 WHERE id=?",
+            (next_status, now, now, task["id"]),
+        )
+        if result.rowcount != 1:
+            conn.rollback()
+            return None
+        conn.commit()
+        task["status"] = next_status
+        task["started_at"] = task.get("started_at") or now
+        return task
+    finally:
+        conn.close()
+
+
+def task_worker_enabled() -> bool:
+    return bool(gateway_cfg().get("enable_background_worker", True))
+
+
+def task_worker_poll_interval() -> float:
+    try:
+        return float(gateway_cfg().get("task_worker_poll_interval_seconds") or 1)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def resolve_task_body(task: sqlite3.Row):
+    payload = json_value_from_db(task["payload_json"]) or {}
+    if not isinstance(payload, dict):
+        raise RuntimeError("task payload is malformed")
+    return GatewayGenerateIn(**payload)
+
+
+def task_retryable_status(status: str) -> bool:
+    return status in {"failed", "expired"}
+
+
+def task_hydratable_status(status: str) -> bool:
+    return status in {"submitted", "hydrating"}
+
+
+def run_generation_attempt(task: sqlite3.Row, attempt_id: int) -> Dict[str, Any]:
+    body = resolve_task_body(task)
+    conn = db_conn()
+    account_row = conn.execute("SELECT * FROM accounts WHERE id=?", (task["account_id"],)).fetchone()
+    conn.close()
+    if not account_row:
+        raise HTTPException(503, "no verified account available")
+    caps = capabilities_from_account(account_row)
+    options = effective_generation_options(body, caps)
+    validate_generation_options(body.kind, options, caps)
+    generation = submit_generation_for_account(account_row, body.kind, body.prompt, options)
+    return {
+        "account_id": account_row["id"],
+        "body": body,
+        "options": options,
+        "generation": generation,
+    }
+
+
+def run_hydration_attempt(task: sqlite3.Row, attempt_id: int) -> Dict[str, Any]:
+    body = resolve_task_body(task)
+    conn = db_conn()
+    account_row = conn.execute("SELECT * FROM accounts WHERE id=?", (task["account_id"],)).fetchone()
+    conn.close()
+    if not account_row:
+        raise HTTPException(503, "no verified account available")
+    session = CLIENT.session_from_account(account_row)
+    response_data = json_value_from_db(task.get("response_json")) or {}
+    chat = task_response_chat(response_data)
+    chat_id = task.get("chat_id") or chat.get("chatId") or ""
+    if not chat_id:
+        raise RuntimeError("task chat_id missing for hydration")
+    if body.kind == "video":
+        hydration = CLIENT.hydrate_generation_result_until_assets(session, chat_id, chat_type="aiVideo")
+    else:
+        hydration = CLIENT.hydrate_generation_result(session, chat_id)
+    if hydration.get("error"):
+        raise UpstreamGenerationError(hydration["error"])
+    assets = hydration.get("assets") or []
+    result_status = "completed" if assets else "submitted"
+    return {
+        "account_id": account_row["id"],
+        "body": body,
+        "hydration": hydration,
+        "assets": assets,
+        "status": result_status,
+        "chat_id": chat_id,
+    }
+
+
+def finalize_task_attempt(task: sqlite3.Row, attempt_id: int, phase: str, result: Dict[str, Any], status: str) -> None:
+    now = time.time()
+    update_task_attempt(
+        attempt_id,
+        status=status,
+        error_code=result.get("error_code") or "",
+        error_message=result.get("error_message") or "",
+        stream_summary_json=result.get("stream_summary"),
+        hydration_summary_json=result.get("hydration_summary"),
+        assets_json=result.get("assets") or [],
+        finished_at=now,
+    )
+    update_task_record(
+        task["id"],
+        status=status,
+        account_id=result.get("account_id", task.get("account_id")),
+        chat_id=result.get("chat_id", task.get("chat_id") or ""),
+        focus_id=result.get("focus_id", task.get("focus_id") or ""),
+        response_json=result.get("response_json"),
+        assets_json=result.get("assets") or [],
+        error_code=result.get("error_code") or "",
+        error_message=result.get("error_message") or "",
+        finished_at=now if status in TASK_TERMINAL_STATUSES else None,
+    )
+    if task.get("api_key_id"):
+        update_usage_log_for_task(
+            task["id"],
+            task.get("api_key_id"),
+            status=status,
+            response_summary=result.get("response_summary") or status,
+            error_code=result.get("error_code") or "",
+            status_code=result.get("status_code") or (200 if status == "completed" else 202 if status in {"queued", "submitted", "hydrating"} else 503),
+        )
+
+
+def execute_task(task: sqlite3.Row) -> bool:
+    phase = "generation" if task.get("status") == "running" else "hydration"
+    attempt_id = create_task_attempt(task, phase, status="running")
+    try:
+        if phase == "generation":
+            result = run_generation_attempt(task, attempt_id)
+            generation = result["generation"]
+            assets = generation.get("assets") or []
+            status = generation.get("status") or ("completed" if assets else "submitted")
+            response = generation.get("response") or {}
+            result_payload = {
+                "account_id": result.get("account_id"),
+                "response_json": response,
+                "assets": assets,
+                "chat_id": response.get("chat", {}).get("chatId") if isinstance(response.get("chat"), dict) else task.get("chat_id"),
+                "focus_id": response.get("chat", {}).get("focusId") if isinstance(response.get("chat"), dict) else task.get("focus_id"),
+                "stream_summary": generation.get("stream"),
+                "hydration_summary": generation.get("hydration"),
+                "response_summary": json.dumps({"status": status, "assets": len(assets)}, ensure_ascii=False),
+                "status_code": 200 if status == "completed" else 202,
+            }
+            if status == "completed":
+                mark_account_success(result["account_id"])
+            else:
+                mark_account_success(result["account_id"])
+            finalize_task_attempt(task, attempt_id, phase, result_payload, status)
+            return True
+
+        hydration_result = run_hydration_attempt(task, attempt_id)
+        status = hydration_result.get("status") or ("completed" if hydration_result.get("assets") else "submitted")
+        result_payload = {
+            "account_id": hydration_result.get("account_id"),
+            "response_json": json_value_from_db(task.get("response_json")) or {},
+            "assets": hydration_result.get("assets") or [],
+            "chat_id": hydration_result.get("chat_id") or task.get("chat_id") or "",
+            "focus_id": task.get("focus_id") or task.get("chat_id") or "",
+            "hydration_summary": hydration_result.get("hydration"),
+            "response_summary": json.dumps({"status": status, "assets": len(hydration_result.get("assets") or [])}, ensure_ascii=False),
+            "status_code": 200 if status == "completed" else 202,
+        }
+        mark_account_success(result_payload["account_id"])
+        finalize_task_attempt(task, attempt_id, phase, result_payload, status)
+        return True
+    except UpstreamGenerationError as exc:
+        error = exc.error if isinstance(exc.error, dict) else {}
+        code = error.get("code") or "UPSTREAM_ERROR"
+        message = error.get("message") or str(exc)
+        result_payload = {
+            "account_id": task.get("account_id"),
+            "error_code": code,
+            "error_message": message,
+            "response_summary": json.dumps({"code": code, "message": message}, ensure_ascii=False),
+            "status_code": 503,
+        }
+        if task.get("account_id"):
+            mark_account_failure(task["account_id"], exc)
+        update_task_attempt(
+            attempt_id,
+            status="failed",
+            error_code=code,
+            error_message=message,
+            finished_at=time.time(),
+        )
+        update_task_record(
+            task["id"],
+            status="failed",
+            error_code=code,
+            error_message=message,
+            finished_at=time.time(),
+        )
+        if task.get("api_key_id"):
+            update_usage_log_for_task(
+                task["id"],
+                task.get("api_key_id"),
+                status="failed",
+                response_summary=message,
+                error_code=code,
+                status_code=503,
+            )
+        return False
+    except Exception as exc:
+        if task.get("account_id"):
+            mark_account_failure(task["account_id"], exc)
+        message = str(exc)
+        update_task_attempt(
+            attempt_id,
+            status="failed",
+            error_code="UPSTREAM_ERROR",
+            error_message=message,
+            finished_at=time.time(),
+        )
+        update_task_record(
+            task["id"],
+            status="failed",
+            error_code="UPSTREAM_ERROR",
+            error_message=message,
+            finished_at=time.time(),
+        )
+        if task.get("api_key_id"):
+            update_usage_log_for_task(
+                task["id"],
+                task.get("api_key_id"),
+                status="failed",
+                response_summary=message,
+                error_code="UPSTREAM_ERROR",
+                status_code=503,
+            )
+        return False
+
+
+def process_task_queue(limit: int = 1) -> int:
+    processed = 0
+    with TASK_WORKER_LOCK:
+        while processed < max(1, int(limit)):
+            task = claim_next_task()
+            if not task:
+                break
+            execute_task(task)
+            processed += 1
+    return processed
+
+
+def task_worker_loop() -> None:
+    while not TASK_WORKER_STOP.is_set():
+        processed = process_task_queue(limit=1)
+        if processed:
+            continue
+        TASK_WORKER_WAKE.wait(task_worker_poll_interval())
+        TASK_WORKER_WAKE.clear()
+
+
+def ensure_task_worker_started() -> None:
+    global TASK_WORKER_THREAD
+    if not task_worker_enabled():
+        return
+    if TASK_WORKER_THREAD and TASK_WORKER_THREAD.is_alive():
+        return
+    TASK_WORKER_STOP.clear()
+    TASK_WORKER_THREAD = threading.Thread(target=task_worker_loop, name="task-worker", daemon=True)
+    TASK_WORKER_THREAD.start()
 
 
 def pick_account_for_task(kind: str) -> Optional[sqlite3.Row]:
@@ -2080,6 +2850,8 @@ def submit_generation_for_account(account: sqlite3.Row, kind: str, prompt: str, 
         "payload": request_payload,
         "response": response,
         "assets": assets,
+        "stream": stream,
+        "hydration": hydration,
         "status": "completed" if assets else hydration.get("status") or "submitted",
     }
 
@@ -2150,7 +2922,7 @@ def auto_register_accounts(count: int = 1) -> List[Dict[str, Any]]:
                             trace.append({"step": "extract_token_from_link", "tokenID": token_id, "link": link})
                             # Visit the verification link (click it) - REQUIRED for email to be marked verified
                             try:
-                                vr = requests.get(link, verify=False, timeout=10, allow_redirects=True)
+                                vr = requests.get(link, verify=tls_verify_enabled(), timeout=10, allow_redirects=True)
                                 trace.append({"step": "visit_verification_link", "status": vr.status_code})
                             except Exception as e:
                                 trace.append({"step": "visit_verification_link", "error": str(e)})
@@ -2351,7 +3123,9 @@ def log_usage(
         ),
     )
     conn.commit()
+    row = conn.execute("SELECT last_insert_rowid()").fetchone()
     conn.close()
+    return row[0] if row else None
 
 
 # === API Key Management (admin only) ===
@@ -2419,8 +3193,14 @@ def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_a
 @app.delete("/api/admin/apikeys/{key_id}")
 def delete_api_key(key_id: int, _=Depends(require_admin)):
     conn = db_conn()
-    conn.execute("DELETE FROM api_keys WHERE id=?", (key_id,))
-    conn.execute("DELETE FROM usage_log WHERE api_key_id=?", (key_id,))
+    conn.execute(
+        """
+        UPDATE api_keys
+        SET enabled=0, deleted_at=?, disabled_reason=?
+        WHERE id=?
+        """,
+        (time.time(), "deleted", key_id),
+    )
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -2459,6 +3239,80 @@ class GatewayGenerateIn(BaseModel):
     keep_original_sound: Optional[bool] = None
     is_audio: Optional[bool] = None
     ai_type: Optional[Any] = None
+    sync_wait_seconds: Optional[float] = None
+
+
+def request_body_from_generation(body: GatewayGenerateIn) -> Dict[str, Any]:
+    data = model_data(body)
+    data.pop("sync_wait_seconds", None)
+    return data
+
+
+def queue_generation_task(
+    api_key_id: Optional[int],
+    request_id: str,
+    account: sqlite3.Row,
+    body: GatewayGenerateIn,
+    options: Dict[str, Any],
+    estimated_point_cost: Optional[int],
+) -> int:
+    payload = request_body_from_generation(body)
+    response = {"status": "queued"}
+    task_id = save_task(
+        account["id"],
+        body.kind,
+        body.prompt,
+        payload,
+        response,
+        status="queued",
+        api_key_id=api_key_id,
+        request_id=request_id,
+        model_name=options.get("model_name") or "",
+        scene_id=options.get("scene_id") or "",
+        resolution=options.get("resolution") or "",
+        ratio=options.get("ratio") or "",
+        duration=options.get("duration"),
+        estimated_point_cost=estimated_point_cost,
+    )
+    if api_key_id is not None:
+        log_usage(
+            api_key_id,
+            body.kind,
+            account["id"],
+            body.prompt,
+            "queued",
+            task_id=task_id,
+            request_id=request_id,
+            model_name=options.get("model_name") or "",
+            resolution=options.get("resolution") or "",
+            ratio=options.get("ratio") or "",
+            duration=options.get("duration"),
+            scene_id=options.get("scene_id") or "",
+            estimated_point_cost=estimated_point_cost,
+            status_code=202,
+        )
+    if task_worker_enabled():
+        TASK_WORKER_WAKE.set()
+    return task_id
+
+
+def wait_for_task_snapshot(task_id: int, api_key_id: int, timeout_sec: Optional[float]) -> Dict[str, Any]:
+    timeout = float(timeout_sec if timeout_sec is not None else gateway_cfg().get("sync_wait_seconds") or 0)
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        row = fetch_task_row(task_id, api_key_id)
+        if not row:
+            raise GatewayAPIError(404, "TASK_NOT_FOUND", "task not found")
+        task = task_detail_for_row(row)
+        if task.get("status") in TASK_TERMINAL_STATUSES:
+            return task
+        if time.monotonic() >= deadline:
+            return task
+        if not task_worker_enabled():
+            process_task_queue(limit=1)
+            continue
+        TASK_WORKER_WAKE.set()
+        time.sleep(min(0.2, max(0.01, deadline - time.monotonic())))
 
 
 @app.post("/v1/generate")
@@ -2467,20 +3321,21 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
     request_id = gateway_request_id(request)
     idempotency_key = request.headers.get("Idempotency-Key", "").strip()
     request_hash = request_hash_for_generation(body)
-    existing_idempotency = find_idempotency_record(api_key_id, idempotency_key)
-    if existing_idempotency:
-        if existing_idempotency["request_hash"] != request_hash:
-            raise GatewayAPIError(
-                409,
-                "IDEMPOTENCY_KEY_CONFLICT",
-                "Idempotency-Key was already used with a different request body",
-                {"field": "Idempotency-Key"},
-                request_id=request_id,
-            )
-        replay = json.loads(existing_idempotency["response_json"])
-        replay["idempotent_replay"] = True
-        replay["request_id"] = request_id
-        return JSONResponse(status_code=existing_idempotency["status_code"], content=replay)
+    if idempotency_key:
+        existing_idempotency = find_idempotency_record(api_key_id, idempotency_key)
+        if existing_idempotency:
+            if existing_idempotency["request_hash"] != request_hash:
+                raise GatewayAPIError(
+                    409,
+                    "IDEMPOTENCY_KEY_CONFLICT",
+                    "Idempotency-Key was already used with a different request body",
+                    {"field": "Idempotency-Key"},
+                    request_id=request_id,
+                )
+            replay = json.loads(existing_idempotency["response_json"])
+            replay["idempotent_replay"] = True
+            replay["request_id"] = request_id
+            return JSONResponse(status_code=existing_idempotency["status_code"], content=replay)
     policy = resolve_api_key_policy(get_api_key_record(api_key_id))
     now = time.time()
     check_rate_limit(api_key_id, policy, now, request_id)
@@ -2495,82 +3350,65 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
     estimated_point_cost = estimate_point_cost(body.kind, options, caps)
     check_daily_quota(api_key_id, estimated_point_cost, policy, now, request_id)
 
-    try:
-        generation = submit_generation_for_account(account, body.kind, body.prompt, options)
-    except UpstreamGenerationError as e:
-        mark_account_failure(account["id"], e)
-        log_usage(
-            api_key_id,
-            body.kind,
-            account["id"],
-            body.prompt,
-            "failed",
-            summary=str(e),
-            request_id=request_id,
-            idempotency_key=idempotency_key,
-            model_name=options.get("model_name") or "",
-            resolution=options.get("resolution") or "",
-            ratio=options.get("ratio") or "",
-            duration=options.get("duration"),
-            scene_id=options.get("scene_id") or "",
-            estimated_point_cost=estimated_point_cost,
-            error_code=e.error.get("code") or "UPSTREAM_ERROR",
-            status_code=503,
-        )
-        raise GatewayAPIError(503, "UPSTREAM_ERROR", e.error.get("message") or str(e), {"upstream": e.error}, request_id=request_id)
-    except Exception as e:
-        mark_account_failure(account["id"], e)
-        log_usage(
-            api_key_id,
-            body.kind,
-            account["id"],
-            body.prompt,
-            "failed",
-            summary=str(e),
-            request_id=request_id,
-            idempotency_key=idempotency_key,
-            model_name=options.get("model_name") or "",
-            resolution=options.get("resolution") or "",
-            ratio=options.get("ratio") or "",
-            duration=options.get("duration"),
-            scene_id=options.get("scene_id") or "",
-            estimated_point_cost=estimated_point_cost,
-            error_code="UPSTREAM_ERROR",
-            status_code=503,
-        )
-        raise GatewayAPIError(503, "UPSTREAM_ERROR", str(e), request_id=request_id)
-
-    mark_account_success(account["id"])
-    task_id = save_task(account["id"], body.kind, body.prompt, generation["payload"], generation["response"], generation["status"])
-    log_usage(
-        api_key_id,
-        body.kind,
-        account["id"],
-        body.prompt,
-        generation["status"],
-        task_id=task_id,
-        request_id=request_id,
-        idempotency_key=idempotency_key,
-        model_name=options.get("model_name") or "",
-        resolution=options.get("resolution") or "",
-        ratio=options.get("ratio") or "",
-        duration=options.get("duration"),
-        scene_id=options.get("scene_id") or "",
-        estimated_point_cost=estimated_point_cost,
-        status_code=200,
-    )
-    result = {
+    task_id = queue_generation_task(api_key_id, request_id, account, body, options, estimated_point_cost)
+    result: Dict[str, Any] = {
         "ok": True,
         "task_id": task_id,
         "account_id": account["id"],
         "request_id": request_id,
         "idempotent_replay": False,
         "estimated_point_cost": estimated_point_cost,
-        "assets": generation["assets"],
-        "response": generation["response"],
+        "status": "queued",
     }
-    save_idempotency_record(api_key_id, idempotency_key, request_hash, 200, result, task_id)
-    return result
+    status_code = 202
+    sync_wait_seconds = body.sync_wait_seconds if body.sync_wait_seconds is not None else gateway_cfg().get("sync_wait_seconds") or 0
+    if sync_wait_seconds and float(sync_wait_seconds) > 0:
+        snapshot = wait_for_task_snapshot(task_id, api_key_id, float(sync_wait_seconds))
+        result["status"] = snapshot.get("status") or result["status"]
+        result["task"] = snapshot
+        result["assets"] = snapshot.get("assets") or []
+        result["response"] = snapshot.get("response") or {}
+        if snapshot.get("status") == "completed":
+            status_code = 200
+        elif snapshot.get("status") in {"failed", "expired"}:
+            error_code = snapshot.get("error_code") or "UPSTREAM_ERROR"
+            error_message = snapshot.get("error_message") or "generation failed"
+            error_content = {
+                "ok": False,
+                "error": {
+                    "code": error_code,
+                    "message": error_message,
+                    "details": {
+                        "task_id": task_id,
+                        "status": snapshot.get("status"),
+                    },
+                },
+                "request_id": request_id,
+            }
+            if idempotency_key:
+                save_idempotency_record(api_key_id, idempotency_key, request_hash, 503, error_content, task_id)
+            return JSONResponse(status_code=503, content=error_content)
+        elif snapshot.get("status") == "cancelled":
+            error_content = {
+                "ok": False,
+                "error": {
+                    "code": "TASK_CANCELLED",
+                    "message": snapshot.get("error_message") or "task cancelled",
+                    "details": {
+                        "task_id": task_id,
+                        "status": snapshot.get("status"),
+                    },
+                },
+                "request_id": request_id,
+            }
+            if idempotency_key:
+                save_idempotency_record(api_key_id, idempotency_key, request_hash, 409, error_content, task_id)
+            return JSONResponse(status_code=409, content=error_content)
+        else:
+            status_code = 202
+    if idempotency_key:
+        save_idempotency_record(api_key_id, idempotency_key, request_hash, status_code, result, task_id)
+    return JSONResponse(status_code=status_code, content=result)
 
 
 @app.post("/v1/uploads")
@@ -2614,10 +3452,11 @@ def gateway_tasks(api_key_id: int = Depends(require_api_key)):
     """List tasks created by this API key."""
     conn = db_conn()
     rows = conn.execute(
-        "SELECT * FROM usage_log WHERE api_key_id=? ORDER BY id DESC LIMIT 50", (api_key_id,)
+        "SELECT * FROM tasks WHERE api_key_id=? ORDER BY id DESC LIMIT 50",
+        (api_key_id,),
     ).fetchall()
     conn.close()
-    return {"items": [dict(r) for r in rows]}
+    return {"items": [task_row_to_public(r) for r in rows]}
 
 
 @app.get("/v1/accounts/status")
@@ -2635,48 +3474,118 @@ def gateway_capabilities(api_key_id: int = Depends(require_api_key)):
     return load_capabilities_from_pool()
 
 
-def gateway_task_detail_payload(task_id: int, api_key_id: int) -> Dict[str, Any]:
+def gateway_task_detail_payload(task_id: int, api_key_id: Optional[int] = None) -> Dict[str, Any]:
+    row = fetch_task_row(task_id, api_key_id)
+    if not row:
+        raise GatewayAPIError(404, "TASK_NOT_FOUND", "task not found")
+    task = task_detail_for_row(row)
     conn = db_conn()
-    row = conn.execute(
-        """
-        SELECT
-            t.*,
-            u.model_name as audit_model_name,
-            u.resolution as audit_resolution,
-            u.ratio as audit_ratio,
-            u.duration as audit_duration,
-            u.scene_id as audit_scene_id,
-            u.estimated_point_cost as audit_estimated_point_cost,
-            u.request_id as audit_request_id,
-            u.idempotency_key as audit_idempotency_key,
-            u.error_code as audit_error_code,
-            u.status_code as audit_status_code
-        FROM tasks t
-        JOIN usage_log u ON u.task_id=t.id
-        WHERE t.id=? AND u.api_key_id=?
-        LIMIT 1
-        """,
-        (task_id, api_key_id),
-    ).fetchone()
+    usage_query = "SELECT * FROM usage_log WHERE task_id=?"
+    params: List[Any] = [task_id]
+    if api_key_id is not None:
+        usage_query += " AND api_key_id=?"
+        params.append(api_key_id)
+    usage_query += " ORDER BY id DESC LIMIT 1"
+    usage_row = conn.execute(usage_query, tuple(params)).fetchone()
     conn.close()
+    payload = task.get("payload") or {}
+    task["model_name"] = task.get("model_name") or (usage_row["model_name"] if usage_row else "") or payload.get("model_name") or payload.get("modelName") or ""
+    task["resolution"] = task.get("resolution") or (usage_row["resolution"] if usage_row else "") or payload.get("resolution") or ""
+    task["ratio"] = task.get("ratio") or (usage_row["ratio"] if usage_row else "") or payload.get("ratio") or ""
+    task["duration"] = task.get("duration") or (usage_row["duration"] if usage_row else None) or payload.get("duration")
+    task["scene_id"] = task.get("scene_id") or (usage_row["scene_id"] if usage_row else "") or payload.get("scene_id") or payload.get("sceneId") or ""
+    task["estimated_point_cost"] = task.get("estimated_point_cost") or (usage_row["estimated_point_cost"] if usage_row else None)
+    task["request_id"] = task.get("request_id") or (usage_row["request_id"] if usage_row else "")
+    task["idempotency_key"] = usage_row["idempotency_key"] if usage_row else ""
+    task["error_code"] = task.get("error_code") or (usage_row["error_code"] if usage_row else "")
+    task["status_code"] = usage_row["status_code"] if usage_row else None
+    return {"ok": True, "task": task}
+
+
+def retry_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[str, Any]:
+    row = fetch_task_row(task_id, api_key_id)
     if not row:
         raise GatewayAPIError(404, "TASK_NOT_FOUND", "task not found")
     task = dict(row)
-    payload = json_from_db(task.get("payload_json")) or {}
-    audit_fields = {
-        "model_name": task.pop("audit_model_name", None) or payload.get("modelName"),
-        "resolution": task.pop("audit_resolution", None) or payload.get("resolution"),
-        "ratio": task.pop("audit_ratio", None) or payload.get("ratio"),
-        "duration": task.pop("audit_duration", None) or payload.get("duration"),
-        "scene_id": task.pop("audit_scene_id", None) or payload.get("sceneId"),
-        "estimated_point_cost": task.pop("audit_estimated_point_cost", None),
-        "request_id": task.pop("audit_request_id", None),
-        "idempotency_key": task.pop("audit_idempotency_key", None),
-        "error_code": task.pop("audit_error_code", None),
-        "status_code": task.pop("audit_status_code", None),
-    }
-    task.update(audit_fields)
-    return {"ok": True, "task": task}
+    if not task_retryable_status(task.get("status") or ""):
+        raise GatewayAPIError(409, "TASK_NOT_RETRYABLE", "only failed or expired tasks can be retried")
+    update_task_record(
+        task_id,
+        status="queued",
+        error_code="",
+        error_message="",
+        response_json={},
+        assets_json=[],
+        chat_id="",
+        focus_id="",
+        cancel_requested_at=None,
+        started_at=None,
+        finished_at=None,
+    )
+    if task.get("api_key_id"):
+        update_usage_log_for_task(
+            task_id,
+            task.get("api_key_id"),
+            status="queued",
+            response_summary="retry requested",
+            error_code="",
+            status_code=202,
+        )
+    TASK_WORKER_WAKE.set()
+    return gateway_task_detail_payload(task_id, api_key_id)
+
+
+def cancel_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[str, Any]:
+    row = fetch_task_row(task_id, api_key_id)
+    if not row:
+        raise GatewayAPIError(404, "TASK_NOT_FOUND", "task not found")
+    task = dict(row)
+    if task.get("status") == "cancelled":
+        return gateway_task_detail_payload(task_id, api_key_id)
+    now = time.time()
+    update_task_record(
+        task_id,
+        status="cancelled",
+        cancel_requested_at=now,
+        finished_at=now,
+    )
+    if task.get("api_key_id"):
+        update_usage_log_for_task(
+            task_id,
+            task.get("api_key_id"),
+            status="cancelled",
+            response_summary="cancelled",
+            error_code="",
+            status_code=499,
+        )
+    return gateway_task_detail_payload(task_id, api_key_id)
+
+
+def hydrate_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[str, Any]:
+    row = fetch_task_row(task_id, api_key_id)
+    if not row:
+        raise GatewayAPIError(404, "TASK_NOT_FOUND", "task not found")
+    task = dict(row)
+    if not task_hydratable_status(task.get("status") or ""):
+        raise GatewayAPIError(409, "TASK_NOT_HYDRATABLE", "only submitted tasks can be rehydrated")
+    update_task_record(
+        task_id,
+        status="hydrating",
+        error_code="",
+        error_message="",
+        cancel_requested_at=None,
+    )
+    if task.get("api_key_id"):
+        update_usage_log_for_task(
+            task_id,
+            task.get("api_key_id"),
+            status="hydrating",
+            response_summary="hydrate requested",
+            error_code="",
+            status_code=202,
+        )
+    TASK_WORKER_WAKE.set()
+    return gateway_task_detail_payload(task_id, api_key_id)
 
 
 @app.get("/v1/task/{task_id}")
@@ -2689,11 +3598,27 @@ def gateway_task_detail_alias(task_id: int, api_key_id: int = Depends(require_ap
     return gateway_task_detail_payload(task_id, api_key_id)
 
 
+@app.post("/v1/tasks/{task_id}/retry")
+def gateway_task_retry(task_id: int, api_key_id: int = Depends(require_api_key)):
+    return retry_task_record(task_id, api_key_id)
+
+
+@app.post("/v1/tasks/{task_id}/cancel")
+def gateway_task_cancel(task_id: int, api_key_id: int = Depends(require_api_key)):
+    return cancel_task_record(task_id, api_key_id)
+
+
+@app.post("/v1/tasks/{task_id}/hydrate")
+def gateway_task_hydrate(task_id: int, api_key_id: int = Depends(require_api_key)):
+    return hydrate_task_record(task_id, api_key_id)
+
+
 @app.on_event("startup")
 def on_startup():
     init_db()
     if not CONFIG_PATH.exists():
         save_config(CFG)
+    ensure_task_worker_started()
 
 
 @app.get("/")
@@ -2800,44 +3725,44 @@ def import_account(body: Dict[str, str], _=Depends(require_admin)):
 
 
 @app.post("/api/media/generate")
-def generate_media(body: MediaTaskIn, _=Depends(require_admin)):
+def generate_media(body: MediaTaskIn, request: Request, _=Depends(require_admin)):
     if body.kind not in ("image", "video"):
         raise HTTPException(400, f"unsupported kind: {body.kind}")
-    if body.account_id:
-        conn = db_conn()
-        account = conn.execute("SELECT * FROM accounts WHERE id=? AND status IN ('verified', 'active')", (body.account_id,)).fetchone()
-        conn.close()
-    else:
-        account = pick_account_for_task(body.kind)
+    account = pick_account_for_generation(body.kind, body.account_id)
     if not account:
         raise HTTPException(503, "no verified account available")
-    if body.kind == "image":
-        options = {
-            "model_name": body.model_name or CFG["oreate"]["default_image_model"],
-            "ratio": body.ratio or CFG["oreate"]["default_image_ratio"],
-            "resolution": body.resolution or CFG["oreate"]["default_image_resolution"],
-        }
-        copy_optional_body_fields(options, body, ("image",))
-    else:
-        options = {
-            "scene_id": body.scene_id or CFG["oreate"]["default_video_scene"],
-            "model_name": body.model_name or CFG["oreate"]["default_video_model"],
-            "duration": body.duration or CFG["oreate"]["default_video_duration"],
-            "resolution": body.resolution or CFG["oreate"]["default_video_resolution"],
-            "ratio": body.ratio or CFG["oreate"]["default_video_ratio"],
-        }
-        copy_optional_body_fields(options, body, VIDEO_ATTACHMENT_OPTION_FIELDS)
+    gateway_body = GatewayGenerateIn(
+        kind=body.kind,
+        prompt=body.prompt,
+        model_name=body.model_name,
+        ratio=body.ratio,
+        resolution=body.resolution,
+        duration=body.duration,
+        scene_id=body.scene_id,
+        account_id=body.account_id,
+        image=body.image,
+        first_frame=body.first_frame,
+        last_frame=body.last_frame,
+        reference_images=body.reference_images,
+        reference_videos=body.reference_videos,
+        motion_video=body.motion_video,
+        character_image=body.character_image,
+        ref_duration=body.ref_duration,
+        ref_total_duration=body.ref_total_duration,
+        motion_duration=body.motion_duration,
+        keep_original_sound=body.keep_original_sound,
+        is_audio=body.is_audio,
+        ai_type=body.ai_type,
+    )
+    caps = capabilities_from_account(account)
+    options = effective_generation_options(gateway_body, caps)
     try:
-        generation = submit_generation_for_account(account, body.kind, body.prompt, options)
-    except UpstreamGenerationError as e:
-        mark_account_failure(account["id"], e)
-        raise HTTPException(503, {"code": e.error.get("code"), "message": e.error.get("message")})
-    except Exception as e:
-        mark_account_failure(account["id"], e)
-        raise HTTPException(503, str(e))
-    mark_account_success(account["id"])
-    task_id = save_task(account["id"], body.kind, body.prompt, generation["payload"], generation["response"], generation["status"])
-    return {"ok": True, "task_id": task_id, "assets": generation["assets"], "response": generation["response"]}
+        validate_generation_options(body.kind, options, caps)
+    except GatewayAPIError as exc:
+        raise HTTPException(exc.status_code, exc.message)
+    estimated_point_cost = estimate_point_cost(body.kind, options, caps)
+    task_id = queue_generation_task(None, gateway_request_id(request), account, gateway_body, options, estimated_point_cost)
+    return {"ok": True, "task_id": task_id, "status": "queued", "account_id": account["id"], "estimated_point_cost": estimated_point_cost}
 
 
 @app.get("/api/tasks")
@@ -2845,7 +3770,27 @@ def list_tasks(_=Depends(require_admin)):
     conn = db_conn()
     rows = conn.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()
     conn.close()
-    return {"items": [dict(r) for r in rows]}
+    return {"items": [task_row_to_public(r) for r in rows]}
+
+
+@app.get("/api/tasks/{task_id}")
+def admin_task_detail(task_id: int, _=Depends(require_admin)):
+    return gateway_task_detail_payload(task_id)
+
+
+@app.post("/api/tasks/{task_id}/retry")
+def admin_task_retry(task_id: int, _=Depends(require_admin)):
+    return retry_task_record(task_id)
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def admin_task_cancel(task_id: int, _=Depends(require_admin)):
+    return cancel_task_record(task_id)
+
+
+@app.post("/api/tasks/{task_id}/hydrate")
+def admin_task_hydrate(task_id: int, _=Depends(require_admin)):
+    return hydrate_task_record(task_id)
 
 
 @app.post("/api/tasks/{task_id}/mark")
@@ -2940,6 +3885,13 @@ tr:hover td{background:#fafafa}
 .endpoint-box{background:#f5f5f7;border-radius:10px;padding:12px 16px;margin-bottom:12px;font-family:monospace;font-size:13px}
 .endpoint-box .url{font-weight:600;color:#1d1d1f}
 .endpoint-box .desc{font-size:12px;color:#86868b;margin-top:2px}
+.task-preview-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+.task-preview-card{background:#f5f5f7;border-radius:12px;padding:12px}
+.task-preview-card h3{font-size:13px;font-weight:600;margin-bottom:8px}
+.task-preview-meta{font-size:12px;line-height:1.65;color:#3a3a3c;word-break:break-word}
+.task-preview-assets{display:flex;flex-direction:column;gap:8px}
+.task-preview-media{max-width:100%;border-radius:10px;border:1px solid #e5e5e5;background:#000}
+.task-actions{display:flex;flex-wrap:wrap;gap:6px}
 .hidden{display:none!important}
 @keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
 @keyframes slideDown{from{opacity:0;transform:translateY(-12px)}to{opacity:1;transform:translateY(0)}}
@@ -3045,9 +3997,13 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
   <button class="btn-secondary btn-sm" onclick="loadTasks()" style="margin-bottom:12px">刷新</button>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>类型</th><th>账号</th><th>状态</th><th>提示词</th><th>chatId</th><th>时间</th></tr></thead>
+      <thead><tr><th>ID</th><th>类型</th><th>账号</th><th>状态</th><th>提示词</th><th>chatId</th><th>时间</th><th>操作</th></tr></thead>
       <tbody id="tasks-tbody"></tbody>
     </table>
+  </div>
+  <div id="task-preview" class="section hidden" style="margin-top:16px">
+    <h2>🔎 任务详情</h2>
+    <div id="task-preview-body" class="task-preview-grid"></div>
   </div>
 </div>
 
@@ -3253,6 +4209,18 @@ function capabilityModels(kind){
 function capabilityScenes(){
   return (((state.capabilities || {}).video || {}).scenes || []);
 }
+function policyBadge(item){
+  const verification = item?.verification_status || 'unverified';
+  return `${verification}${item?.experimental ? ' · experimental' : ''}`;
+}
+function modelOptionLabel(model){
+  const title = model.description ? `${model.name} - ${model.description}` : model.name;
+  return `${title} · ${policyBadge(model)}`;
+}
+function sceneOptionLabel(scene){
+  const title = scene.name ? `${scene.name} - ${scene.scene_id}` : scene.scene_id;
+  return `${title} · ${policyBadge(scene)}`;
+}
 function defaultModel(kind){
   return kind === 'video' ? (state.settings.oreate?.default_video_model || '') : (state.settings.oreate?.default_image_model || '');
 }
@@ -3312,7 +4280,8 @@ async function loadCapabilities(){
     setCapabilityState(r);
     const imageCount=capabilityModels('image').length;
     const videoCount=capabilityModels('video').length;
-    if(status) status.textContent=`账号 ${r.source_account_id || '-'} · 图片模型 ${imageCount} · 视频模型 ${videoCount}`;
+    const sceneSummary=capabilityScenes().map(s => `${s.scene_id}:${policyBadge(s)}`).join(' | ');
+    if(status) status.textContent=`账号 ${r.source_account_id || '-'} · 图片模型 ${imageCount} · 视频模型 ${videoCount}${sceneSummary ? ` · 场景 ${sceneSummary}` : ''}`;
   } catch(e) {
     setCapabilityState({});
     if(status) status.textContent='未加载：' + e.message;
@@ -3348,7 +4317,7 @@ function applyGenerateOptions(){
   setVideoFieldsVisible(kind === 'video');
   setSelectOptions(
     'g-model',
-    models.map(m => ({value:m.name,label:m.description ? `${m.name} - ${m.description}` : m.name})),
+    models.map(m => ({value:m.name,label:modelOptionLabel(m)})),
     selected,
     models.length ? null : '使用默认模型'
   );
@@ -3371,7 +4340,7 @@ function applyModelOptions(){
     setSelectOptions('g-dur', valueOptions(model?.durations || [state.settings.oreate?.default_video_duration]), state.settings.oreate?.default_video_duration || '', model?.durations?.length ? null : '默认时长');
     setSelectOptions(
       'g-scene',
-      capabilityScenes().map(s => ({value:s.scene_id,label:s.name ? `${s.name} - ${s.scene_id}` : s.scene_id})),
+      capabilityScenes().map(s => ({value:s.scene_id,label:sceneOptionLabel(s)})),
       state.settings.oreate?.default_video_scene || '',
       capabilityScenes().length ? null : '默认场景'
     );
@@ -3401,9 +4370,95 @@ async function gatewayGenerate(){
 async function loadTasks(){const r=await api('GET','/api/tasks');state.tasks=r.items||[];renderTasks();updateStats();}
 function renderTasks(){
   document.getElementById('tasks-tbody').innerHTML = state.tasks.slice(0,50).map(t => {
-    const sc=t.status==='created'?'tag-blue':t.status==='completed'?'tag-green':'tag-gray';
-    return `<tr><td>${t.id}</td><td><span class="tag ${t.kind==='image'?'tag-blue':'tag-green'}">${t.kind}</span></td><td>${t.account_id||'-'}</td><td><span class="tag ${sc}">${t.status}</span></td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${(t.prompt||'').substring(0,40)}</td><td style="font-family:monospace;font-size:11px">${(t.chat_id||'').substring(0,12)}</td><td style="font-size:11px">${new Date((t.created_at||0)*1000).toLocaleString()}</td></tr>`;
+    const statusClass=t.status==='completed'?'tag-green':t.status==='failed'?'tag-red':t.status==='cancelled'?'tag-gray':t.status==='submitted'?'tag-blue':'tag-gray';
+    const kindClass=t.kind==='image'?'tag-blue':'tag-green';
+    return `<tr>
+      <td>${t.id}</td>
+      <td><span class="tag ${kindClass}">${t.kind}</span></td>
+      <td>${t.account_id||'-'}</td>
+      <td><span class="tag ${statusClass}">${t.status}${t.cancel_requested_at ? ' · cancel' : ''}</span></td>
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${escapeHtml((t.prompt||'').substring(0,40))}</td>
+      <td style="font-family:monospace;font-size:11px">${escapeHtml((t.chat_id||'').substring(0,12))}</td>
+      <td style="font-size:11px">${new Date((t.created_at||0)*1000).toLocaleString()}</td>
+      <td>
+        <div class="task-actions">
+          <button class="btn-sm btn-secondary" onclick="loadTaskDetail(${t.id})">详情</button>
+          <button class="btn-sm btn-secondary" onclick="hydrateTask(${t.id})">重水合</button>
+          <button class="btn-sm btn-secondary" onclick="retryTask(${t.id})">重试</button>
+          <button class="btn-sm btn-danger" onclick="cancelTask(${t.id})">取消</button>
+        </div>
+      </td>
+    </tr>`;
   }).join('');
+}
+function renderTaskAsset(asset){
+  const url = String(asset || '');
+  if(!url) return '';
+  if(/\.(mp4|mov|webm)(\?|$)/i.test(url)) {
+    return `<video class="task-preview-media" controls src="${escapeHtml(url)}"></video>`;
+  }
+  return `<img class="task-preview-media" src="${escapeHtml(url)}" alt="task result">`;
+}
+function renderTaskPreview(task){
+  const panel=document.getElementById('task-preview');
+  const body=document.getElementById('task-preview-body');
+  if(!panel || !body) return;
+  const assets=Array.isArray(task?.assets) ? task.assets : [];
+  const attempts=Array.isArray(task?.attempts) ? task.attempts : [];
+  const scene=capabilityScenes().find(s => s.scene_id === (task?.scene_id || task?.payload?.scene_id)) || null;
+  const model=capabilityModels(task?.kind || 'image').find(m => m.name === (task?.model_name || task?.payload?.model_name)) || null;
+  const assetHtml=assets.length ? assets.map(renderTaskAsset).join('') : '<div class="task-preview-meta">暂无结果</div>';
+  body.innerHTML = `
+    <div class="task-preview-card">
+      <h3>基础信息</h3>
+      <div class="task-preview-meta">
+        <div><strong>ID</strong> ${task?.id || '-'}</div>
+        <div><strong>状态</strong> ${escapeHtml(task?.status || '-')}</div>
+        <div><strong>模型</strong> ${escapeHtml(task?.model_name || '-')}</div>
+        <div><strong>场景</strong> ${escapeHtml(task?.scene_id || '-')}</div>
+        <div><strong>验证</strong> ${escapeHtml(scene?.verification_status || model?.verification_status || task?.verification_status || '-')}</div>
+        <div><strong>实验性</strong> ${(scene?.experimental ?? model?.experimental ?? task?.experimental) ? '是' : '否'}</div>
+        <div><strong>点数</strong> ${task?.estimated_point_cost ?? '-'}</div>
+        <div><strong>错误码</strong> ${escapeHtml(task?.error_code || '-')}</div>
+      </div>
+      <div style="margin-top:12px" class="task-actions">
+        <button class="btn-sm btn-secondary" onclick="retryTask(${task?.id || 0})">retryTask</button>
+        <button class="btn-sm btn-secondary" onclick="cancelTask(${task?.id || 0})">cancelTask</button>
+        <button class="btn-sm btn-secondary" onclick="hydrateTask(${task?.id || 0})">hydrateTask</button>
+      </div>
+    </div>
+    <div class="task-preview-card">
+      <h3>结果预览</h3>
+      <div class="task-preview-assets">${assetHtml}</div>
+      <div style="margin-top:8px;font-size:12px;color:#86868b">${assets.map(a => `<div><a href="${escapeHtml(String(a))}" target="_blank" rel="noreferrer">${escapeHtml(String(a))}</a></div>`).join('')}</div>
+    </div>
+    <div class="task-preview-card">
+      <h3>参数与尝试</h3>
+      <div class="task-preview-meta"><pre style="white-space:pre-wrap">${escapeHtml(JSON.stringify(task?.payload || {}, null, 2))}</pre></div>
+      <div class="task-preview-meta" style="margin-top:8px"><pre style="white-space:pre-wrap">${escapeHtml(JSON.stringify(attempts, null, 2))}</pre></div>
+    </div>
+  `;
+  panel.classList.remove('hidden');
+}
+async function loadTaskDetail(id){
+  const r=await api('GET',`/api/tasks/${id}`);
+  renderTaskPreview(r.task);
+  return r.task;
+}
+async function retryTask(id){
+  const r=await api('POST',`/api/tasks/${id}/retry`);
+  await loadTasks();
+  renderTaskPreview(r.task);
+}
+async function cancelTask(id){
+  const r=await api('POST',`/api/tasks/${id}/cancel`);
+  await loadTasks();
+  renderTaskPreview(r.task);
+}
+async function hydrateTask(id){
+  const r=await api('POST',`/api/tasks/${id}/hydrate`);
+  await loadTasks();
+  renderTaskPreview(r.task);
 }
 
 // === API Keys ===

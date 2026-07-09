@@ -12,6 +12,8 @@
 - 已新增模型参数白名单校验、API Key 限流/配额、`Idempotency-Key` 幂等和成本审计
 - 已新增 `/v1/uploads`，按网页 BOS 上传协议返回可用于视频首尾帧、参考素材和动作模仿的附件对象
 - 已新增 `/v1/tasks/{task_id}` 标准任务详情接口，旧 `/v1/task/{task_id}` 仍保留兼容
+- 已完成 Phase 0 风险收口：reference/frame_based/motion 默认关闭，API Key 删除改为软删除，TLS verify 改为配置化
+- 已完成 Phase 1 任务中心：`/v1/generate` 默认异步排队，支持任务详情、重试、取消和重新水合
 - 后台支持独立修改管理员账号密码，修改后强制重新登录
 - 已补充 SSE 事件解析、上游错误分类、账号健康分类和历史消息资源 URL 抽取
 - 自动注册（YYDS 邮箱）链路尚未完成

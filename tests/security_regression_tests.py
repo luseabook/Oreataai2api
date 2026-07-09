@@ -24,7 +24,10 @@ class SecurityRegressionTests(unittest.TestCase):
             "CFG",
             server.deep_merge(
                 server.CFG,
-                {"server": {"host": "127.0.0.1", "admin_username": "admin", "admin_password": "test-admin-password"}},
+                {
+                    "server": {"host": "127.0.0.1", "admin_username": "admin", "admin_password": "test-admin-password"},
+                    "gateway": {"enable_background_worker": False},
+                },
             ),
         )
         self.cfg_patch.start()
@@ -354,7 +357,14 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertEqual(authorized.json()["image"]["models"][0]["name"], "Google Nano Banana 2")
 
     def test_admin_generate_can_auto_select_account(self):
-        self.seed_account()
+        account_id = self.seed_account()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET model_info_json=?, video_info_json=? WHERE id=?",
+            (json.dumps(self.sample_image_info()), json.dumps(self.sample_video_info()), account_id),
+        )
+        conn.commit()
+        conn.close()
 
         class StubClient:
             def session_from_account(self, account):
@@ -379,6 +389,31 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ok"])
 
+    def test_delete_api_key_soft_deletes_without_dropping_usage_log(self):
+        account_id = self.seed_account()
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute("INSERT INTO api_keys(key,name,enabled,created_at) VALUES(?,?,1,?)", ("audit-key", "audit", now))
+        key_id = conn.execute("SELECT id FROM api_keys WHERE key='audit-key'").fetchone()[0]
+        conn.execute(
+            "INSERT INTO usage_log(api_key_id,kind,account_id,prompt,status,response_summary,created_at) VALUES(?,?,?,?,?,?,?)",
+            (key_id, "image", account_id, "hello", "queued", "queued", now),
+        )
+        conn.commit()
+        conn.close()
+
+        response = self.client.delete(f"/api/admin/apikeys/{key_id}", headers=self.admin_headers())
+        self.assertEqual(response.status_code, 200)
+
+        conn = server.db_conn()
+        key_row = conn.execute("SELECT enabled,deleted_at,disabled_reason FROM api_keys WHERE id=?", (key_id,)).fetchone()
+        usage_count = conn.execute("SELECT COUNT(*) AS c FROM usage_log WHERE api_key_id=?", (key_id,)).fetchone()["c"]
+        conn.close()
+        self.assertEqual(key_row["enabled"], 0)
+        self.assertIsNotNone(key_row["deleted_at"])
+        self.assertEqual(key_row["disabled_reason"], "deleted")
+        self.assertEqual(usage_count, 1)
+
     def test_admin_html_sends_bearer_token_for_api_calls(self):
         html = server.ADMIN_HTML
         self.assertIn("localStorage", html)
@@ -391,6 +426,12 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertIn("/api/models/capabilities", html)
         self.assertIn("changeCredentials", html)
         self.assertIn("loadCapabilities", html)
+        self.assertIn("verification_status", html)
+        self.assertIn("experimental", html)
+        self.assertIn("retryTask", html)
+        self.assertIn("cancelTask", html)
+        self.assertIn("hydrateTask", html)
+        self.assertIn("task-preview", html)
         self.assertNotIn("s-admin-pwd", html)
 
 

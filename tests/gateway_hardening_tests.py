@@ -24,7 +24,10 @@ class GatewayHardeningTests(unittest.TestCase):
             "CFG",
             server.deep_merge(
                 server.CFG,
-                {"server": {"host": "127.0.0.1", "admin_username": "admin", "admin_password": "test-admin-password"}},
+                {
+                    "server": {"host": "127.0.0.1", "admin_username": "admin", "admin_password": "test-admin-password"},
+                    "gateway": {"enable_background_worker": False},
+                },
             ),
         )
         self.cfg_patch.start()
@@ -160,14 +163,31 @@ class GatewayHardeningTests(unittest.TestCase):
         conn.close()
         return key_id
 
-    def valid_image_request(self):
-        return {
+    def valid_image_request(self, sync_wait_seconds=None):
+        request = {
             "kind": "image",
             "prompt": "hello",
             "model_name": "Google Nano Banana 2",
             "resolution": "4K",
             "ratio": "16:9",
         }
+        if sync_wait_seconds is not None:
+            request["sync_wait_seconds"] = sync_wait_seconds
+        return request
+
+    def valid_video_request(self, scene_id="text_or_image", sync_wait_seconds=None):
+        request = {
+            "kind": "video",
+            "prompt": "hello",
+            "model_name": "Seedance 2.0 Mini",
+            "resolution": "480",
+            "ratio": "16:9",
+            "duration": 5,
+            "scene_id": scene_id,
+        }
+        if sync_wait_seconds is not None:
+            request["sync_wait_seconds"] = sync_wait_seconds
+        return request
 
     def uploaded_image(self, name="first.png", object_path="uploads/first.png"):
         return {
@@ -199,6 +219,9 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         return {"Authorization": f"Bearer {response.json()['token']}"}
 
+    def process_task_queue(self, limit=1):
+        return server.process_task_queue(limit=limit)
+
     def test_v1_errors_use_stable_envelope(self):
         response = self.client.get("/v1/capabilities")
 
@@ -226,6 +249,8 @@ class GatewayHardeningTests(unittest.TestCase):
         conn = server.db_conn()
         api_key_cols = {r["name"] for r in conn.execute("PRAGMA table_info(api_keys)").fetchall()}
         account_cols = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+        task_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        attempt_cols = {r["name"] for r in conn.execute("PRAGMA table_info(task_attempts)").fetchall()}
         usage_cols = {r["name"] for r in conn.execute("PRAGMA table_info(usage_log)").fetchall()}
         idem = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='idempotency_keys'").fetchone()
         conn.close()
@@ -233,9 +258,20 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("rate_limit_per_minute", api_key_cols)
         self.assertIn("daily_request_limit", api_key_cols)
         self.assertIn("daily_point_limit", api_key_cols)
+        self.assertIn("deleted_at", api_key_cols)
         self.assertIn("last_used_at", account_cols)
         self.assertIn("failure_count", account_cols)
         self.assertIn("cooldown_until", account_cols)
+        self.assertIn("status", task_cols)
+        self.assertIn("request_id", task_cols)
+        self.assertIn("api_key_id", task_cols)
+        self.assertIn("attempt_count", task_cols)
+        self.assertIn("cancel_requested_at", task_cols)
+        self.assertIn("phase", attempt_cols)
+        self.assertIn("attempt_no", attempt_cols)
+        self.assertIn("request_payload_json", attempt_cols)
+        self.assertIn("stream_summary_json", attempt_cols)
+        self.assertIn("hydration_summary_json", attempt_cols)
         self.assertIn("request_id", usage_cols)
         self.assertIn("idempotency_key", usage_cols)
         self.assertIn("model_name", usage_cols)
@@ -243,6 +279,205 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("error_code", usage_cols)
         self.assertIn("status_code", usage_cols)
         self.assertIsNotNone(idem)
+
+    def test_capabilities_expose_scene_policy_metadata(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("caps-key")
+
+        response = self.client.get("/v1/capabilities", headers={"Authorization": "Bearer caps-key"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        scenes = {scene["scene_id"]: scene for scene in payload["video"]["scenes"]}
+        self.assertTrue(scenes["text_or_image"]["enabled"])
+        self.assertEqual(scenes["text_or_image"]["verification_status"], "live_verified")
+        self.assertFalse(scenes["reference"]["enabled"])
+        self.assertTrue(scenes["reference"]["experimental"])
+        self.assertEqual(scenes["reference"]["verification_status"], "unverified")
+        self.assertFalse(scenes["frame_based"]["enabled"])
+        self.assertTrue(scenes["motion"]["experimental"])
+
+    def test_generate_rejects_experimental_scene_before_upstream_call(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("scene-key")
+
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-exp"}) as create_chat,
+        ):
+            response = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer scene-key"},
+                json={
+                    "kind": "video",
+                    "prompt": "hello",
+                    "model_name": "Seedance 2.0 Mini",
+                    "resolution": "480",
+                    "ratio": "16:9",
+                    "duration": 5,
+                    "scene_id": "reference",
+                },
+            )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "EXPERIMENTAL_SCENE_DISABLED")
+        create_chat.assert_not_called()
+
+    def test_tls_verify_setting_applies_to_new_sessions(self):
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(original_cfg, {"oreate": {"verify_tls": False}})
+        try:
+            class FakeSession:
+                def __init__(self):
+                    self.verify = True
+                    self.cookies = {}
+                    self.called = False
+
+                def get(self, *args, **kwargs):
+                    self.called = True
+                    return type("Resp", (), {"raise_for_status": lambda self: None})()
+
+            fake = FakeSession()
+            with patch.object(server.requests, "Session", return_value=fake):
+                client = server.OreateClient()
+                session = client.new_session()
+        finally:
+            server.CFG = original_cfg
+
+        self.assertIs(session, fake)
+        self.assertTrue(fake.called)
+        self.assertFalse(fake.verify)
+
+    def test_auto_register_accounts_uses_configured_tls_verify_flag_for_confirmation_link(self):
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(original_cfg, {"oreate": {"verify_tls": True}})
+        try:
+            with (
+                patch.object(server.MAIL, "create_mailbox", return_value={"address": "user@example.com", "token": "mail-token", "domain": "example.com", "mailbox_id": "mb-1"}),
+                patch.object(
+                    server.CLIENT,
+                    "signup_attempt",
+                    return_value={
+                        "status_code": 200,
+                        "response": {"status": {"code": 0}, "data": {"sendEmailCount": 1, "confirmEmailStatus": 1, "registerStatus": 1}},
+                        "ticket": {"ticketID": "ticket-1"},
+                        "cookies": {},
+                    },
+                ),
+                patch.object(server.MAIL, "wait_verification_artifact", return_value={"link": "https://www.oreateai.com/passport/confirm?tokenID=abc123", "code": ""}),
+                patch.object(server.requests, "get") as visit_link,
+                patch.object(server.CLIENT, "confirm_email_register", return_value={"status_code": 200, "response": {"status": {"code": 0}}}),
+                patch.object(server.CLIENT, "login", return_value=server.OreateSession(email="user@example.com", password="pass", cookies={"OUID": "ouid", "ouss": "ouss"})),
+                patch.object(server.CLIENT, "session_from_cookie_dict", return_value=object()),
+                patch.object(server.CLIENT, "fetch_image_models", return_value={}),
+                patch.object(server.CLIENT, "fetch_video_models", return_value=[]),
+                patch.object(server.CLIENT, "fetch_video_scenes", return_value=[]),
+                patch.object(server, "save_account", return_value=1),
+            ):
+                result = server.auto_register_accounts(1)
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(result[0]["status"], "verified")
+        self.assertTrue(visit_link.called)
+        self.assertTrue(visit_link.call_args.kwargs["verify"])
+
+    def test_generate_enqueues_task_and_worker_completes_it(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("async-key")
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-async", "focusId": "focus-async"}),
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None, "status": "streamed"}),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": ["https://cdn.oreateai.com/static/result/x.jpg"], "status": "completed"}),
+        ):
+            response = self.client.post("/v1/generate", headers={"Authorization": "Bearer async-key"}, json=self.valid_image_request())
+
+            self.assertEqual(response.status_code, 202)
+            payload = response.json()
+            self.assertEqual(payload["status"], "queued")
+            self.assertIn("task_id", payload)
+
+            processed = self.process_task_queue(limit=1)
+            self.assertEqual(processed, 1)
+
+            detail = self.client.get(f"/v1/tasks/{payload['task_id']}", headers={"Authorization": "Bearer async-key"})
+            self.assertEqual(detail.status_code, 200)
+            task = detail.json()["task"]
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["assets"], ["https://cdn.oreateai.com/static/result/x.jpg"])
+            self.assertEqual(task["attempt_count"], 1)
+
+    def test_task_retry_cancel_and_hydrate_actions_work(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("task-action-key")
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "create_chat_session", side_effect=RuntimeError("upstream down")),
+        ):
+            created = self.client.post("/v1/generate", headers={"Authorization": "Bearer task-action-key"}, json=self.valid_image_request())
+
+            self.assertEqual(created.status_code, 202)
+            task_id = created.json()["task_id"]
+            self.process_task_queue(limit=1)
+
+            detail = self.client.get(f"/v1/tasks/{task_id}", headers={"Authorization": "Bearer task-action-key"})
+            self.assertEqual(detail.status_code, 200)
+            self.assertEqual(detail.json()["task"]["status"], "failed")
+
+            retry = self.client.post(f"/v1/tasks/{task_id}/retry", headers={"Authorization": "Bearer task-action-key"})
+            self.assertEqual(retry.status_code, 200)
+            self.assertEqual(retry.json()["task"]["status"], "queued")
+
+            cancel = self.client.post(f"/v1/tasks/{task_id}/cancel", headers={"Authorization": "Bearer task-action-key"})
+            self.assertEqual(cancel.status_code, 200)
+            self.assertEqual(cancel.json()["task"]["status"], "cancelled")
+
+    def test_task_hydrate_reprocesses_submitted_task(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("hydrate-key")
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-hydrate", "focusId": "focus-hydrate"}),
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "ping"}], "error": None, "status": "submitted"}),
+            patch.object(server.CLIENT, "hydrate_generation_result_until_assets", side_effect=[
+                {"raw": {}, "assets": [], "status": "submitted", "attempts": 1},
+                {"raw": {"status": {"code": 0}, "data": {"messageList": [{"content": '<video src="https://cdn.oreateai.com/aivideo/videodownload/1899992928.mp4">'}]}}, "assets": ["https://cdn.oreateai.com/aivideo/videodownload/1899992928.mp4"], "status": "completed", "attempts": 2},
+            ]),
+        ):
+            created = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer hydrate-key"},
+                json={
+                    "kind": "video",
+                    "prompt": "hello",
+                    "model_name": "Seedance 2.0 Mini",
+                    "resolution": "480",
+                    "ratio": "16:9",
+                    "duration": 5,
+                    "scene_id": "text_or_image",
+                },
+            )
+
+            self.assertEqual(created.status_code, 202)
+            task_id = created.json()["task_id"]
+            self.process_task_queue(limit=1)
+
+            detail = self.client.get(f"/v1/tasks/{task_id}", headers={"Authorization": "Bearer hydrate-key"})
+            self.assertEqual(detail.status_code, 200)
+            self.assertEqual(detail.json()["task"]["status"], "submitted")
+
+            hydrate = self.client.post(f"/v1/tasks/{task_id}/hydrate", headers={"Authorization": "Bearer hydrate-key"})
+            self.assertEqual(hydrate.status_code, 200)
+            self.assertEqual(hydrate.json()["task"]["status"], "hydrating")
+
+            self.process_task_queue(limit=1)
+
+            refreshed = self.client.get(f"/v1/tasks/{task_id}", headers={"Authorization": "Bearer hydrate-key"})
+            self.assertEqual(refreshed.status_code, 200)
+            task = refreshed.json()["task"]
+            self.assertEqual(task["status"], "completed")
+            self.assertEqual(task["assets"], ["https://cdn.oreateai.com/aivideo/videodownload/1899992928.mp4"])
 
     def test_generate_rejects_invalid_video_options_before_upstream_call(self):
         self.seed_account_with_capabilities()
@@ -674,31 +909,39 @@ class GatewayHardeningTests(unittest.TestCase):
         self.seed_api_key("reference-key")
         image = self.uploaded_image("ref.png", "uploads/ref.png")
         video = self.uploaded_video("ref.mp4", "uploads/ref.mp4", duration=4)
-
-        with (
-            patch.object(server.CLIENT, "session_from_account", return_value=object()),
-            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-ref", "focusId": "focus-ref"}),
-            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}) as stream_generation,
-            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": []}),
-        ):
-            response = self.client.post(
-                "/v1/generate",
-                headers={"Authorization": "Bearer reference-key"},
-                json={
-                    "kind": "video",
-                    "prompt": "hello",
-                    "model_name": "Seedance 2.0 Mini",
-                    "resolution": "480",
-                    "ratio": "16:9",
-                    "duration": 5,
-                    "scene_id": "reference",
-                    "reference_images": [image],
-                    "reference_videos": [video],
-                    "ref_duration": "2-5",
-                    "ref_total_duration": 4,
-                    "keep_original_sound": True,
-                },
-            )
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {"gateway": {"scene_policies": {"reference": {"enabled": True, "experimental": True, "verification_status": "unit_tested"}}}},
+        )
+        try:
+            with (
+                patch.object(server.CLIENT, "session_from_account", return_value=object()),
+                patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-ref", "focusId": "focus-ref"}),
+                patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}) as stream_generation,
+                patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": ["https://cdn.oreateai.com/static/result/ref.mp4"]}),
+            ):
+                response = self.client.post(
+                    "/v1/generate",
+                    headers={"Authorization": "Bearer reference-key"},
+                    json={
+                        "kind": "video",
+                        "prompt": "hello",
+                        "model_name": "Seedance 2.0 Mini",
+                        "resolution": "480",
+                        "ratio": "16:9",
+                        "duration": 5,
+                        "scene_id": "reference",
+                        "reference_images": [image],
+                        "reference_videos": [video],
+                        "ref_duration": "2-5",
+                        "ref_total_duration": 4,
+                        "keep_original_sound": True,
+                        "sync_wait_seconds": 1,
+                    },
+                )
+        finally:
+            server.CFG = original_cfg
 
         self.assertEqual(response.status_code, 200)
         kwargs = stream_generation.call_args.kwargs
@@ -1058,7 +1301,7 @@ class GatewayHardeningTests(unittest.TestCase):
             response = self.client.post(
                 "/v1/generate",
                 headers={"Authorization": "Bearer web-flow-key"},
-                json=self.valid_image_request(),
+                json=self.valid_image_request(sync_wait_seconds=1),
             )
 
         self.assertEqual(response.status_code, 200)
@@ -1105,15 +1348,7 @@ class GatewayHardeningTests(unittest.TestCase):
             response = self.client.post(
                 "/v1/generate",
                 headers={"Authorization": "Bearer video-poll-key"},
-                json={
-                    "kind": "video",
-                    "prompt": "hello",
-                    "model_name": "Seedance 2.0 Mini",
-                    "resolution": "480",
-                    "ratio": "16:9",
-                    "duration": 5,
-                    "scene_id": "text_or_image",
-                },
+                json=self.valid_video_request(sync_wait_seconds=1),
             )
 
         self.assertEqual(response.status_code, 200)
@@ -1155,7 +1390,7 @@ class GatewayHardeningTests(unittest.TestCase):
                 json=self.valid_image_request(),
             )
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 202)
         self.assertIn("estimated_point_cost", response.json())
         self.assertEqual(response.json()["estimated_point_cost"], 12)
         conn = server.db_conn()
@@ -1168,11 +1403,12 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(row["resolution"], "4K")
         self.assertEqual(row["ratio"], "16:9")
         self.assertEqual(row["estimated_point_cost"], 12)
-        self.assertEqual(row["status_code"], 200)
+        self.assertEqual(row["status_code"], 202)
 
     def test_idempotency_key_replays_same_response_without_second_task(self):
         self.seed_account_with_capabilities()
         self.seed_api_key("idem-key")
+        request = self.valid_image_request(sync_wait_seconds=1)
 
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
@@ -1183,16 +1419,16 @@ class GatewayHardeningTests(unittest.TestCase):
             first = self.client.post(
                 "/v1/generate",
                 headers={"Authorization": "Bearer idem-key", "Idempotency-Key": "same-1"},
-                json=self.valid_image_request(),
+                json=request,
             )
             second = self.client.post(
                 "/v1/generate",
                 headers={"Authorization": "Bearer idem-key", "Idempotency-Key": "same-1"},
-                json=self.valid_image_request(),
+                json=request,
             )
 
-        self.assertEqual(first.status_code, 200)
-        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 202)
         self.assertTrue(second.json()["idempotent_replay"])
         self.assertEqual(first.json()["task_id"], second.json()["task_id"])
         self.assertEqual(create_chat.call_count, 1)
@@ -1200,7 +1436,7 @@ class GatewayHardeningTests(unittest.TestCase):
     def test_idempotency_key_conflict_rejects_different_body(self):
         self.seed_account_with_capabilities()
         self.seed_api_key("idem-conflict-key")
-        changed = self.valid_image_request()
+        changed = self.valid_image_request(sync_wait_seconds=1)
         changed["ratio"] = "1:1"
 
         with (
@@ -1212,7 +1448,7 @@ class GatewayHardeningTests(unittest.TestCase):
             first = self.client.post(
                 "/v1/generate",
                 headers={"Authorization": "Bearer idem-conflict-key", "Idempotency-Key": "same-2"},
-                json=self.valid_image_request(),
+                json=self.valid_image_request(sync_wait_seconds=1),
             )
             conflict = self.client.post(
                 "/v1/generate",
@@ -1220,7 +1456,7 @@ class GatewayHardeningTests(unittest.TestCase):
                 json=changed,
             )
 
-        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.status_code, 202)
         self.assertEqual(conflict.status_code, 409)
         self.assertEqual(conflict.json()["error"]["code"], "IDEMPOTENCY_KEY_CONFLICT")
 
@@ -1237,7 +1473,7 @@ class GatewayHardeningTests(unittest.TestCase):
             first = self.client.post("/v1/generate", headers={"Authorization": "Bearer rate-key"}, json=self.valid_image_request())
             second = self.client.post("/v1/generate", headers={"Authorization": "Bearer rate-key"}, json=self.valid_image_request())
 
-        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.status_code, 202)
         self.assertEqual(second.status_code, 429)
         self.assertEqual(second.json()["error"]["code"], "RATE_LIMITED")
 
@@ -1254,7 +1490,7 @@ class GatewayHardeningTests(unittest.TestCase):
             first = self.client.post("/v1/generate", headers={"Authorization": "Bearer daily-key"}, json=self.valid_image_request())
             second = self.client.post("/v1/generate", headers={"Authorization": "Bearer daily-key"}, json=self.valid_image_request())
 
-        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.status_code, 202)
         self.assertEqual(second.status_code, 429)
         self.assertEqual(second.json()["error"]["code"], "DAILY_REQUEST_LIMIT_EXCEEDED")
 
@@ -1285,9 +1521,9 @@ class GatewayHardeningTests(unittest.TestCase):
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
             patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-ready"}),
             patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}),
-            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": []}),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": ["https://cdn.oreateai.com/static/result/ready.jpg"]}),
         ):
-            response = self.client.post("/v1/generate", headers={"Authorization": "Bearer cooldown-key"}, json=self.valid_image_request())
+            response = self.client.post("/v1/generate", headers={"Authorization": "Bearer cooldown-key"}, json=self.valid_image_request(sync_wait_seconds=1))
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["account_id"], ready_id)
@@ -1301,7 +1537,7 @@ class GatewayHardeningTests(unittest.TestCase):
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
             patch.object(server.CLIENT, "create_chat_session", side_effect=RuntimeError("upstream down")),
         ):
-            response = client.post("/v1/generate", headers={"Authorization": "Bearer fail-key"}, json=self.valid_image_request())
+            response = client.post("/v1/generate", headers={"Authorization": "Bearer fail-key"}, json=self.valid_image_request(sync_wait_seconds=1))
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["error"]["code"], "UPSTREAM_ERROR")
@@ -1391,9 +1627,9 @@ class GatewayHardeningTests(unittest.TestCase):
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
             patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-success"}),
             patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}),
-            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": []}),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": ["https://cdn.oreateai.com/static/result/success.jpg"]}),
         ):
-            response = self.client.post("/v1/generate", headers={"Authorization": "Bearer success-key"}, json=self.valid_image_request())
+            response = self.client.post("/v1/generate", headers={"Authorization": "Bearer success-key"}, json=self.valid_image_request(sync_wait_seconds=1))
 
         self.assertEqual(response.status_code, 200)
         conn = server.db_conn()
@@ -1416,7 +1652,7 @@ class GatewayHardeningTests(unittest.TestCase):
         ):
             created = self.client.post("/v1/generate", headers={"Authorization": "Bearer detail-key"}, json=self.valid_image_request())
 
-        self.assertEqual(created.status_code, 200)
+        self.assertEqual(created.status_code, 202)
         task_id = created.json()["task_id"]
         detail = self.client.get(f"/v1/tasks/{task_id}", headers={"Authorization": "Bearer detail-key"})
 
