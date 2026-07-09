@@ -313,6 +313,122 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(fake.last_json["js_env"], "h5")
         self.assertEqual(result["events"][-1]["event"], "end")
 
+    def test_stream_generation_uses_web_video_headers(self):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def iter_lines(self, decode_unicode=True):
+                return iter(['data: {"event":"end","data":{}}'])
+
+            def close(self):
+                return None
+
+        class FakeSession:
+            def __init__(self):
+                self.cookies = {"OUID": "ouid-secret", "__bid_n": "bid-secret"}
+                self.last_headers = {}
+                self.last_json = {}
+
+            def post(self, url, **kwargs):
+                self.last_headers = kwargs["headers"]
+                self.last_json = kwargs["json"]
+                return FakeResponse()
+
+        fake = FakeSession()
+        client = server.OreateClient()
+        client.stream_generation(
+            fake,
+            chat_id="chat-video",
+            focus_id="focus-video",
+            chat_type="aiVideo",
+            prompt="hello",
+            video_config={"modelName": "Seedance 1.5 Pro", "scene": "text_or_image"},
+            jt="test-jt",
+        )
+
+        self.assertEqual(fake.last_headers["accept"], "text/event-stream")
+        self.assertEqual(fake.last_headers["content-type"], "application/json")
+        self.assertEqual(fake.last_headers["Client-Type"], "pc")
+        self.assertTrue(fake.last_headers["referer"].endswith("/home/vertical/aiVideo/zh"))
+        self.assertEqual(fake.last_json["chatType"], "aiVideo")
+        self.assertIn("videoConfig", fake.last_json)
+
+    def test_video_stream_read_timeout_after_ping_is_submitted(self):
+        class FakeResponse:
+            def __init__(self):
+                self.closed = False
+
+            def raise_for_status(self):
+                return None
+
+            def iter_lines(self, decode_unicode=True):
+                yield 'data: {"event":"start","data":{}}'
+                yield 'data: {"event":"ping","data":{}}'
+                raise server.requests.exceptions.ReadTimeout("read timed out")
+
+            def close(self):
+                self.closed = True
+
+        class FakeSession:
+            def __init__(self):
+                self.cookies = {"OUID": "ouid-secret", "__bid_n": "bid-secret"}
+                self.response = FakeResponse()
+
+            def post(self, url, **kwargs):
+                return self.response
+
+        fake = FakeSession()
+        client = server.OreateClient()
+        result = client.stream_generation(
+            fake,
+            chat_id="chat-video",
+            focus_id="focus-video",
+            chat_type="aiVideo",
+            prompt="hello",
+            video_config={"modelName": "Seedance 1.5 Pro", "scene": "text_or_image"},
+            jt="test-jt",
+        )
+
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["status"], "submitted")
+        self.assertEqual(result["completion_reason"], "read_timeout")
+        self.assertEqual([event["event"] for event in result["events"]], ["start", "ping"])
+        self.assertTrue(fake.response.closed)
+
+    def test_video_stream_empty_eof_is_not_treated_as_submitted(self):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def iter_lines(self, decode_unicode=True):
+                return iter([])
+
+            def close(self):
+                return None
+
+        class FakeSession:
+            def __init__(self):
+                self.cookies = {"OUID": "ouid-secret", "__bid_n": "bid-secret"}
+
+            def post(self, url, **kwargs):
+                return FakeResponse()
+
+        client = server.OreateClient()
+        result = client.stream_generation(
+            FakeSession(),
+            chat_id="chat-video",
+            focus_id="focus-video",
+            chat_type="aiVideo",
+            prompt="hello",
+            video_config={"modelName": "Seedance 1.5 Pro", "scene": "text_or_image"},
+            jt="test-jt",
+        )
+
+        self.assertEqual(result["events"], [])
+        self.assertEqual(result["completion_reason"], "eof")
+        self.assertEqual(result["status"], "streamed")
+
     def test_stream_generation_carries_banti_bid_cookie_from_helper(self):
         class FakeResponse:
             def raise_for_status(self):
@@ -838,6 +954,55 @@ class GatewayHardeningTests(unittest.TestCase):
 
         self.assertEqual(assets, ["https://cdn.oreateai.com/aiimage/nano/chat-id/result-token"])
 
+    def test_video_hydration_polling_extracts_video_html_src(self):
+        class FakeResponse:
+            def __init__(self, body):
+                self.body = body
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.body
+
+        class FakeSession:
+            def __init__(self):
+                self.calls = []
+                self.responses = [
+                    {
+                        "status": {"code": 0},
+                        "data": {"messageList": [{"role": "assistant", "content": "generating video", "status": 1}]},
+                    },
+                    {
+                        "status": {"code": 0},
+                        "data": {
+                            "messageList": [
+                                {
+                                    "role": "assistant",
+                                    "content": '<video controls src="https://cdn.oreateai.com/aivideo/videodownload/1899992928.mp4"></video>',
+                                }
+                            ]
+                        },
+                    },
+                ]
+
+            def get(self, url, **kwargs):
+                self.calls.append({"url": url, "kwargs": kwargs})
+                return FakeResponse(self.responses.pop(0))
+
+        client = server.OreateClient()
+        with patch.object(server.time, "sleep", return_value=None):
+            result = client.hydrate_generation_result_until_assets(
+                FakeSession(),
+                "chat-video",
+                timeout_sec=5,
+                poll_interval_sec=1,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(result["assets"], ["https://cdn.oreateai.com/aivideo/videodownload/1899992928.mp4"])
+
     def test_v1_generate_uses_web_generation_flow(self):
         self.seed_account_with_capabilities()
         self.seed_api_key("web-flow-key")
@@ -871,6 +1036,58 @@ class GatewayHardeningTests(unittest.TestCase):
         create_session.assert_called_once()
         stream_generation.assert_called_once()
         hydrate.assert_called_once()
+
+    def test_v1_generate_video_polls_history_after_ping_only_stream(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("video-poll-key")
+
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-video", "focusId": "focus-video"}),
+            patch.object(
+                server.CLIENT,
+                "stream_generation",
+                return_value={
+                    "events": [{"event": "start"}, {"event": "ping"}],
+                    "error": None,
+                    "status": "submitted",
+                    "completion_reason": "read_timeout",
+                },
+            ),
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": []}) as hydrate_once,
+            patch.object(
+                server.CLIENT,
+                "hydrate_generation_result_until_assets",
+                create=True,
+                return_value={
+                    "raw": {
+                        "status": {"code": 0},
+                        "data": {"messageList": [{"content": '<video src="https://cdn.oreateai.com/aivideo/videodownload/1899992928.mp4">'}]},
+                    },
+                    "assets": ["https://cdn.oreateai.com/aivideo/videodownload/1899992928.mp4"],
+                    "status": "completed",
+                    "attempts": 2,
+                },
+            ) as hydrate_until,
+        ):
+            response = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer video-poll-key"},
+                json={
+                    "kind": "video",
+                    "prompt": "hello",
+                    "model_name": "Seedance 2.0 Mini",
+                    "resolution": "480",
+                    "ratio": "16:9",
+                    "duration": 5,
+                    "scene_id": "text_or_image",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["assets"], ["https://cdn.oreateai.com/aivideo/videodownload/1899992928.mp4"])
+        hydrate_once.assert_not_called()
+        hydrate_until.assert_called_once()
 
     def test_session_from_account_replaces_anonymous_cookie_names(self):
         account_id = self.seed_account_with_capabilities()

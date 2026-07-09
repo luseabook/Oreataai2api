@@ -50,6 +50,10 @@ DEFAULT_CONFIG = {
         "default_video_duration": 5,
         "default_video_resolution": "480",
         "default_video_ratio": "16:9",
+        "video_stream_wait_seconds": 60,
+        "video_stream_read_timeout_seconds": 20,
+        "video_hydration_timeout_seconds": 600,
+        "video_hydration_poll_interval_seconds": 10,
     },
     "mail": {
         "provider": "yyds",
@@ -654,26 +658,31 @@ def extract_user_mirror_metadata(body: Any, fallback_email: str = "") -> Dict[st
     }
 
 
+def parse_sse_line(raw: Any) -> Optional[Dict[str, Any]]:
+    if raw is None:
+        return None
+    line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    line = line.strip()
+    if not line or not line.startswith("data:"):
+        return None
+    data = line[5:].strip()
+    if not data or data == "[DONE]":
+        return None
+    try:
+        parsed = json.loads(data)
+    except json.JSONDecodeError:
+        parsed = {"event": "message", "data": data}
+    if isinstance(parsed, dict):
+        return parsed
+    return {"event": "message", "data": parsed}
+
+
 def parse_sse_lines(lines: Iterable[Any]) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     for raw in lines:
-        if raw is None:
-            continue
-        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
-        line = line.strip()
-        if not line or not line.startswith("data:"):
-            continue
-        data = line[5:].strip()
-        if not data or data == "[DONE]":
-            continue
-        try:
-            parsed = json.loads(data)
-        except json.JSONDecodeError:
-            parsed = {"event": "message", "data": data}
-        if isinstance(parsed, dict):
-            events.append(parsed)
-        else:
-            events.append({"event": "message", "data": parsed})
+        event = parse_sse_line(raw)
+        if event is not None:
+            events.append(event)
     return events
 
 
@@ -685,6 +694,48 @@ def classify_sse_error(events: List[Dict[str, Any]]) -> Optional[Dict[str, str]]
             message = data.get("msg") or data.get("message") or event.get("msg") or event.get("message") or "upstream error"
             return {"code": str(code or "UPSTREAM_ERROR"), "message": str(message)}
     return None
+
+
+def classify_history_error(body: Any, ignored_codes: Optional[List[str]] = None) -> Optional[Dict[str, str]]:
+    ignored = set(ignored_codes or [])
+    if isinstance(body, dict):
+        status = body.get("status") if isinstance(body.get("status"), dict) else {}
+        code = status.get("code")
+        if code not in (None, "", 0, "0") and str(code) not in ignored:
+            message = status.get("msg") or status.get("message") or body.get("message") or "history hydration failed"
+            return {"code": str(code), "message": str(message)}
+
+    def walk(value: Any) -> Optional[Dict[str, str]]:
+        if isinstance(value, list):
+            for item in value:
+                error = walk(item)
+                if error:
+                    return error
+            return None
+        if not isinstance(value, dict):
+            return None
+        explicit_error = value.get("error") or value.get("err")
+        if isinstance(explicit_error, dict):
+            code = explicit_error.get("code") or explicit_error.get("errCode") or explicit_error.get("errorCode")
+            message = explicit_error.get("msg") or explicit_error.get("message") or explicit_error.get("errorMessage")
+            if code not in (None, "", 0, "0") and str(code) not in ignored:
+                return {"code": str(code), "message": str(message or "history hydration failed")}
+        for code_key in ("errorCode", "errCode"):
+            code = value.get(code_key)
+            if code not in (None, "", 0, "0") and str(code) not in ignored:
+                message = value.get("errorMessage") or value.get("errMsg") or value.get("msg") or value.get("message")
+                return {"code": str(code), "message": str(message or "history hydration failed")}
+        for message_key in ("failReason", "errorMessage", "errMsg"):
+            message = value.get(message_key)
+            if isinstance(message, str) and message.strip():
+                return {"code": "UPSTREAM_ERROR", "message": message.strip()}
+        for item in value.values():
+            error = walk(item)
+            if error:
+                return error
+        return None
+
+    return walk(body)
 
 
 MEDIA_URL_RE = re.compile(
@@ -1278,6 +1329,35 @@ class OreateClient:
             "cache-control": "no-cache, no-store",
         }
 
+    def _headers_for(
+        self,
+        chat_type: str = "",
+        accept: Optional[str] = None,
+        content_type: Optional[str] = None,
+    ) -> Dict[str, str]:
+        headers = dict(self.headers)
+        if chat_type == "aiVideo":
+            headers["referer"] = f"{self.base}/home/vertical/aiVideo/zh"
+        elif chat_type == "aiImage":
+            headers["referer"] = f"{self.base}/home/vertical/aiImage"
+        if accept:
+            headers["accept"] = accept
+        if content_type:
+            headers["content-type"] = content_type
+        headers.pop("client-type", None)
+        headers["Client-Type"] = "pc"
+        return headers
+
+    def _stream_timeout(self, is_video: bool) -> Any:
+        if not is_video:
+            return self.timeout
+        try:
+            base_timeout = float(self.timeout)
+        except (TypeError, ValueError):
+            base_timeout = 30.0
+        read_timeout = float(CFG["oreate"].get("video_stream_read_timeout_seconds") or min(base_timeout, 20.0))
+        return (self.timeout, read_timeout)
+
     def new_session(self) -> requests.Session:
         s = requests.Session()
         s.verify = False
@@ -1433,17 +1513,17 @@ class OreateClient:
         return s
 
     def fetch_image_models(self, s: requests.Session) -> Dict[str, Any]:
-        r = s.get(self.base + "/oreate/img/getmodelconfig", headers=self.headers, timeout=self.timeout)
+        r = s.get(self.base + "/oreate/img/getmodelconfig", headers=self._headers_for("aiImage"), timeout=self.timeout)
         r.raise_for_status()
         return r.json()
 
     def fetch_video_models(self, s: requests.Session) -> Dict[str, Any]:
-        r = s.get(self.base + "/oreate/aivideo/getmodelconfigv3", headers=self.headers, timeout=self.timeout)
+        r = s.get(self.base + "/oreate/aivideo/getmodelconfigv3", headers=self._headers_for("aiVideo"), timeout=self.timeout)
         r.raise_for_status()
         return r.json()
 
     def fetch_video_scenes(self, s: requests.Session) -> Dict[str, Any]:
-        r = s.get(self.base + "/oreate/aivideo/getsceneconfig", headers=self.headers, timeout=self.timeout)
+        r = s.get(self.base + "/oreate/aivideo/getsceneconfig", headers=self._headers_for("aiVideo"), timeout=self.timeout)
         r.raise_for_status()
         return r.json()
 
@@ -1591,7 +1671,7 @@ class OreateClient:
     def create_chat_session(self, s: requests.Session, chat_type: str) -> Dict[str, Any]:
         r = s.post(
             self.base + "/oreate/create/chat",
-            headers={**self.headers, "content-type": "application/json"},
+            headers=self._headers_for(chat_type, content_type="application/json"),
             json={"type": chat_type, "docId": ""},
             timeout=self.timeout,
         )
@@ -1654,27 +1734,110 @@ class OreateClient:
             body["imageConfig"] = image_config
         if video_config is not None:
             body["videoConfig"] = video_config
-        r = s.post(
-            self.base + "/oreate/sse/stream",
-            headers={**self.headers, "content-type": "application/json"},
-            json=body,
-            timeout=self.timeout,
-            stream=True,
-        )
-        r.raise_for_status()
-        events = parse_sse_lines(r.iter_lines(decode_unicode=True))
-        return {"events": events, "error": classify_sse_error(events)}
+        is_video = chat_type == "aiVideo" or video_config is not None
+        events: List[Dict[str, Any]] = []
+        completion_reason = "eof"
+        response = None
+        stream_wait = float(CFG["oreate"].get("video_stream_wait_seconds") or 60)
+        deadline = time.monotonic() + max(0.0, stream_wait) if is_video else None
+        try:
+            response = s.post(
+                self.base + "/oreate/sse/stream",
+                headers=self._headers_for(chat_type, accept="text/event-stream", content_type="application/json"),
+                json=body,
+                timeout=self._stream_timeout(is_video),
+                stream=True,
+            )
+            response.raise_for_status()
+            for raw in response.iter_lines(decode_unicode=True):
+                event = parse_sse_line(raw)
+                if event is None:
+                    continue
+                events.append(event)
+                if event.get("event") == "end":
+                    completion_reason = "end"
+                    break
+                if classify_sse_error([event]):
+                    completion_reason = "error"
+                    break
+                if is_video and deadline is not None and time.monotonic() >= deadline:
+                    completion_reason = "video_stream_wait_elapsed"
+                    break
+        except (requests.exceptions.ReadTimeout, requests.exceptions.Timeout):
+            if not (is_video and events and not classify_sse_error(events)):
+                raise
+            completion_reason = "read_timeout"
+        except requests.exceptions.ConnectionError as exc:
+            if not (is_video and events and "read timed out" in str(exc).lower() and not classify_sse_error(events)):
+                raise
+            completion_reason = "read_timeout"
+        finally:
+            if response is not None and hasattr(response, "close"):
+                response.close()
+        error = classify_sse_error(events)
+        if error:
+            status = "failed"
+        elif is_video and events and completion_reason in ("read_timeout", "video_stream_wait_elapsed", "eof"):
+            status = "submitted"
+        else:
+            status = "streamed"
+        return {
+            "events": events,
+            "error": error,
+            "status": status,
+            "completion_reason": completion_reason,
+        }
 
-    def hydrate_generation_result(self, s: requests.Session, chat_id: str) -> Dict[str, Any]:
+    def hydrate_generation_result(self, s: requests.Session, chat_id: str, chat_type: str = "") -> Dict[str, Any]:
         r = s.get(
             self.base + "/oreate/memory/getmessagelist",
-            headers=self.headers,
+            headers=self._headers_for(chat_type),
             params={"pn": 1, "rn": 30, "chatID": chat_id},
             timeout=self.timeout,
         )
         r.raise_for_status()
         body = r.json()
         return {"raw": body, "assets": extract_generation_assets(body)}
+
+    def hydrate_generation_result_until_assets(
+        self,
+        s: requests.Session,
+        chat_id: str,
+        timeout_sec: Optional[float] = None,
+        poll_interval_sec: Optional[float] = None,
+        chat_type: str = "aiVideo",
+    ) -> Dict[str, Any]:
+        timeout = float(
+            CFG["oreate"].get("video_hydration_timeout_seconds") or 600
+            if timeout_sec is None
+            else timeout_sec
+        )
+        interval = float(
+            CFG["oreate"].get("video_hydration_poll_interval_seconds") or 10
+            if poll_interval_sec is None
+            else poll_interval_sec
+        )
+        deadline = time.monotonic() + max(0.0, timeout)
+        attempts = 0
+        last_result: Dict[str, Any] = {"raw": {}, "assets": []}
+        while True:
+            attempts += 1
+            last_result = self.hydrate_generation_result(s, chat_id, chat_type=chat_type)
+            assets = last_result.get("assets") or []
+            last_result["attempts"] = attempts
+            if assets:
+                last_result["status"] = "completed"
+                return last_result
+            history_error = classify_history_error(last_result.get("raw"), ignored_codes=["110012"])
+            if history_error:
+                last_result["status"] = "failed"
+                last_result["error"] = history_error
+                return last_result
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_result["status"] = "submitted"
+                return last_result
+            time.sleep(min(max(interval, 0.0), remaining))
 
     def create_chat(self, s: requests.Session, payload: Dict[str, Any]) -> Dict[str, Any]:
         r = s.post(
@@ -1897,7 +2060,14 @@ def submit_generation_for_account(account: sqlite3.Row, kind: str, prompt: str, 
     )
     if stream.get("error"):
         raise UpstreamGenerationError(stream["error"])
-    hydration = CLIENT.hydrate_generation_result(s, chat["chatId"])
+    if kind == "video" and stream.get("status") == "submitted":
+        hydration = CLIENT.hydrate_generation_result_until_assets(s, chat["chatId"], chat_type=chat_type)
+    elif kind == "video":
+        hydration = CLIENT.hydrate_generation_result(s, chat["chatId"], chat_type=chat_type)
+    else:
+        hydration = CLIENT.hydrate_generation_result(s, chat["chatId"])
+    if hydration.get("error"):
+        raise UpstreamGenerationError(hydration["error"])
     assets = hydration.get("assets") or []
     response = {
         "chat": {"chatId": chat["chatId"], "focusId": chat.get("focusId") or chat["chatId"]},
@@ -1908,7 +2078,7 @@ def submit_generation_for_account(account: sqlite3.Row, kind: str, prompt: str, 
         "payload": request_payload,
         "response": response,
         "assets": assets,
-        "status": "completed" if assets else "submitted",
+        "status": "completed" if assets else hydration.get("status") or "submitted",
     }
 
 

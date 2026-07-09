@@ -557,7 +557,40 @@ Upload-backed video validation on 2026-07-09:
 Interpretation:
 - `200002` remains a request-contract rejection and has no observed point deduction.
 - `100003` is different: the request appears to reach the model service layer and can consume points even when no video asset is produced.
-- The upload/BOS path is proven live, but video generation parity is not proven. More live retries should stop until the missing web-only video field or model-service precondition is identified.
+- The upload/BOS path is proven live, but upload-backed video parity is not proven. More upload-class live retries should stop until the model-service precondition for that scene is identified.
+
+Text-to-video validation on 2026-07-09:
+- Account used: internal account id `2`.
+- Model: `Seedance 1.5 Pro`.
+- Scene: `text_or_image`.
+- Ratio/resolution/duration/audio: `16:9`, `480`, `5`, `false`.
+- `aiType`: `14001`.
+- Estimated cost: `7`.
+- Stream body matched the web shape: `clientType: "pc"`, `chatType: "aiVideo"`, `messages[0].attachments: []`, web `extra` mirror fields, `jt`, `ua`, `js_env`, and nested `videoConfig.textOrImage: {"image": ""}`.
+- Stream headers used the video page context:
+  - `accept: text/event-stream`
+  - `Client-Type: pc`
+  - `referer: https://www.oreateai.com/home/vertical/aiVideo/zh`
+- SSE behavior:
+  - HTTP `200`, `text/event-stream`.
+  - events: `start`, then repeated `ping`.
+  - no `end`, no `error`, no `generating` within the long read window.
+- Point evidence:
+  - before run: `daily=53`, `bonus=50`;
+  - after stream abort/timeout: `daily=46`, `bonus=100`;
+  - net is consistent with `-7` video cost plus `+50` first-use reward.
+- History hydration:
+  - chatId: `629f8ac016e542d03bab9b87`.
+  - endpoint: `/oreate/memory/getmessagelist?pn=1&rn=30&chatID=629f8ac016e542d03bab9b87`.
+  - first poll returned assistant content `generating video`, status `1`.
+  - later poll returned `<video ... src="https://cdn.oreateai.com/aivideo/videodownload/1899992928.mp4">`.
+  - extracted asset: `https://cdn.oreateai.com/aivideo/videodownload/1899992928.mp4`.
+
+Critical text-to-video conclusion:
+- The remaining basic text-to-video issue was not a hidden field.
+- The gateway was waiting for the SSE stream to finish, but the web-visible video stream can keep pinging after the task is already accepted.
+- Correct protocol handling is `create_chat -> sse/stream until terminal/error/read deadline -> poll getmessagelist by chatID until video asset, failure, or timeout`.
+- This is a stateful session/hydration contract, not a browser-only dependency.
 
 Bulk 25-account replay evidence:
 - A pure Python hand-built body with:
@@ -639,6 +672,9 @@ Fix verification:
 - Stream result: `start -> ping -> ping -> generating -> end`, no `200002`.
 - History endpoint returned `data.messageList` with an extensionless Oreate image CDN URL.
 - Asset extraction had to support `data.messageList` and extensionless `https://cdn.oreateai.com/aiimage/...` result URLs.
+- 2026-07-09, account 2, minimal text-to-video prompt, pure Python protocol replay.
+- Video stream result: `start -> ping...`; no terminal `end` was observed, but history hydration returned a real MP4 CDN URL for logId `1899992928`.
+- Gateway fix: video read-timeout/ping-only streams are treated as `submitted`, then `getmessagelist` is polled until the video asset appears or the hydration timeout is reached.
 
 ## Recommended Implementation Plan
 
@@ -647,6 +683,7 @@ Fix verification:
    - `stream_generation(session, chat_id, focus_id, chat_type, messages, image_config=None, video_config=None)`.
    - `parse_sse_events(response_iter)`.
    - `hydrate_generation_result(session, chat_id)` using `/oreate/memory/getmessagelist` with uppercase `chatID`.
+   - `hydrate_generation_result_until_assets(session, chat_id)` for video streams that submit successfully but keep pinging.
 
 2. Preserve the old `create_chat` method temporarily, but stop using it for `/v1/generate`.
 
@@ -699,12 +736,12 @@ Fix verification:
 
 - `chrome-devtools` first-pass evidence is blocked by local profile lock. `js-reverse` and direct HTTP evidence were used instead.
 - Logged-in text-to-image is proven with pure protocol replay and hydrated CDN assets.
-- A controlled logged-in text-to-video success is still needed before video generation is marked production-equivalent.
-- Upload-backed video scenes are implemented from static web evidence and unit-level protocol tests, but still need one live successful video task before being called production-equivalent.
+- Logged-in basic text-to-video is proven with pure protocol replay and hydrated CDN MP4 assets.
+- Upload-backed video scenes are implemented from static web evidence and unit-level protocol tests, but still need one live successful upload-backed video task before being called production-equivalent.
 - Account health/cooldown classification is implemented for known generation outcomes, but broader pool automation and replacement registration are still incomplete.
 
 ## Review Verdict
 
-The current project is now a protocol-compatible image gateway and a much closer image/video gateway, but video output still needs controlled live success proof.
+The current project is now a protocol-compatible image gateway and a protocol-compatible basic text-to-video gateway. Upload-backed video scenes are much closer, but still need separate live success proof.
 
-Text-to-image generation now follows the web's two-stage `create_chat -> sse/stream -> getmessagelist` protocol, restores Banti `jt` and `__bid_n`, preserves the web `ZCe` mirror fields, and hydrates extensionless Oreate CDN image results from `messageList`. Upload-backed video scenes now use the web-style BOS upload object flow and normalized message attachments. Remaining production gaps are controlled text-to-video/video-upload proof and full account-pool maintenance automation.
+Text-to-image generation now follows the web's two-stage `create_chat -> sse/stream -> getmessagelist` protocol, restores Banti `jt` and `__bid_n`, preserves the web `ZCe` mirror fields, and hydrates extensionless Oreate CDN image results from `messageList`. Text-to-video additionally handles the web behavior where SSE can keep pinging without `end` and the final MP4 appears only through history hydration. Upload-backed video scenes now use the web-style BOS upload object flow and normalized message attachments. Remaining production gaps are controlled upload-backed video proof and full account-pool maintenance automation.

@@ -102,6 +102,8 @@ python server.py
 }
 ```
 
+视频生成和图片生成有一个关键差异：网页端视频 SSE 可能长时间只返回 `start/ping`，即使任务已经成功提交，也不一定会发送 `end`。网关现在在视频流进入该状态后转为轮询 `/oreate/memory/getmessagelist?chatID=<chatId>`，从历史消息里的 `<video src="...mp4">` 提取最终 CDN 地址。
+
 ### 网关能力发现
 `GET /v1/capabilities`
 
@@ -159,6 +161,8 @@ X-Request-ID: <可选，客户端请求 ID>
 网关会基于 `/v1/capabilities` 的能力目录校验模型、分辨率、比例、视频时长和场景；非法参数会在调用 Oreate 前返回 `422`，避免无效扣费。成功响应包含 `request_id`、`idempotent_replay`、`estimated_point_cost`、`assets` 和上游 `response` 摘要。
 
 `jt` 由本地 `banti_jt_helper.js` 恢复，Python 只负责 HTTP 协议、账号池、SSE 解析和结果水合；生产路径不依赖浏览器或浏览器配置文件。
+
+视频请求使用网页视频页 referer：`/home/vertical/aiVideo/zh`。当视频 SSE 只持续 ping 或读超时时，任务不会被误判为失败；网关会继续按 chatId 轮询历史消息，拿到视频 URL 后返回 `completed`，超时仍无资产则返回 `submitted`。
 
 ### 网关上传
 `POST /v1/uploads`
@@ -238,13 +242,19 @@ Content-Type: multipart/form-data
     "idempotency_ttl_hours": 24,
     "account_cooldown_seconds": 300,
     "prompt_max_length": 4000
+  },
+  "oreate": {
+    "video_stream_wait_seconds": 60,
+    "video_stream_read_timeout_seconds": 20,
+    "video_hydration_timeout_seconds": 600,
+    "video_hydration_poll_interval_seconds": 10
   }
 }
 ```
 
 ## 当前缺口
 - 自动注册：待补 `/passport/api/emailsignupin` + YYDS 收信 + `/passport/api/emailregisterconfirm`
-- 真实视频成功回归：上传协议已补齐媒体 `source:"aiImage"` 与 `/oreate/convert/submit` 差异，但上一轮上传图生视频返回上游 `100003 call service error`；账号 12 的实测表明该错误可能扣点但不产出资产，下一次真实验证需明确接受额度风险
+- 上传类视频成功回归：文本转视频已用真实账号验证成功；上传协议已补齐媒体 `source:"aiImage"` 与 `/oreate/convert/submit` 差异，但上传图生视频仍需要单独实测。上一轮上传图生视频返回上游 `100003 call service error`，该错误可能扣点但不产出资产，下一次真实验证需明确接受额度风险
 - 号池维护：基础结构已搭好，自动补号逻辑待实现
 - 网关结果：已支持同步解析 SSE 和历史消息资源 URL，后续可补异步任务轮询、失败任务重试/取消
 
