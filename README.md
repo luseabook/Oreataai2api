@@ -5,6 +5,8 @@
 - 已打通图片/视频配置接口
 - 已切换到网页一致的 `create_chat -> /oreate/sse/stream -> getmessagelist` 生成协议
 - 已用真实账号验证最小 1K 生图：stream 成功返回并可从历史消息提取 Oreate CDN 图片 URL
+- 已用真实账号验证基础文本生视频：视频 SSE 可持续 ping，最终 MP4 需要从历史消息轮询水合
+- 已用真实账号验证上传图生视频 `text_or_image`：`/v1/uploads` 产物可进入视频生成并水合出 Oreate CDN MP4
 - 已实现基础管理服务：账号导入、号池存储、图片/视频提交 API
 - 已新增 `/v1/capabilities` 模型能力发现接口，返回图片/视频模型、描述、分辨率、比例、时长和视频场景
 - 已新增模型参数白名单校验、API Key 限流/配额、`Idempotency-Key` 幂等和成本审计
@@ -260,5 +262,5 @@ Content-Type: multipart/form-data
 
 ## 下一步
 1. 先补自动注册链路
-2. 再补真实视频生成回归验证
-3. 最后补号池自动维护
+2. 低成本实测上传类视频高级场景：`reference`、`frame_based`、`motion`
+3. 补异步任务轮询、失败任务重试/取消和号池自动维护

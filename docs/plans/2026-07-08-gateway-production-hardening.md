@@ -443,7 +443,8 @@ Document:
 - `/v1/tasks/{task_id}`.
 - Error envelope.
 - API Key limit fields.
-- Known limitation that real Oreate result retrieval is still not implemented.
+- Current result hydration behavior: SSE parsing plus `/oreate/memory/getmessagelist` polling now retrieves real Oreate CDN image/video assets for proven image, text-to-video, and upload-backed `text_or_image` paths.
+- Known remaining limitation: advanced upload-backed video scenes `reference`, `frame_based`, and `motion` still need separate live success proof.
 
 **Step 2: Run all verification**
 

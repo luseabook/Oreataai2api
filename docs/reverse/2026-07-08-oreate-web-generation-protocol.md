@@ -419,7 +419,8 @@ Static diff update on 2026-07-09:
 - The earlier live video attempts uploaded bytes successfully, but the upload attachment was missing the web's media conversion step.
 - The page upload code also uses `encodeURIComponent(objectPath)` for the Google resumable `name` parameter; the gateway now matches this encoding.
 - `getVideoConfig()` conditionally clears `ratio`/`resolution` and omits `duration` when the selected model/scene capability exposes no values for those controls. The gateway now mirrors that behavior for normalized capability data.
-- This fixes a concrete protocol mismatch, but it does not prove that `100003` is fully resolved. Another live video run can still consume points and should be done only after explicit approval.
+- This fixed a concrete protocol mismatch. Later 2026-07-09 live validation superseded the early failure state for basic text-to-video and upload-backed `text_or_image`: both now produce real hydrated CDN MP4 assets through pure protocol replay.
+- The early `100003` failures remain useful evidence that model-service failures can consume points. They do not by themselves disprove upload parity, because the later Pixverse V5 upload-backed run succeeded with the web-style upload and hydration flow.
 
 ## Current Gateway Behavior
 
@@ -437,8 +438,9 @@ Current `/v1/generate` behavior:
 
 Remaining qualification gap:
 - Text-to-image has been proven with real account protocol replay.
-- Upload-backed video request construction is implemented from web evidence.
-- A controlled logged-in successful text-to-video or upload-backed video generation still needs live verification before claiming complete web parity.
+- Basic text-to-video has been proven with real account protocol replay and history hydration.
+- Upload-backed `text_or_image` video has been proven with real account protocol replay, web-style BOS upload, conversion submit, role-aware attachment handling, and history hydration.
+- Advanced upload-backed scenes `reference`, `frame_based`, and `motion` are implemented from static web evidence and unit-level protocol tests, but still require separate low-cost live success proof before claiming production-equivalent web parity.
 
 ## What Solves The User-Visible Problems
 
@@ -557,7 +559,7 @@ Upload-backed video validation on 2026-07-09:
 Interpretation:
 - `200002` remains a request-contract rejection and has no observed point deduction.
 - `100003` is different: the request appears to reach the model service layer and can consume points even when no video asset is produced.
-- The upload/BOS path is proven live, but upload-backed video parity is not proven. More upload-class live retries should stop until the model-service precondition for that scene is identified.
+- This was the interpretation immediately after the early failed upload-backed attempts. It is superseded for upload-backed `text_or_image` by the later Pixverse V5 success below, while the warning still applies to unproven advanced upload scenes.
 
 Text-to-video validation on 2026-07-09:
 - Account used: internal account id `2`.
