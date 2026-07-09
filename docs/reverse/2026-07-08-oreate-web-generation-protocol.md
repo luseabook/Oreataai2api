@@ -378,28 +378,67 @@ Gateway implication:
 - The gateway needs scene-specific nested config and attachment normalization.
 - `aiType` should be derived from the same cost table the web uses; it is not optional for maximum parity.
 
-## Current Gateway Gap
+## Upload Protocol
+
+The upload-backed video scenes do not send local paths in `videoConfig`. The web first uploads the local file to Oreate/BOS-backed Google Storage, then places the returned object path in both `videoConfig` and `messages[0].attachments`.
+
+Observed web flow:
+1. Build `mFileList`:
+   ```json
+   [{"filename":"ref","fileExt":"png","size":1234}]
+   ```
+2. `POST /oreate/convert/getuploadbostoken`.
+   - The home upload component adds `source: "aiImage"` for image/video extensions.
+3. Read `KeyList[0].bucket`, `KeyList[0].objectPath`, and `KeyList[0].sessionkey`.
+4. Start Google resumable upload:
+   ```text
+   POST https://storage.googleapis.com/upload/storage/v1/b/<bucket>/o?uploadType=resumable&name=<objectPath>
+   Authorization: Bearer <sessionkey>
+   ```
+5. `PUT` the file bytes to the returned `Location`.
+6. For media uploads, call `/oreate/convert/submit` with `fileName`, `fileExt`, `fileSize`, `bucket`, `object`, and `needEdit:false`.
+7. Return a gateway attachment object with `fileName`, `fileExt`, `originSize`, `object`, `bosUrl`, `bosObjectPath`, and conversion metadata such as `docId`/`parseInfo` when present.
+
+Gateway implementation:
+- `/v1/uploads` performs the token exchange and Google resumable upload without browser automation.
+- For media files, `/v1/uploads` now mirrors the web's `source:"aiImage"` token request and `convert/submit` follow-up before returning the attachment.
+- `/v1/generate` accepts uploaded attachment objects in `image`, `first_frame`, `last_frame`, `reference_images`, `reference_videos`, `character_image`, and `motion_video`.
+- The gateway rebuilds `messages[0].attachments` with the same `nke(files)` shape used by the web.
+- Attachment fields are accepted only when they contain an uploaded object path such as `object`, `bosUrl`, or `bos_url`; filename-only placeholders are rejected before any upstream generation call.
+- Scene configs use object paths:
+  - `textOrImage.image`
+  - `frameBased.firstFrame/lastFrame`
+  - `reference.referenceImages/referenceVideos`
+  - `motion.characterImage/motionVideo`
+
+Security note:
+- The temporary BOS `sessionkey` is used only inside `OreateClient.upload_file_bytes`.
+- It is not persisted, returned by the API, or written into task payloads.
+
+Static diff update on 2026-07-09:
+- The earlier live video attempts uploaded bytes successfully, but the upload attachment was missing the web's media conversion step.
+- The page upload code also uses `encodeURIComponent(objectPath)` for the Google resumable `name` parameter; the gateway now matches this encoding.
+- `getVideoConfig()` conditionally clears `ratio`/`resolution` and omits `duration` when the selected model/scene capability exposes no values for those controls. The gateway now mirrors that behavior for normalized capability data.
+- This fixes a concrete protocol mismatch, but it does not prove that `100003` is fully resolved. Another live video run can still consume points and should be done only after explicit approval.
+
+## Current Gateway Behavior
 
 Current `/v1/generate` behavior:
-- Select account.
-- Build a flat image/video payload.
-- Call `CLIENT.create_chat(s, payload)`.
-- Save task as `created`.
+- Select an account from the pool.
+- Validate requested model/ratio/resolution/duration/scene against cached capability data.
+- Create a chat session with `/oreate/create/chat`.
+- Submit generation to `/oreate/sse/stream`.
+- Send prompt in `messages[0].content`.
+- Send image options in `imageConfig`.
+- Send video options in scene-specific `videoConfig`.
+- Send upload-backed video attachments in `messages[0].attachments`.
+- Include mirrored web fields: `jt`, `ua`, `js_env`, and `extra.deviceID/bid/user fields`.
+- Parse SSE events and hydrate final resources from `/oreate/memory/getmessagelist`.
 
-Observed gap:
-- `create_chat` is session creation, not generation.
-- The prompt should be in `messages[0].content`, not `create_chat.content`.
-- Image options should be in `imageConfig`.
-- Video options should be in `videoConfig`.
-- The actual submit endpoint should be `/oreate/sse/stream`.
-- Request body should include mirrored fields: `jt`, `ua`, `js_env`, and `extra.deviceID/bid/user fields`.
-- Result completion should be parsed from SSE frames or hydrated later from history/message endpoints.
-
-This explains why the project still feels unqualified as an image/video gateway even after adding capability lists:
-- It can list and validate some options.
-- It cannot yet reproduce the web generation path.
-- It cannot yet return final generated asset URLs reliably.
-- It does not model video scene modes, uploads, reference files, motion mimicry, audio, original sound, or `aiType`.
+Remaining qualification gap:
+- Text-to-image has been proven with real account protocol replay.
+- Upload-backed video request construction is implemented from web evidence.
+- A controlled logged-in successful text-to-video or upload-backed video generation still needs live verification before claiming complete web parity.
 
 ## What Solves The User-Visible Problems
 
@@ -496,6 +535,29 @@ Point accounting observation:
   - AI video generation costs observed: `-40` and `-70` in the sample ledger.
 - Therefore the observed `80 -> 127` is consistent with a first generation reward `+50` and a 1K image charge `-3`, net `+47`.
 - The asset evidence proves real generation, and the likely actual image cost for the accepted 1K samples is `3` points, even though the visible balance increased.
+
+Upload-backed video validation on 2026-07-09:
+- Gateway path used: `/v1/uploads -> /v1/generate -> /oreate/create/chat -> /oreate/sse/stream`.
+- Upload protocol result: three PNG uploads succeeded through `/oreate/convert/getuploadbostoken` plus Google Storage resumable upload. The returned object paths were accepted by gateway request construction.
+- Account 1, `Seedance 1.5 Pro`, `text_or_image`, 480p, 5s, image attachment, estimated 7 points:
+  - upload succeeded;
+  - stream did not fail fast with `200002`;
+  - final upstream error was `100003 call service error`;
+  - account 1 had only `daily=3`, `bonus=5` in `/oreate/account/getpointdetail`.
+- Account 1, `Seedance 2.0 Mini`, `text_or_image`, 480p, 5s, image attachment, estimated 20 points:
+  - upload succeeded;
+  - final upstream error was again `100003 call service error`;
+  - account balance was insufficient for this estimate, so this run is not useful as a success proof.
+- Account 12, capabilities refreshed, `Seedance 2.0 Mini`, `text_or_image`, 480p, 5s, image attachment, estimated 20 points:
+  - before run: `/oreate/account/getpointdetail` returned `daily=27`, `bonus=100`;
+  - upload succeeded;
+  - stream held open for several minutes, then returned `100003 call service error`;
+  - after run: point detail returned `daily=7`, `bonus=100`, meaning 20 points were consumed despite no asset being returned.
+
+Interpretation:
+- `200002` remains a request-contract rejection and has no observed point deduction.
+- `100003` is different: the request appears to reach the model service layer and can consume points even when no video asset is produced.
+- The upload/BOS path is proven live, but video generation parity is not proven. More live retries should stop until the missing web-only video field or model-service precondition is identified.
 
 Bulk 25-account replay evidence:
 - A pure Python hand-built body with:
@@ -613,7 +675,14 @@ Fix verification:
    - `110012` on hydration: no persisted messages for the chat.
    - repeated generation rejection should increment account generation failure count and set cooldown.
 
-8. Add regression tests:
+8. Add upload protocol support:
+   - `POST /oreate/convert/getuploadbostoken`.
+   - Google Storage resumable upload initiation.
+   - Google Storage byte upload to returned `Location`.
+   - `/v1/uploads` API with API Key protection.
+   - uploaded object normalization into web `nke(files)` message attachments.
+
+9. Add regression tests:
    - image request builds `imageConfig` and calls `/oreate/sse/stream`.
    - video `text_or_image` builds `textOrImage`.
    - `frame_based` requires first/last frame.
@@ -623,17 +692,19 @@ Fix verification:
    - SSE file frames become persisted task results.
    - history hydration extracts markdown/CDN file URLs from assistant messages.
    - upstream error frames classify nested `data.code`.
+   - upload API returns both raw attachment and message attachment.
+   - account health classification separates `200001`, `200002`, `212361`, and `110012`.
 
 ## Remaining Unknowns
 
 - `chrome-devtools` first-pass evidence is blocked by local profile lock. `js-reverse` and direct HTTP evidence were used instead.
 - Logged-in text-to-image is proven with pure protocol replay and hydrated CDN assets.
 - A controlled logged-in text-to-video success is still needed before video generation is marked production-equivalent.
-- Need account health/cooldown implementation before using a 25-account pool for production generation.
-- Need upload protocol analysis for turning local files into `bosUrl/object/docId` records before image-to-video/reference/motion modes can be complete.
+- Upload-backed video scenes are implemented from static web evidence and unit-level protocol tests, but still need one live successful video task before being called production-equivalent.
+- Account health/cooldown classification is implemented for known generation outcomes, but broader pool automation and replacement registration are still incomplete.
 
 ## Review Verdict
 
-The current project is now close to a web-equivalent image gateway, but not yet a complete image/video gateway.
+The current project is now a protocol-compatible image gateway and a much closer image/video gateway, but video output still needs controlled live success proof.
 
-Text-to-image generation now follows the web's two-stage `create_chat -> sse/stream -> getmessagelist` protocol, restores Banti `jt` and `__bid_n`, preserves the web `ZCe` mirror fields, and hydrates extensionless Oreate CDN image results from `messageList`. Remaining production gaps are controlled text-to-video proof, upload-backed video scenes, and account-pool health automation for spam/risk outcomes such as `212361`.
+Text-to-image generation now follows the web's two-stage `create_chat -> sse/stream -> getmessagelist` protocol, restores Banti `jt` and `__bid_n`, preserves the web `ZCe` mirror fields, and hydrates extensionless Oreate CDN image results from `messageList`. Upload-backed video scenes now use the web-style BOS upload object flow and normalized message attachments. Remaining production gaps are controlled text-to-video/video-upload proof and full account-pool maintenance automation.

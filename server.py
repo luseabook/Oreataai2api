@@ -7,7 +7,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -18,7 +18,7 @@ import requests
 import re
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Depends
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -175,6 +175,16 @@ def normalize_ratios(value: Any) -> List[str]:
     return ratios
 
 
+def normalize_option_values(value: Any, key: str = "value") -> List[Any]:
+    values = []
+    if isinstance(value, list):
+        for item in value:
+            option = item.get(key) if isinstance(item, dict) else item
+            if option not in (None, "") and option not in values:
+                values.append(option)
+    return values
+
+
 def normalize_image_models(image_info: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     models = []
     factories = (image_info or {}).get("data", {}).get("factory", [])
@@ -213,20 +223,20 @@ def normalize_video_models(video_info: Optional[Dict[str, Any]]) -> List[Dict[st
         name = model.get("modelName", "")
         if not name:
             continue
-        duration = model.get("duration")
         resolutions = model.get("videoResolution")
         models.append({
             "name": name,
             "description": localized_text(model.get("description")),
             "icon": model.get("modelIcon") or "",
             "ai_type": model.get("aiType"),
-            "durations": duration if isinstance(duration, list) else [],
+            "durations": normalize_option_values(model.get("duration")),
             "resolutions": resolutions if isinstance(resolutions, list) else [],
             "ratios": normalize_ratios(model.get("videoSize")),
             "supports_audio": bool(model.get("supportAudio")),
             "supports_modify_size": bool(model.get("supportModifySize")),
             "point_cost_image": model.get("pointCostImage") if isinstance(model.get("pointCostImage"), list) else [],
             "point_cost_reference": model.get("pointCostReference") if isinstance(model.get("pointCostReference"), list) else [],
+            "point_cost_motion": model.get("pointCostMotion") if isinstance(model.get("pointCostMotion"), list) else [],
         })
     return models
 
@@ -282,21 +292,49 @@ def find_capability_model(models: List[Dict[str, Any]], name: str) -> Optional[D
     return None
 
 
+VIDEO_ATTACHMENT_OPTION_FIELDS = (
+    "image",
+    "first_frame",
+    "last_frame",
+    "reference_images",
+    "reference_videos",
+    "motion_video",
+    "character_image",
+    "ref_duration",
+    "ref_total_duration",
+    "motion_duration",
+    "keep_original_sound",
+    "is_audio",
+    "ai_type",
+)
+MEDIA_UPLOAD_EXTENSIONS = {"jpg", "jpeg", "png", "bmp", "webp", "mp4", "mov"}
+
+
+def copy_optional_body_fields(options: Dict[str, Any], body: Any, fields: Iterable[str]) -> Dict[str, Any]:
+    for field in fields:
+        value = getattr(body, field, None)
+        if value is not None:
+            options[field] = value
+    return options
+
+
 def effective_generation_options(body: Any, caps: Dict[str, Any]) -> Dict[str, Any]:
     if body.kind == "image":
-        return {
+        options = {
             "model_name": body.model_name or CFG["oreate"]["default_image_model"],
             "ratio": body.ratio or CFG["oreate"]["default_image_ratio"],
             "resolution": body.resolution or CFG["oreate"]["default_image_resolution"],
         }
+        return copy_optional_body_fields(options, body, ("image",))
     if body.kind == "video":
-        return {
+        options = {
             "model_name": body.model_name or CFG["oreate"]["default_video_model"],
             "ratio": body.ratio or CFG["oreate"]["default_video_ratio"],
             "resolution": body.resolution or CFG["oreate"]["default_video_resolution"],
             "duration": body.duration or CFG["oreate"]["default_video_duration"],
             "scene_id": body.scene_id or CFG["oreate"]["default_video_scene"],
         }
+        return copy_optional_body_fields(options, body, VIDEO_ATTACHMENT_OPTION_FIELDS)
     return {}
 
 
@@ -333,18 +371,50 @@ def validate_generation_options(kind: str, options: Dict[str, Any], caps: Dict[s
         ensure_capability_value("scene_id", options.get("scene_id"), scene_ids, "INVALID_SCENE")
 
 
+def video_cost_table_for_scene(model: Dict[str, Any], scene_id: str) -> List[Dict[str, Any]]:
+    if scene_id == "reference":
+        return model.get("point_cost_reference") or []
+    if scene_id == "motion":
+        return model.get("point_cost_motion") or []
+    return model.get("point_cost_image") or []
+
+
+def cost_option_value(options: Dict[str, Any], key: str) -> Any:
+    if key == "audio":
+        return bool(options.get("is_audio"))
+    if key == "motDuration":
+        return options.get("motion_duration") or options.get("duration")
+    if key == "refDuration":
+        return options.get("ref_duration")
+    return options.get(key)
+
+
+def cost_item_matches_options(item: Dict[str, Any], options: Dict[str, Any]) -> bool:
+    for key in ("duration", "resolution", "audio", "motDuration", "refDuration"):
+        if key in item and item.get(key) not in (None, "", cost_option_value(options, key)):
+            return False
+    return True
+
+
+def matched_video_cost_item(model: Dict[str, Any], options: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    for item in video_cost_table_for_scene(model, options.get("scene_id") or ""):
+        if isinstance(item, dict) and cost_item_matches_options(item, options):
+            return item
+    return None
+
+
 def estimate_point_cost(kind: str, options: Dict[str, Any], caps: Dict[str, Any]) -> Optional[int]:
     models = caps.get(kind, {}).get("models") or []
     model = find_capability_model(models, options.get("model_name") or "")
     if not model:
         return None
-    costs = model.get("point_cost") if kind == "image" else model.get("point_cost_image")
+    costs = model.get("point_cost") if kind == "image" else video_cost_table_for_scene(model, options.get("scene_id") or "")
     for item in costs or []:
         if not isinstance(item, dict):
             continue
         if kind == "image" and item.get("resolution") == options.get("resolution"):
             return item.get("point")
-        if kind == "video" and item.get("duration") == options.get("duration"):
+        if kind == "video" and cost_item_matches_options(item, options):
             return item.get("point")
     return None
 
@@ -357,37 +427,212 @@ def build_image_config(options: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def upload_attachment_data(value: Any) -> Dict[str, Any]:
+    if isinstance(value, BaseModel):
+        return model_data(value)
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def normalized_file_extension(value: Any) -> str:
+    return str(value or "").lstrip(".").lower()
+
+
+def is_media_upload_extension(value: Any) -> bool:
+    return normalized_file_extension(value) in MEDIA_UPLOAD_EXTENSIONS
+
+
+def response_data_object(body: Any) -> Dict[str, Any]:
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        return body["data"]
+    return body if isinstance(body, dict) else {}
+
+
+def upload_attachment_list(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [upload_attachment_data(item) for item in value if upload_attachment_data(item)]
+
+
+def upload_object_value(value: Any) -> str:
+    item = upload_attachment_data(value)
+    for key in ("bosUrl", "bos_url", "object", "bosObjectPath", "url"):
+        candidate = item.get(key)
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return ""
+
+
+def normalize_upload_attachment(value: Any) -> Dict[str, Any]:
+    item = upload_attachment_data(value)
+    bos_value = upload_object_value(item)
+    normalized: Dict[str, Any] = {
+        "bos_url": bos_value,
+        "docId": item.get("docId") or item.get("docID") or "",
+        "doc_title": item.get("fileName") or item.get("doc_title") or item.get("title") or item.get("name") or "",
+        "doc_type": item.get("fileExt") or item.get("doc_type") or item.get("contentType") or "",
+        "size": item.get("originSize") or item.get("fileSize") or item.get("size") or 0,
+        "bosUrl": bos_value,
+        "flag": "upload",
+        "type": "file",
+        "status": 1,
+    }
+    duration = item.get("videoDurationSec")
+    if isinstance(duration, (int, float)) and duration > 0:
+        normalized["videoDurationSec"] = duration
+    return normalized
+
+
+def first_upload_key_entry(key_list: Any) -> Dict[str, Any]:
+    if isinstance(key_list, list) and key_list:
+        first = key_list[0]
+        return first if isinstance(first, dict) else {}
+    if isinstance(key_list, dict) and key_list:
+        for key in sorted(key_list.keys(), key=str):
+            first = key_list[key]
+            return first if isinstance(first, dict) else {}
+    return {}
+
+
+def require_upload_object(options: Dict[str, Any], field: str) -> Dict[str, Any]:
+    item = upload_attachment_data(options.get(field))
+    if not upload_object_value(item):
+        raise GatewayAPIError(
+            422,
+            "MISSING_VIDEO_ATTACHMENT",
+            f"{field} is required for {options.get('scene_id') or 'video'} scene",
+            {"field": field},
+        )
+    return item
+
+
+def optional_upload_object(options: Dict[str, Any], field: str) -> Dict[str, Any]:
+    item = upload_attachment_data(options.get(field))
+    if item and not upload_object_value(item):
+        raise GatewayAPIError(
+            422,
+            "MISSING_VIDEO_ATTACHMENT",
+            f"{field} must contain an uploaded object path",
+            {"field": field},
+        )
+    return item
+
+
+def require_upload_object_list(options: Dict[str, Any], field: str) -> List[Dict[str, Any]]:
+    items = upload_attachment_list(options.get(field))
+    invalid = [item for item in items if not upload_object_value(item)]
+    if invalid:
+        raise GatewayAPIError(
+            422,
+            "MISSING_VIDEO_ATTACHMENT",
+            f"{field} contains an item without an uploaded object path",
+            {"field": field},
+        )
+    return items
+
+
+def first_positive_number(values: Iterable[Any], fallback: Any = "") -> Any:
+    for value in values:
+        if isinstance(value, (int, float)) and value > 0:
+            return value
+    return fallback
+
+
+def resolve_video_ai_type(options: Dict[str, Any], model: Optional[Dict[str, Any]]) -> Optional[Any]:
+    if options.get("ai_type") is not None:
+        return options.get("ai_type")
+    item = matched_video_cost_item(model or {}, options)
+    if isinstance(item, dict) and item.get("aiType") is not None:
+        return item.get("aiType")
+    return (model or {}).get("ai_type")
+
+
+def known_model_option_values(model: Optional[Dict[str, Any]], field: str) -> Optional[List[Any]]:
+    if not isinstance(model, dict) or field not in model:
+        return None
+    value = model.get(field)
+    return value if isinstance(value, list) else []
+
+
+def should_send_model_option(model: Optional[Dict[str, Any]], field: str) -> bool:
+    values = known_model_option_values(model, field)
+    return values is None or bool(values)
+
+
+def build_video_message_attachments(options: Dict[str, Any]) -> List[Dict[str, Any]]:
+    scene_id = options.get("scene_id") or CFG["oreate"]["default_video_scene"]
+    raw: List[Dict[str, Any]] = []
+    if scene_id == "text_or_image":
+        image = optional_upload_object(options, "image")
+        if image:
+            raw.append(image)
+    elif scene_id == "frame_based":
+        raw.extend([require_upload_object(options, "first_frame"), require_upload_object(options, "last_frame")])
+    elif scene_id == "reference":
+        raw.extend(require_upload_object_list(options, "reference_images"))
+        raw.extend(require_upload_object_list(options, "reference_videos"))
+        if not raw:
+            raise GatewayAPIError(
+                422,
+                "MISSING_VIDEO_ATTACHMENT",
+                "at least one reference image or video is required for reference scene",
+                {"field": "reference_images/reference_videos"},
+            )
+    elif scene_id == "motion":
+        raw.extend([require_upload_object(options, "motion_video"), require_upload_object(options, "character_image")])
+    return [normalize_upload_attachment(item) for item in raw]
+
+
 def build_video_config(options: Dict[str, Any], model: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     scene_id = options.get("scene_id") or CFG["oreate"]["default_video_scene"]
     config: Dict[str, Any] = {
         "modelName": options.get("model_name") or "",
-        "ratio": options.get("ratio") or "",
-        "resolution": str(options.get("resolution") or ""),
-        "duration": options.get("duration") or CFG["oreate"]["default_video_duration"],
-        "isAudio": False,
+        "ratio": (options.get("ratio") or "") if should_send_model_option(model, "ratios") else "",
+        "resolution": str(options.get("resolution") or "") if should_send_model_option(model, "resolutions") else "",
+        "isAudio": bool(options.get("is_audio")) if (not isinstance(model, dict) or model.get("supports_audio")) else False,
         "scene": scene_id,
     }
-    ai_type = (model or {}).get("ai_type")
-    if ai_type is not None:
-        config["aiType"] = ai_type
+    if should_send_model_option(model, "durations"):
+        config["duration"] = options.get("duration") or CFG["oreate"]["default_video_duration"]
+    ai_type = resolve_video_ai_type(options, model)
+    config["aiType"] = ai_type if ai_type is not None else 0
     if scene_id == "text_or_image":
-        config["textOrImage"] = {"image": ""}
+        config["textOrImage"] = {"image": upload_object_value(optional_upload_object(options, "image"))}
     elif scene_id == "frame_based":
-        config["frameBased"] = {"firstFrame": "", "lastFrame": ""}
+        config["frameBased"] = {
+            "firstFrame": upload_object_value(require_upload_object(options, "first_frame")),
+            "lastFrame": upload_object_value(require_upload_object(options, "last_frame")),
+        }
     elif scene_id == "reference":
+        reference_images = require_upload_object_list(options, "reference_images")
+        reference_videos = require_upload_object_list(options, "reference_videos")
+        if not reference_images and not reference_videos:
+            raise GatewayAPIError(
+                422,
+                "MISSING_VIDEO_ATTACHMENT",
+                "at least one reference image or video is required for reference scene",
+                {"field": "reference_images/reference_videos"},
+            )
+        ref_total_duration = options.get("ref_total_duration")
+        if ref_total_duration is None:
+            ref_total_duration = first_positive_number(
+                (item.get("videoDurationSec") for item in reference_videos),
+                config.get("duration") or CFG["oreate"]["default_video_duration"],
+            )
         config["reference"] = {
-            "referenceImages": [],
-            "referenceVideos": [],
-            "refDuration": "2-5",
-            "refTotalDuration": config["duration"],
-            "keepOriginalSound": False,
+            "referenceImages": [upload_object_value(item) for item in reference_images if upload_object_value(item)],
+            "referenceVideos": [upload_object_value(item) for item in reference_videos if upload_object_value(item)],
+            "refDuration": options.get("ref_duration") or "2-5",
+            "refTotalDuration": ref_total_duration,
+            "keepOriginalSound": bool(options.get("keep_original_sound")),
         }
     elif scene_id == "motion":
+        motion_video = require_upload_object(options, "motion_video")
+        character_image = require_upload_object(options, "character_image")
         config["motion"] = {
-            "characterImage": "",
-            "motionVideo": "",
-            "motDuration": config["duration"],
-            "keepOriginalSound": False,
+            "characterImage": upload_object_value(character_image),
+            "motionVideo": upload_object_value(motion_video),
+            "motDuration": options.get("motion_duration") or motion_video.get("videoDurationSec") or config.get("duration") or CFG["oreate"]["default_video_duration"],
+            "keepOriginalSound": bool(options.get("keep_original_sound")),
         }
     return config
 
@@ -634,15 +879,49 @@ def mark_account_success(account_id: int) -> None:
     conn.close()
 
 
+def upstream_error_code(error: Exception) -> str:
+    upstream = getattr(error, "error", None)
+    if isinstance(upstream, dict) and upstream.get("code") is not None:
+        return str(upstream.get("code"))
+    match = re.search(r"\b\d{5,6}\b", str(error))
+    return match.group(0) if match else ""
+
+
+def account_failure_message(error: Exception, code: str) -> str:
+    upstream = getattr(error, "error", None)
+    if isinstance(upstream, dict):
+        message = upstream.get("message") or upstream.get("msg") or str(error)
+        return f"{code}: {message}" if code else str(message)
+    return str(error)
+
+
 def mark_account_failure(account_id: int, error: Exception) -> None:
     now = time.time()
+    code = upstream_error_code(error)
+    last_error = account_failure_message(error, code)[:500]
     conn = db_conn()
     row = conn.execute("SELECT COALESCE(failure_count, 0) as failure_count FROM accounts WHERE id=?", (account_id,)).fetchone()
+    if code == "110012":
+        conn.execute(
+            "UPDATE accounts SET last_error=?, updated_at=? WHERE id=?",
+            (last_error, now, account_id),
+        )
+        conn.commit()
+        conn.close()
+        return
     next_failure_count = (row["failure_count"] if row else 0) + 1
+    if code == "200001":
+        conn.execute(
+            "UPDATE accounts SET status='invalid', failure_count=?, cooldown_until=NULL, last_error=?, updated_at=? WHERE id=?",
+            (next_failure_count, last_error, now, account_id),
+        )
+        conn.commit()
+        conn.close()
+        return
     cooldown_seconds = int(CFG.get("gateway", {}).get("account_cooldown_seconds") or 300) * min(next_failure_count, 6)
     conn.execute(
         "UPDATE accounts SET failure_count=?, cooldown_until=?, last_error=?, updated_at=? WHERE id=?",
-        (next_failure_count, now + cooldown_seconds, str(error)[:500], now, account_id),
+        (next_failure_count, now + cooldown_seconds, last_error, now, account_id),
     )
     conn.commit()
     conn.close()
@@ -820,6 +1099,19 @@ class MediaTaskIn(BaseModel):
     resolution: Optional[str] = None
     duration: Optional[int] = None
     scene_id: Optional[str] = None
+    image: Optional[Dict[str, Any]] = None
+    first_frame: Optional[Dict[str, Any]] = None
+    last_frame: Optional[Dict[str, Any]] = None
+    reference_images: Optional[List[Dict[str, Any]]] = None
+    reference_videos: Optional[List[Dict[str, Any]]] = None
+    motion_video: Optional[Dict[str, Any]] = None
+    character_image: Optional[Dict[str, Any]] = None
+    ref_duration: Optional[Any] = None
+    ref_total_duration: Optional[Any] = None
+    motion_duration: Optional[Any] = None
+    keep_original_sound: Optional[bool] = None
+    is_audio: Optional[bool] = None
+    ai_type: Optional[Any] = None
     jt: str = ""
 
 
@@ -1164,6 +1456,117 @@ class OreateClient:
         except Exception:
             return {"email": fallback_email, "vip": "", "reg_ts": ""}
 
+    def upload_file_bytes(
+        self,
+        s: requests.Session,
+        filename: str,
+        data: bytes,
+        content_type: str = "application/octet-stream",
+    ) -> Dict[str, Any]:
+        safe_name = Path(filename or "upload.bin").name
+        path = Path(safe_name)
+        file_ext = normalized_file_extension(path.suffix)
+        file_name = path.stem or "upload"
+        upload_payload = {
+            "mFileList": [
+                {
+                    "filename": file_name,
+                    "fileExt": file_ext,
+                    "size": len(data),
+                }
+            ]
+        }
+        is_media_upload = is_media_upload_extension(file_ext)
+        if is_media_upload:
+            upload_payload["source"] = "aiImage"
+        token_response = s.post(
+            self.base + "/oreate/convert/getuploadbostoken",
+            headers={**self.headers, "content-type": "application/json"},
+            json=upload_payload,
+            timeout=self.timeout,
+        )
+        token_response.raise_for_status()
+        token_body = token_response.json()
+        token_data = response_data_object(token_body)
+        key_list = (token_data or {}).get("KeyList") or (token_data or {}).get("keyList") or []
+        key = first_upload_key_entry(key_list)
+        if not key:
+            raise RuntimeError(f"upload token response missing KeyList: {token_body}")
+        bucket = key.get("bucket") or key.get("Bucket") or ""
+        object_path = key.get("objectPath") or key.get("object") or key.get("bosObjectPath") or key.get("key") or ""
+        session_key = key.get("sessionkey") or key.get("sessionKey") or key.get("accessToken") or key.get("token") or ""
+        if not bucket or not object_path or not session_key:
+            raise RuntimeError("upload token response missing bucket, objectPath, or sessionkey")
+
+        upload_type = content_type or "application/octet-stream"
+        init_url = (
+            "https://storage.googleapis.com/upload/storage/v1/b/"
+            f"{quote(str(bucket), safe='')}/o?uploadType=resumable&name={quote(str(object_path), safe='')}"
+        )
+        init_response = requests.post(
+            init_url,
+            headers={
+                "authorization": f"Bearer {session_key}",
+                "x-upload-content-type": upload_type,
+                "x-upload-content-length": str(len(data)),
+                "content-length": "0",
+            },
+            timeout=self.timeout,
+        )
+        init_response.raise_for_status()
+        upload_location = init_response.headers.get("Location") or init_response.headers.get("location")
+        if not upload_location:
+            raise RuntimeError("resumable upload did not return Location")
+        put_response = requests.put(
+            upload_location,
+            headers={
+                "authorization": f"Bearer {session_key}",
+                "content-type": upload_type,
+                "content-length": str(len(data)),
+            },
+            data=data,
+            timeout=self.timeout,
+        )
+        put_response.raise_for_status()
+        attachment = {
+            "fileName": file_name,
+            "fileExt": file_ext,
+            "originSize": len(data),
+            "contentType": upload_type,
+            "bucket": bucket,
+            "object": object_path,
+            "bosUrl": object_path,
+            "bosObjectPath": object_path,
+            "status": "completed",
+        }
+        if is_media_upload:
+            convert_payload = {
+                "fileName": f"{file_name}.{file_ext}" if file_ext else file_name,
+                "fileExt": file_ext,
+                "fileSize": len(data),
+                "needEdit": False,
+                "bucket": bucket,
+                "object": object_path,
+            }
+            convert_response = s.post(
+                self.base + "/oreate/convert/submit",
+                headers={**self.headers, "content-type": "application/json"},
+                json=convert_payload,
+                timeout=self.timeout,
+            )
+            convert_response.raise_for_status()
+            convert_body = convert_response.json()
+            status = convert_body.get("status") if isinstance(convert_body, dict) else None
+            if isinstance(status, dict) and status.get("code") not in (None, 0):
+                raise RuntimeError(f"convert submit failed: {status}")
+            convert_data = response_data_object(convert_body)
+            doc_id = convert_data.get("docId") or convert_data.get("docID")
+            if doc_id:
+                attachment["docId"] = doc_id
+            if "parseInfo" in convert_data:
+                attachment["parseInfo"] = convert_data.get("parseInfo")
+        return attachment
+
     def _set_cookie_unique(self, s: requests.Session, name: str, value: str) -> None:
         cookies = getattr(s, "cookies", {})
         if isinstance(cookies, dict):
@@ -1210,6 +1613,7 @@ class OreateClient:
         prompt: str,
         image_config: Optional[Dict[str, Any]] = None,
         video_config: Optional[Dict[str, Any]] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
         account: Optional[sqlite3.Row] = None,
         jt: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -1238,7 +1642,7 @@ class OreateClient:
             "chatType": chat_type,
             "from": "home",
             "chatTitle": "Unnamed Session",
-            "messages": [{"role": "user", "content": prompt, "attachments": []}],
+            "messages": [{"role": "user", "content": prompt, "attachments": attachments or []}],
             "isFirst": True,
             "extra": extra,
             "clientType": "pc",
@@ -1468,12 +1872,15 @@ def submit_generation_for_account(account: sqlite3.Row, kind: str, prompt: str, 
     }
     image_config = None
     video_config = None
+    attachments: List[Dict[str, Any]] = []
     if kind == "image":
         image_config = build_image_config(options)
         request_payload["imageConfig"] = image_config
     else:
         model = find_capability_model(caps.get("video", {}).get("models") or [], options.get("model_name") or "") or {}
         video_config = build_video_config(options, model)
+        attachments = build_video_message_attachments(options)
+        request_payload["messages"][0]["attachments"] = attachments
         request_payload["videoConfig"] = video_config
 
     chat = CLIENT.create_chat_session(s, chat_type)
@@ -1485,6 +1892,7 @@ def submit_generation_for_account(account: sqlite3.Row, kind: str, prompt: str, 
         prompt=prompt,
         image_config=image_config,
         video_config=video_config,
+        attachments=attachments,
         account=account,
     )
     if stream.get("error"):
@@ -1866,6 +2274,19 @@ class GatewayGenerateIn(BaseModel):
     duration: Optional[int] = None
     scene_id: Optional[str] = None
     account_id: Optional[int] = None
+    image: Optional[Dict[str, Any]] = None
+    first_frame: Optional[Dict[str, Any]] = None
+    last_frame: Optional[Dict[str, Any]] = None
+    reference_images: Optional[List[Dict[str, Any]]] = None
+    reference_videos: Optional[List[Dict[str, Any]]] = None
+    motion_video: Optional[Dict[str, Any]] = None
+    character_image: Optional[Dict[str, Any]] = None
+    ref_duration: Optional[Any] = None
+    ref_total_duration: Optional[Any] = None
+    motion_duration: Optional[Any] = None
+    keep_original_sound: Optional[bool] = None
+    is_audio: Optional[bool] = None
+    ai_type: Optional[Any] = None
 
 
 @app.post("/v1/generate")
@@ -1978,6 +2399,42 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
     }
     save_idempotency_record(api_key_id, idempotency_key, request_hash, 200, result, task_id)
     return result
+
+
+@app.post("/v1/uploads")
+async def gateway_upload(
+    request: Request,
+    file: UploadFile = File(...),
+    account_id: Optional[int] = Form(None),
+    api_key_id: int = Depends(require_api_key),
+):
+    """Upload a local file to the same BOS object path format used by web video scenes."""
+    request_id = gateway_request_id(request)
+    account = pick_account_for_generation("video", account_id) or pick_account_for_generation("image", account_id)
+    if not account:
+        raise GatewayAPIError(503, "NO_ACCOUNT_AVAILABLE", "no verified account available", request_id=request_id)
+    data = await file.read()
+    if not data:
+        raise GatewayAPIError(400, "EMPTY_UPLOAD", "uploaded file is empty", {"field": "file"}, request_id=request_id)
+    try:
+        session = CLIENT.session_from_account(account)
+        attachment = CLIENT.upload_file_bytes(
+            session,
+            file.filename or "upload.bin",
+            data,
+            file.content_type or "application/octet-stream",
+        )
+    except Exception as e:
+        mark_account_failure(account["id"], e)
+        raise GatewayAPIError(503, "UPLOAD_FAILED", str(e), request_id=request_id)
+    mark_account_success(account["id"])
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "account_id": account["id"],
+        "attachment": attachment,
+        "message_attachment": normalize_upload_attachment(attachment),
+    }
 
 
 @app.get("/v1/tasks")
@@ -2188,6 +2645,7 @@ def generate_media(body: MediaTaskIn, _=Depends(require_admin)):
             "ratio": body.ratio or CFG["oreate"]["default_image_ratio"],
             "resolution": body.resolution or CFG["oreate"]["default_image_resolution"],
         }
+        copy_optional_body_fields(options, body, ("image",))
     else:
         options = {
             "scene_id": body.scene_id or CFG["oreate"]["default_video_scene"],
@@ -2196,6 +2654,7 @@ def generate_media(body: MediaTaskIn, _=Depends(require_admin)):
             "resolution": body.resolution or CFG["oreate"]["default_video_resolution"],
             "ratio": body.ratio or CFG["oreate"]["default_video_ratio"],
         }
+        copy_optional_body_fields(options, body, VIDEO_ATTACHMENT_OPTION_FIELDS)
     try:
         generation = submit_generation_for_account(account, body.kind, body.prompt, options)
     except UpstreamGenerationError as e:

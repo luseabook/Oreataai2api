@@ -80,6 +80,7 @@ class GatewayHardeningTests(unittest.TestCase):
                             "supportModifySize": True,
                             "pointCostImage": [{"duration": 5, "point": 20}],
                             "pointCostReference": [{"duration": 5, "point": 25}],
+                            "pointCostMotion": [{"duration": 5, "point": 30, "aiType": 15123}],
                         }
                     ]
                 }
@@ -92,6 +93,24 @@ class GatewayHardeningTests(unittest.TestCase):
                             "sceneName": {"zh": "文生或图生视频", "en": "Text or image"},
                             "description": {"zh": "输入文本或图片"},
                             "sceneIcon": "scene.svg",
+                        },
+                        {
+                            "sceneId": "frame_based",
+                            "sceneName": {"zh": "首尾帧"},
+                            "description": {"zh": "上传首帧和尾帧"},
+                            "sceneIcon": "frame.svg",
+                        },
+                        {
+                            "sceneId": "reference",
+                            "sceneName": {"zh": "参考素材"},
+                            "description": {"zh": "上传参考图片或视频"},
+                            "sceneIcon": "reference.svg",
+                        },
+                        {
+                            "sceneId": "motion",
+                            "sceneName": {"zh": "动作模仿"},
+                            "description": {"zh": "上传角色图和动作视频"},
+                            "sceneIcon": "motion.svg",
                         }
                     ]
                 }
@@ -148,6 +167,25 @@ class GatewayHardeningTests(unittest.TestCase):
             "model_name": "Google Nano Banana 2",
             "resolution": "4K",
             "ratio": "16:9",
+        }
+
+    def uploaded_image(self, name="first.png", object_path="uploads/first.png"):
+        return {
+            "fileName": name.rsplit(".", 1)[0],
+            "fileExt": name.rsplit(".", 1)[1],
+            "originSize": 1234,
+            "object": object_path,
+            "status": "completed",
+        }
+
+    def uploaded_video(self, name="motion.mp4", object_path="uploads/motion.mp4", duration=8):
+        return {
+            "fileName": name.rsplit(".", 1)[0],
+            "fileExt": name.rsplit(".", 1)[1],
+            "originSize": 9876,
+            "object": object_path,
+            "status": "completed",
+            "videoDurationSec": duration,
         }
 
     def admin_headers(self):
@@ -355,6 +393,367 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("textOrImage", config)
         self.assertEqual(config["textOrImage"]["image"], "")
         self.assertNotIn("sceneId", config)
+
+    def test_video_config_clears_empty_capability_options_like_web(self):
+        config = server.build_video_config(
+            {
+                "model_name": "Seedance Auto",
+                "ratio": "16:9",
+                "resolution": "480",
+                "duration": 5,
+                "scene_id": "text_or_image",
+            },
+            {
+                "name": "Seedance Auto",
+                "ratios": [],
+                "resolutions": [],
+                "durations": [],
+                "supports_audio": False,
+            },
+        )
+
+        self.assertEqual(config["ratio"], "")
+        self.assertEqual(config["resolution"], "")
+        self.assertNotIn("duration", config)
+        self.assertFalse(config["isAudio"])
+        self.assertEqual(config["aiType"], 0)
+
+    def test_video_cost_matching_treats_missing_audio_as_false(self):
+        caps = {
+            "video": {
+                "models": [
+                    {
+                        "name": "Seedance 2.0 Mini",
+                        "point_cost_image": [
+                            {"duration": 5, "resolution": "480", "audio": False, "point": 20}
+                        ],
+                    }
+                ]
+            }
+        }
+
+        cost = server.estimate_point_cost(
+            "video",
+            {
+                "model_name": "Seedance 2.0 Mini",
+                "scene_id": "text_or_image",
+                "duration": 5,
+                "resolution": "480",
+            },
+            caps,
+        )
+
+        self.assertEqual(cost, 20)
+
+    def test_video_duration_capability_accepts_web_value_objects(self):
+        models = server.normalize_video_models(
+            {
+                "models": {
+                    "data": {
+                        "models": [
+                            {
+                                "modelName": "Seedance Live Shape",
+                                "duration": [{"value": 5}, {"value": 10}],
+                                "videoResolution": ["480"],
+                                "videoSize": [{"ratio": "16:9"}],
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(models[0]["durations"], [5, 10])
+
+    def test_upload_attachment_is_normalized_like_web_nke(self):
+        attachment = server.normalize_upload_attachment(
+            {
+                "fileName": "first",
+                "fileExt": "png",
+                "originSize": 1234,
+                "object": "uploads/first.png",
+                "videoDurationSec": 0,
+            }
+        )
+
+        self.assertEqual(attachment["bos_url"], "uploads/first.png")
+        self.assertEqual(attachment["bosUrl"], "uploads/first.png")
+        self.assertEqual(attachment["doc_title"], "first")
+        self.assertEqual(attachment["doc_type"], "png")
+        self.assertEqual(attachment["size"], 1234)
+        self.assertEqual(attachment["flag"], "upload")
+        self.assertEqual(attachment["type"], "file")
+        self.assertEqual(attachment["status"], 1)
+        self.assertNotIn("videoDurationSec", attachment)
+
+    def test_reference_video_rejects_attachment_without_object_path(self):
+        with self.assertRaises(server.GatewayAPIError) as raised:
+            server.build_video_config(
+                {
+                    "model_name": "Seedance 2.0 Mini",
+                    "ratio": "16:9",
+                    "resolution": "480",
+                    "duration": 5,
+                    "scene_id": "reference",
+                    "reference_images": [{"fileName": "ref", "fileExt": "png", "originSize": 1234}],
+                },
+                {"name": "Seedance 2.0 Mini", "ai_type": 14198},
+            )
+
+        self.assertEqual(raised.exception.code, "MISSING_VIDEO_ATTACHMENT")
+        self.assertEqual(raised.exception.details["field"], "reference_images")
+
+    def test_video_frame_based_requires_both_frames(self):
+        with self.assertRaises(server.GatewayAPIError) as raised:
+            server.build_video_config(
+                {
+                    "model_name": "Seedance 2.0 Mini",
+                    "ratio": "16:9",
+                    "resolution": "480",
+                    "duration": 5,
+                    "scene_id": "frame_based",
+                    "first_frame": self.uploaded_image(),
+                },
+                {"name": "Seedance 2.0 Mini", "ai_type": 14198},
+            )
+
+        self.assertEqual(raised.exception.code, "MISSING_VIDEO_ATTACHMENT")
+
+    def test_video_frame_based_config_uses_uploaded_object_paths_and_attachments(self):
+        options = {
+            "model_name": "Seedance 2.0 Mini",
+            "ratio": "16:9",
+            "resolution": "480",
+            "duration": 5,
+            "scene_id": "frame_based",
+            "first_frame": self.uploaded_image("first.png", "uploads/first.png"),
+            "last_frame": self.uploaded_image("last.png", "uploads/last.png"),
+        }
+
+        config = server.build_video_config(options, {"name": "Seedance 2.0 Mini", "ai_type": 14198})
+        attachments = server.build_video_message_attachments(options)
+
+        self.assertEqual(config["frameBased"]["firstFrame"], "uploads/first.png")
+        self.assertEqual(config["frameBased"]["lastFrame"], "uploads/last.png")
+        self.assertEqual([a["bos_url"] for a in attachments], ["uploads/first.png", "uploads/last.png"])
+
+    def test_video_motion_requires_character_and_motion_video(self):
+        with self.assertRaises(server.GatewayAPIError) as raised:
+            server.build_video_config(
+                {
+                    "model_name": "Seedance 2.0 Mini",
+                    "ratio": "16:9",
+                    "resolution": "480",
+                    "duration": 5,
+                    "scene_id": "motion",
+                    "motion_video": self.uploaded_video(),
+                },
+                {"name": "Seedance 2.0 Mini", "ai_type": 14198},
+            )
+
+        self.assertEqual(raised.exception.code, "MISSING_VIDEO_ATTACHMENT")
+
+    def test_v1_generate_reference_video_passes_scene_config_and_message_attachments(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("reference-key")
+        image = self.uploaded_image("ref.png", "uploads/ref.png")
+        video = self.uploaded_video("ref.mp4", "uploads/ref.mp4", duration=4)
+
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-ref", "focusId": "focus-ref"}),
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "end"}], "error": None}) as stream_generation,
+            patch.object(server.CLIENT, "hydrate_generation_result", return_value={"raw": {}, "assets": []}),
+        ):
+            response = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer reference-key"},
+                json={
+                    "kind": "video",
+                    "prompt": "hello",
+                    "model_name": "Seedance 2.0 Mini",
+                    "resolution": "480",
+                    "ratio": "16:9",
+                    "duration": 5,
+                    "scene_id": "reference",
+                    "reference_images": [image],
+                    "reference_videos": [video],
+                    "ref_duration": "2-5",
+                    "ref_total_duration": 4,
+                    "keep_original_sound": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        kwargs = stream_generation.call_args.kwargs
+        self.assertEqual(kwargs["video_config"]["reference"]["referenceImages"], ["uploads/ref.png"])
+        self.assertEqual(kwargs["video_config"]["reference"]["referenceVideos"], ["uploads/ref.mp4"])
+        self.assertEqual(kwargs["video_config"]["reference"]["refTotalDuration"], 4)
+        self.assertTrue(kwargs["video_config"]["reference"]["keepOriginalSound"])
+        self.assertEqual([a["bos_url"] for a in kwargs["attachments"]], ["uploads/ref.png", "uploads/ref.mp4"])
+
+    def test_upload_endpoint_uses_oreate_bos_upload_protocol(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("upload-key")
+
+        with patch.object(
+            server.CLIENT,
+            "upload_file_bytes",
+            return_value={
+                "fileName": "sample",
+                "fileExt": "png",
+                "originSize": 4,
+                "object": "uploads/sample.png",
+                "status": "completed",
+            },
+        ) as upload_file:
+            response = self.client.post(
+                "/v1/uploads",
+                headers={"Authorization": "Bearer upload-key"},
+                files={"file": ("sample.png", b"data", "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["attachment"]["object"], "uploads/sample.png")
+        self.assertEqual(payload["message_attachment"]["bos_url"], "uploads/sample.png")
+        upload_file.assert_called_once()
+
+    def test_upload_file_bytes_accepts_web_keylist_object(self):
+        class FakeResponse:
+            def __init__(self, body=None, headers=None):
+                self._body = body or {}
+                self.headers = headers or {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._body
+
+        class FakeSession:
+            def __init__(self):
+                self.posts = []
+
+            def post(self, url, **kwargs):
+                self.posts.append((url, kwargs))
+                if url.endswith("/oreate/convert/submit"):
+                    return FakeResponse({"docId": "doc-sample", "parseInfo": {"ok": True}})
+                return FakeResponse(
+                    {
+                        "KeyList": {
+                            "0": {
+                                "bucket": "bucket-a",
+                                "objectPath": "uploads/sample.png",
+                                "sessionkey": "token-a",
+                            }
+                        }
+                    }
+                )
+
+        client = server.OreateClient()
+        with (
+            patch.object(server.requests, "post", return_value=FakeResponse(headers={"Location": "https://upload.example/session"})) as init_upload,
+            patch.object(server.requests, "put", return_value=FakeResponse()) as put_upload,
+        ):
+            attachment = client.upload_file_bytes(FakeSession(), "sample.png", b"data", "image/png")
+
+        self.assertEqual(attachment["object"], "uploads/sample.png")
+        self.assertEqual(attachment["docId"], "doc-sample")
+        self.assertEqual(attachment["parseInfo"], {"ok": True})
+        init_upload.assert_called_once()
+        put_upload.assert_called_once()
+
+    def test_media_upload_uses_web_ai_image_source_and_convert_submit(self):
+        class FakeResponse:
+            def __init__(self, body=None, headers=None):
+                self._body = body or {}
+                self.headers = headers or {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._body
+
+        class FakeSession:
+            def __init__(self):
+                self.posts = []
+
+            def post(self, url, **kwargs):
+                self.posts.append((url, kwargs))
+                if url.endswith("/oreate/convert/submit"):
+                    return FakeResponse({"data": {"docId": "doc-video", "parseInfo": {"type": "media"}}})
+                return FakeResponse(
+                    {
+                        "KeyList": {
+                            "0": {
+                                "bucket": "bucket-a",
+                                "objectPath": "uploads/ref.mp4",
+                                "sessionkey": "token-a",
+                            }
+                        }
+                    }
+                )
+
+        fake_session = FakeSession()
+        client = server.OreateClient()
+        with (
+            patch.object(server.requests, "post", return_value=FakeResponse(headers={"Location": "https://upload.example/session"})),
+            patch.object(server.requests, "put", return_value=FakeResponse()),
+        ):
+            attachment = client.upload_file_bytes(fake_session, "ref.mp4", b"data", "video/mp4")
+
+        token_payload = fake_session.posts[0][1]["json"]
+        convert_payload = fake_session.posts[1][1]["json"]
+        self.assertEqual(token_payload["source"], "aiImage")
+        self.assertEqual(convert_payload["object"], "uploads/ref.mp4")
+        self.assertEqual(convert_payload["fileName"], "ref.mp4")
+        self.assertEqual(attachment["docId"], "doc-video")
+        self.assertEqual(attachment["parseInfo"], {"type": "media"})
+
+    def test_non_media_upload_skips_ai_image_source_and_convert_submit(self):
+        class FakeResponse:
+            def __init__(self, body=None, headers=None):
+                self._body = body or {}
+                self.headers = headers or {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._body
+
+        class FakeSession:
+            def __init__(self):
+                self.posts = []
+
+            def post(self, url, **kwargs):
+                self.posts.append((url, kwargs))
+                return FakeResponse(
+                    {
+                        "KeyList": {
+                            "0": {
+                                "bucket": "bucket-a",
+                                "objectPath": "uploads/readme.txt",
+                                "sessionkey": "token-a",
+                            }
+                        }
+                    }
+                )
+
+        fake_session = FakeSession()
+        client = server.OreateClient()
+        with (
+            patch.object(server.requests, "post", return_value=FakeResponse(headers={"Location": "https://upload.example/session"})),
+            patch.object(server.requests, "put", return_value=FakeResponse()),
+        ):
+            attachment = client.upload_file_bytes(fake_session, "readme.txt", b"data", "text/plain")
+
+        token_payload = fake_session.posts[0][1]["json"]
+        self.assertNotIn("source", token_payload)
+        self.assertEqual(len(fake_session.posts), 1)
+        self.assertEqual(attachment["object"], "uploads/readme.txt")
 
     def test_user_mirror_metadata_matches_web_zce_fields(self):
         metadata = server.extract_user_mirror_metadata(
@@ -663,6 +1062,70 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(row["failure_count"], 1)
         self.assertGreater(row["cooldown_until"], time.time())
         self.assertIn("upstream down", row["last_error"])
+
+    def test_session_expired_upstream_error_marks_account_invalid(self):
+        account_id = self.seed_account_with_capabilities()
+
+        server.mark_account_failure(
+            account_id,
+            server.UpstreamGenerationError({"code": "200001", "message": "session expired"}),
+        )
+
+        conn = server.db_conn()
+        row = conn.execute("SELECT status,failure_count,cooldown_until,last_error FROM accounts WHERE id=?", (account_id,)).fetchone()
+        conn.close()
+        self.assertEqual(row["status"], "invalid")
+        self.assertEqual(row["failure_count"], 1)
+        self.assertIsNone(row["cooldown_until"])
+        self.assertIn("200001", row["last_error"])
+
+    def test_params_error_cools_account_without_invalidating_it(self):
+        account_id = self.seed_account_with_capabilities()
+
+        server.mark_account_failure(
+            account_id,
+            server.UpstreamGenerationError({"code": "200002", "message": "params error"}),
+        )
+
+        conn = server.db_conn()
+        row = conn.execute("SELECT status,failure_count,cooldown_until,last_error FROM accounts WHERE id=?", (account_id,)).fetchone()
+        conn.close()
+        self.assertEqual(row["status"], "verified")
+        self.assertEqual(row["failure_count"], 1)
+        self.assertGreater(row["cooldown_until"], time.time())
+        self.assertIn("200002", row["last_error"])
+
+    def test_risk_control_error_cools_account_without_invalidating_it(self):
+        account_id = self.seed_account_with_capabilities()
+
+        server.mark_account_failure(
+            account_id,
+            server.UpstreamGenerationError({"code": "212361", "message": "risk control"}),
+        )
+
+        conn = server.db_conn()
+        row = conn.execute("SELECT status,failure_count,cooldown_until,last_error FROM accounts WHERE id=?", (account_id,)).fetchone()
+        conn.close()
+        self.assertEqual(row["status"], "verified")
+        self.assertEqual(row["failure_count"], 1)
+        self.assertGreater(row["cooldown_until"], time.time())
+        self.assertIn("212361", row["last_error"])
+
+    def test_hydration_no_message_error_does_not_penalize_account(self):
+        account_id = self.seed_account_with_capabilities()
+
+        server.mark_account_failure(
+            account_id,
+            server.UpstreamGenerationError({"code": "110012", "message": "message not found"}),
+        )
+
+        conn = server.db_conn()
+        row = conn.execute("SELECT status,failure_count,cooldown_until,last_error FROM accounts WHERE id=?", (account_id,)).fetchone()
+        conn.close()
+        self.assertEqual(row["status"], "verified")
+        self.assertEqual(row["failure_count"], 0)
+        self.assertIsNone(row["cooldown_until"])
+        self.assertIn("110012", row["last_error"])
 
     def test_successful_generation_clears_account_failure_state(self):
         account_id = self.seed_account_with_capabilities()

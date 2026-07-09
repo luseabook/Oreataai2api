@@ -8,9 +8,10 @@
 - 已实现基础管理服务：账号导入、号池存储、图片/视频提交 API
 - 已新增 `/v1/capabilities` 模型能力发现接口，返回图片/视频模型、描述、分辨率、比例、时长和视频场景
 - 已新增模型参数白名单校验、API Key 限流/配额、`Idempotency-Key` 幂等和成本审计
+- 已新增 `/v1/uploads`，按网页 BOS 上传协议返回可用于视频首尾帧、参考素材和动作模仿的附件对象
 - 已新增 `/v1/tasks/{task_id}` 标准任务详情接口，旧 `/v1/task/{task_id}` 仍保留兼容
 - 后台支持独立修改管理员账号密码，修改后强制重新登录
-- 已补充 SSE 事件解析、上游错误分类和历史消息资源 URL 抽取
+- 已补充 SSE 事件解析、上游错误分类、账号健康分类和历史消息资源 URL 抽取
 - 自动注册（YYDS 邮箱）链路尚未完成
 
 ## 文件
@@ -137,9 +138,50 @@ X-Request-ID: <可选，客户端请求 ID>
 }
 ```
 
+上传类视频场景先调用 `/v1/uploads`，再把返回的 `attachment` 放入对应字段：
+```json
+{
+  "kind": "video",
+  "prompt": "make the reference material cinematic",
+  "model_name": "Seedance 2.0 Mini",
+  "ratio": "16:9",
+  "resolution": "480",
+  "duration": 5,
+  "scene_id": "reference",
+  "reference_images": [{"fileName": "ref", "fileExt": "png", "originSize": 1234, "object": "uploads/ref.png"}],
+  "reference_videos": [{"fileName": "ref", "fileExt": "mp4", "originSize": 9876, "object": "uploads/ref.mp4", "videoDurationSec": 4}],
+  "ref_duration": "2-5",
+  "ref_total_duration": 4,
+  "keep_original_sound": true
+}
+```
+
 网关会基于 `/v1/capabilities` 的能力目录校验模型、分辨率、比例、视频时长和场景；非法参数会在调用 Oreate 前返回 `422`，避免无效扣费。成功响应包含 `request_id`、`idempotent_replay`、`estimated_point_cost`、`assets` 和上游 `response` 摘要。
 
 `jt` 由本地 `banti_jt_helper.js` 恢复，Python 只负责 HTTP 协议、账号池、SSE 解析和结果水合；生产路径不依赖浏览器或浏览器配置文件。
+
+### 网关上传
+`POST /v1/uploads`
+
+请求头：
+```text
+Authorization: Bearer <API Key>
+Content-Type: multipart/form-data
+```
+
+表单字段：
+- `file`：要上传的图片或视频。
+- `account_id`：可选，指定用于换取上传 token 的账号。
+
+响应中的 `attachment` 可直接放入：
+- `image`：`text_or_image` 图生视频。
+- `first_frame` / `last_frame`：首尾帧视频。
+- `reference_images[]` / `reference_videos[]`：参考素材视频。
+- `character_image` / `motion_video`：动作模仿。
+
+这些字段必须使用 `/v1/uploads` 返回的对象，至少包含 `object`/`bosUrl` 路径；本地文件路径或只有文件名的占位对象会被本地拒绝，不会继续打上游。
+
+`message_attachment` 是网页 `nke(files)` 格式，网关生成时会自动从上述字段重建 `messages[0].attachments`。
 
 ### 任务查询
 - `GET /v1/tasks`：当前 API Key 的任务列表。
@@ -167,10 +209,18 @@ X-Request-ID: <可选，客户端请求 ID>
 - `UNAUTHORIZED`：缺少或无效 API Key。
 - `CAPABILITIES_UNAVAILABLE`：没有模型能力缓存，需要后台刷新。
 - `INVALID_MODEL` / `INVALID_RESOLUTION` / `INVALID_RATIO` / `INVALID_DURATION` / `INVALID_SCENE`：请求参数不在能力目录中。
+- `MISSING_VIDEO_ATTACHMENT`：视频场景缺少必要的上传对象，例如首尾帧、参考素材或动作视频。
+- `UPLOAD_FAILED`：BOS 上传协议失败，账号会按上游错误类型分类处理。
 - `IDEMPOTENCY_KEY_CONFLICT`：同一个 `Idempotency-Key` 被不同请求体复用。
 - `RATE_LIMITED` / `DAILY_REQUEST_LIMIT_EXCEEDED` / `DAILY_POINT_LIMIT_EXCEEDED`：API Key 策略限制触发。
-- `UPSTREAM_ERROR`：Oreate 上游调用失败，账号会进入冷却。
+- `UPSTREAM_ERROR`：Oreate 上游调用失败，账号会按错误类型进入冷却或失效。
 - 上游 `200002 params error`：`/oreate/sse/stream` 参数合同未通过，不是额度不足；通常不会扣点。已确认关键原因包括缺少网页 `ZCe` 用户镜像字段（`vip/reg_ts`）或 Banti `__bid_n`。
+
+账号健康分类：
+- `200001`：登录态失效，账号标记为 `invalid`。
+- `200002`：协议参数被拒绝，账号保留但进入冷却。
+- `212361`：上游风控/垃圾用户，账号保留但进入冷却。
+- `110012`：历史消息未生成或未持久化，只记录警告，不惩罚账号池。
 
 ### API Key 策略
 后台 API Keys 页面可配置：
@@ -194,7 +244,7 @@ X-Request-ID: <可选，客户端请求 ID>
 
 ## 当前缺口
 - 自动注册：待补 `/passport/api/emailsignupin` + YYDS 收信 + `/passport/api/emailregisterconfirm`
-- 视频上传类场景：`frame_based`、`reference`、`motion` 还需要补上传到 BOS 后的附件对象协议
+- 真实视频成功回归：上传协议已补齐媒体 `source:"aiImage"` 与 `/oreate/convert/submit` 差异，但上一轮上传图生视频返回上游 `100003 call service error`；账号 12 的实测表明该错误可能扣点但不产出资产，下一次真实验证需明确接受额度风险
 - 号池维护：基础结构已搭好，自动补号逻辑待实现
 - 网关结果：已支持同步解析 SSE 和历史消息资源 URL，后续可补异步任务轮询、失败任务重试/取消
 
