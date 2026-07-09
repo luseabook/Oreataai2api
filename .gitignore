@@ -16,6 +16,7 @@ config.json
 accounts.db
 
 # Generated files
+live_validation/
 banti_raw.js
 banti_*.js
 !banti_jt_helper.js

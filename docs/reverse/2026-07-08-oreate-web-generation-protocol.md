@@ -592,6 +592,50 @@ Critical text-to-video conclusion:
 - Correct protocol handling is `create_chat -> sse/stream until terminal/error/read deadline -> poll getmessagelist by chatID until video asset, failure, or timeout`.
 - This is a stateful session/hydration contract, not a browser-only dependency.
 
+Upload-backed `text_or_image` video success validation on 2026-07-09:
+- Account used: internal account id `12`.
+- Upload input: generated local `512x512` PNG, uploaded through `/oreate/convert/getuploadbostoken`, Google Storage resumable upload, and `/oreate/convert/submit`.
+- Upload artifact had:
+  - Oreate object path under `aiimage/upload/...png`;
+  - `docId`;
+  - `parseInfo`.
+- Model: `Pixverse V5`.
+- Scene: `text_or_image`.
+- Ratio/resolution/duration/audio: `1:1`, `360`, `5`, `false`.
+- `aiType`: `14065`.
+- Estimated cost: `5`.
+- ChatId: `840f1cebeaff404810e64e93`.
+- Stream behavior:
+  - `start`, then repeated `ping`;
+  - no immediate terminal video asset;
+  - production stream logic treated this as `submitted`.
+- First hydration exposed a gateway bug:
+  - history had a `role=user` message containing the uploaded image attachment;
+  - the old asset extractor counted that uploaded source image as a generated asset;
+  - fix: `extract_generation_assets` now ignores `role=user` dictionaries.
+- Continued hydration exposed a second gateway bug:
+  - top-level history response had `status.code = 0` and `errMsg = "success"`;
+  - the old history-error classifier treated any `errMsg` string as a failure;
+  - fix: history failures now require an explicit non-zero code or `failReason`.
+- Final hydration:
+  - attempt count: `17`;
+  - assistant message contained `<video ... src="https://cdn.oreateai.com/aivideo/videodownload/385175529.mp4">`;
+  - extracted asset: `https://cdn.oreateai.com/aivideo/videodownload/385175529.mp4`.
+- CDN verification:
+  - `HEAD` status: `200`;
+  - `content-type`: `video/mp4`;
+  - `content-length`: `361797`.
+- Point evidence:
+  - before run: `daily=27`, `bonus=100`;
+  - after final hydration: `daily=52`, `bonus=100`;
+  - net `+25` is consistent with a `+30` daily/first-use grant and the selected `-5` video charge.
+
+Critical upload-backed conclusion:
+- Upload-backed `text_or_image` video is now proven live through pure protocol replay.
+- The gateway must not classify user-uploaded source media as generated assets.
+- The gateway must tolerate successful history envelopes with `errMsg="success"` while assistant content remains `generating video`.
+- Remaining unproven upload-backed scenes are `reference`, `frame_based`, and `motion`.
+
 Bulk 25-account replay evidence:
 - A pure Python hand-built body with:
   - model: `Google Nano Banana 2 Lite`
@@ -675,6 +719,9 @@ Fix verification:
 - 2026-07-09, account 2, minimal text-to-video prompt, pure Python protocol replay.
 - Video stream result: `start -> ping...`; no terminal `end` was observed, but history hydration returned a real MP4 CDN URL for logId `1899992928`.
 - Gateway fix: video read-timeout/ping-only streams are treated as `submitted`, then `getmessagelist` is polled until the video asset appears or the hydration timeout is reached.
+- 2026-07-09, account 12, uploaded-image-to-video prompt, pure Python protocol replay.
+- Upload-backed video result: `start -> ping...`, then history hydration returned a real MP4 CDN URL for logId-like asset id `385175529`.
+- Gateway fix: generated asset extraction ignores `role=user` uploads; history success envelopes are not treated as failures just because they contain `errMsg="success"`.
 
 ## Recommended Implementation Plan
 
@@ -737,11 +784,12 @@ Fix verification:
 - `chrome-devtools` first-pass evidence is blocked by local profile lock. `js-reverse` and direct HTTP evidence were used instead.
 - Logged-in text-to-image is proven with pure protocol replay and hydrated CDN assets.
 - Logged-in basic text-to-video is proven with pure protocol replay and hydrated CDN MP4 assets.
-- Upload-backed video scenes are implemented from static web evidence and unit-level protocol tests, but still need one live successful upload-backed video task before being called production-equivalent.
+- Upload-backed `text_or_image` video is proven with pure protocol replay and hydrated CDN MP4 assets.
+- Advanced upload-backed scenes `reference`, `frame_based`, and `motion` are implemented from static web evidence and unit-level protocol tests, but still need separate live success proof before being called production-equivalent.
 - Account health/cooldown classification is implemented for known generation outcomes, but broader pool automation and replacement registration are still incomplete.
 
 ## Review Verdict
 
-The current project is now a protocol-compatible image gateway and a protocol-compatible basic text-to-video gateway. Upload-backed video scenes are much closer, but still need separate live success proof.
+The current project is now a protocol-compatible image gateway, a protocol-compatible basic text-to-video gateway, and a protocol-compatible upload-backed `text_or_image` video gateway. Advanced upload-backed scenes still need separate live success proof.
 
-Text-to-image generation now follows the web's two-stage `create_chat -> sse/stream -> getmessagelist` protocol, restores Banti `jt` and `__bid_n`, preserves the web `ZCe` mirror fields, and hydrates extensionless Oreate CDN image results from `messageList`. Text-to-video additionally handles the web behavior where SSE can keep pinging without `end` and the final MP4 appears only through history hydration. Upload-backed video scenes now use the web-style BOS upload object flow and normalized message attachments. Remaining production gaps are controlled upload-backed video proof and full account-pool maintenance automation.
+Text-to-image generation now follows the web's two-stage `create_chat -> sse/stream -> getmessagelist` protocol, restores Banti `jt` and `__bid_n`, preserves the web `ZCe` mirror fields, and hydrates extensionless Oreate CDN image results from `messageList`. Text-to-video additionally handles the web behavior where SSE can keep pinging without `end` and the final MP4 appears only through history hydration. Upload-backed `text_or_image` video now uses the web-style BOS upload object flow, normalized message attachments, role-aware result extraction, and history polling until a real MP4 appears. Remaining production gaps are controlled proof for `reference`/`frame_based`/`motion` and full account-pool maintenance automation.

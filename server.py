@@ -725,7 +725,7 @@ def classify_history_error(body: Any, ignored_codes: Optional[List[str]] = None)
             if code not in (None, "", 0, "0") and str(code) not in ignored:
                 message = value.get("errorMessage") or value.get("errMsg") or value.get("msg") or value.get("message")
                 return {"code": str(code), "message": str(message or "history hydration failed")}
-        for message_key in ("failReason", "errorMessage", "errMsg"):
+        for message_key in ("failReason",):
             message = value.get(message_key)
             if isinstance(message, str) and message.strip():
                 return {"code": "UPSTREAM_ERROR", "message": message.strip()}
@@ -766,6 +766,8 @@ def extract_generation_assets(body: Any) -> List[str]:
                 walk(item)
             return
         if not isinstance(value, dict):
+            return
+        if value.get("role") == "user":
             return
         for key in ("url", "bosUrl", "bos_url", "object", "src", "downloadUrl"):
             add(value.get(key))

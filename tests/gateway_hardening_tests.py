@@ -898,6 +898,14 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(error["code"], "200002")
         self.assertEqual(error["message"], "params error")
 
+    def test_success_history_status_is_not_classified_as_error(self):
+        body = {
+            "status": {"code": 0, "msg": "success", "errMsg": "success"},
+            "data": {"messageList": [{"role": "assistant", "content": "generating video"}]},
+        }
+
+        self.assertIsNone(server.classify_history_error(body, ignored_codes=["110012"]))
+
     def test_hydration_extracts_cdn_urls_from_markdown_messages(self):
         body = {
             "status": {"code": 0},
@@ -953,6 +961,30 @@ class GatewayHardeningTests(unittest.TestCase):
         assets = server.extract_generation_assets(body)
 
         self.assertEqual(assets, ["https://cdn.oreateai.com/aiimage/nano/chat-id/result-token"])
+
+    def test_hydration_ignores_user_uploaded_assets(self):
+        body = {
+            "status": {"code": 0},
+            "data": {
+                "messageList": [
+                    {
+                        "role": "user",
+                        "content": "source image",
+                        "attachments": [
+                            {"bosUrl": "https://cdn.oreateai.com/aiimage/upload/source.png"},
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "generating video",
+                    },
+                ]
+            },
+        }
+
+        assets = server.extract_generation_assets(body)
+
+        self.assertEqual(assets, [])
 
     def test_video_hydration_polling_extracts_video_html_src(self):
         class FakeResponse:

@@ -254,7 +254,7 @@ Content-Type: multipart/form-data
 
 ## 当前缺口
 - 自动注册：待补 `/passport/api/emailsignupin` + YYDS 收信 + `/passport/api/emailregisterconfirm`
-- 上传类视频成功回归：文本转视频已用真实账号验证成功；上传协议已补齐媒体 `source:"aiImage"` 与 `/oreate/convert/submit` 差异，但上传图生视频仍需要单独实测。上一轮上传图生视频返回上游 `100003 call service error`，该错误可能扣点但不产出资产，下一次真实验证需明确接受额度风险
+- 上传类视频高级场景回归：文本转视频和上传图生视频 `text_or_image` 已用真实账号验证成功；`reference`、`frame_based`、`motion` 仍需要单独低成本实测
 - 号池维护：基础结构已搭好，自动补号逻辑待实现
 - 网关结果：已支持同步解析 SSE 和历史消息资源 URL，后续可补异步任务轮询、失败任务重试/取消
 
