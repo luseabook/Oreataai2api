@@ -14,6 +14,7 @@ config.json
 
 # Database
 accounts.db
+*.worker.lock
 
 # Generated files
 live_validation/
@@ -45,6 +46,7 @@ run_oqjk*.js
 # Environment
 .env
 .env.local
+.omc/
 
 # OS
 .DS_Store

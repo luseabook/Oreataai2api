@@ -1,4 +1,5 @@
 import json
+import struct
 import threading
 import tempfile
 import time
@@ -54,6 +55,22 @@ class GatewayHardeningTests(unittest.TestCase):
         self.config_patch.stop()
         self.db_patch.stop()
         self.tmp.cleanup()
+
+    def sample_mp4_bytes(self, duration_sec=3, width=320, height=240):
+        def box(name, payload):
+            return struct.pack(">I4s", len(payload) + 8, name.encode("ascii")) + payload
+
+        mvhd_payload = (
+            b"\x00\x00\x00\x00"
+            + b"\x00" * 8
+            + struct.pack(">II", 1000, int(duration_sec * 1000))
+            + b"\x00" * 80
+        )
+        tkhd_payload = (
+            b"\x00" * 76
+            + struct.pack(">II", int(width * 65536), int(height * 65536))
+        )
+        return box("ftyp", b"isom" + b"\x00" * 12) + box("moov", box("mvhd", mvhd_payload) + box("trak", box("tkhd", tkhd_payload)))
 
     def sample_image_info(self):
         return {
@@ -139,11 +156,11 @@ class GatewayHardeningTests(unittest.TestCase):
             """,
             (
                 email,
-                "plain-password",
+                server.encrypt_secret_value("plain-password"),
                 "verified",
                 "manual",
-                "ouid-secret",
-                "ouss-secret",
+                server.encrypt_secret_value("ouid-secret"),
+                server.encrypt_secret_value("ouss-secret"),
                 json.dumps(self.sample_image_info()),
                 json.dumps(self.sample_video_info()),
                 now,
@@ -230,6 +247,72 @@ class GatewayHardeningTests(unittest.TestCase):
 
     def process_task_queue(self, limit=1):
         return server.process_task_queue(limit=limit)
+
+    def post_generation_requests_concurrently(self, api_key, requests):
+        result_lock = threading.Lock()
+        request_start = threading.Barrier(len(requests))
+        responses = []
+        errors = []
+
+        def post_generation(request):
+            client = TestClient(server.app)
+            try:
+                request_start.wait(timeout=5)
+                response = client.post(
+                    "/v1/generate",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json=request,
+                )
+                with result_lock:
+                    responses.append(response)
+            except Exception as exc:
+                with result_lock:
+                    errors.append(exc)
+            finally:
+                client.close()
+
+        threads = [threading.Thread(target=post_generation, args=(request,)) for request in requests]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        return responses
+
+    def post_upload_requests_concurrently(self, api_key, files):
+        result_lock = threading.Lock()
+        request_start = threading.Barrier(len(files))
+        responses = []
+        errors = []
+
+        def post_upload(file_spec):
+            client = TestClient(server.app)
+            try:
+                request_start.wait(timeout=5)
+                response = client.post(
+                    "/v1/uploads",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    files={"file": file_spec},
+                )
+                with result_lock:
+                    responses.append(response)
+            except Exception as exc:
+                with result_lock:
+                    errors.append(exc)
+            finally:
+                client.close()
+
+        threads = [threading.Thread(target=post_upload, args=(file_spec,)) for file_spec in files]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        return responses
 
     def seed_task(
         self,
@@ -346,6 +429,40 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("actual_point_cost", usage_cols)
         self.assertIn("client_id", api_key_cols)
         self.assertIsNotNone(client_table)
+
+    def test_database_connections_enable_production_pragmas_and_indexes(self):
+        server.init_db()
+        conn = server.db_conn()
+        foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+        busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        index_names = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
+            ).fetchall()
+        }
+        migration = conn.execute(
+            "SELECT version,name FROM schema_migrations WHERE version=1"
+        ).fetchone()
+        conn.close()
+
+        self.assertEqual(foreign_keys, 1)
+        self.assertGreaterEqual(busy_timeout, 5000)
+        self.assertEqual(str(journal_mode).lower(), "wal")
+        self.assertTrue(
+            {
+                "idx_tasks_claim",
+                "idx_tasks_tenant_lookup",
+                "idx_usage_quota_window",
+                "idx_usage_task_lookup",
+                "idx_idempotency_task_lookup",
+                "idx_accounts_scheduler",
+                "idx_task_attempts_task",
+            }.issubset(index_names)
+        )
+        self.assertIsNotNone(migration)
+        self.assertEqual(migration["name"], "operational_indexes")
 
     def test_capabilities_expose_scene_policy_metadata(self):
         self.seed_account_with_capabilities()
@@ -477,6 +594,7 @@ class GatewayHardeningTests(unittest.TestCase):
 
     def test_task_retry_cancel_and_hydrate_actions_work(self):
         self.seed_account_with_capabilities()
+        self.seed_account_with_capabilities("task-action-failover@example.com")
         self.seed_api_key("task-action-key")
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
@@ -499,6 +617,174 @@ class GatewayHardeningTests(unittest.TestCase):
             cancel = self.client.post(f"/v1/tasks/{task_id}/cancel", headers={"Authorization": "Bearer task-action-key"})
             self.assertEqual(cancel.status_code, 200)
             self.assertEqual(cancel.json()["task"]["status"], "cancelled")
+
+    def test_task_retry_rechecks_api_key_model_scope(self):
+        self.seed_account_with_capabilities()
+        self.seed_account_with_capabilities("retry-scope-failover@example.com")
+        key_id = self.seed_api_key("retry-scope-key")
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "create_chat_session", side_effect=RuntimeError("upstream down")),
+        ):
+            created = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer retry-scope-key"},
+                json=self.valid_image_request(),
+            )
+            task_id = created.json()["task_id"]
+            self.process_task_queue(limit=1)
+
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE api_keys SET allowed_models=? WHERE id=?",
+            (json.dumps(["another-model"]), key_id),
+        )
+        conn.commit()
+        conn.close()
+
+        retry = self.client.post(
+            f"/v1/tasks/{task_id}/retry",
+            headers={"Authorization": "Bearer retry-scope-key"},
+        )
+
+        self.assertEqual(retry.status_code, 403)
+        self.assertEqual(retry.json()["error"]["code"], "API_KEY_MODEL_FORBIDDEN")
+        conn = server.db_conn()
+        task = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+        usage_count = conn.execute("SELECT COUNT(*) FROM usage_log WHERE task_id=?", (task_id,)).fetchone()[0]
+        conn.close()
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(usage_count, 1)
+
+    def test_task_retry_rechecks_daily_point_quota(self):
+        self.seed_account_with_capabilities()
+        self.seed_account_with_capabilities("retry-quota-failover@example.com")
+        self.seed_api_key("retry-quota-key", daily_point_limit=12)
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "create_chat_session", side_effect=RuntimeError("upstream down")),
+        ):
+            created = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer retry-quota-key"},
+                json=self.valid_image_request(),
+            )
+            task_id = created.json()["task_id"]
+            self.process_task_queue(limit=1)
+
+        retry = self.client.post(
+            f"/v1/tasks/{task_id}/retry",
+            headers={"Authorization": "Bearer retry-quota-key"},
+        )
+
+        self.assertEqual(retry.status_code, 429)
+        self.assertEqual(retry.json()["error"]["code"], "DAILY_POINT_LIMIT_EXCEEDED")
+
+    def test_concurrent_task_retries_share_daily_request_admission(self):
+        api_key_id = self.seed_api_key("concurrent-retry-key", daily_request_limit=1)
+        task_ids = [self.seed_task(status="failed", kind="image") for _ in range(2)]
+        conn = server.db_conn()
+        conn.executemany(
+            "UPDATE tasks SET api_key_id=? WHERE id=?",
+            [(api_key_id, task_id) for task_id in task_ids],
+        )
+        conn.commit()
+        conn.close()
+
+        original_check_daily_quota = server.check_daily_quota
+        quota_checked = threading.Barrier(2)
+
+        def synchronized_check_daily_quota(*args, **kwargs):
+            original_check_daily_quota(*args, **kwargs)
+            try:
+                quota_checked.wait(timeout=0.5)
+            except threading.BrokenBarrierError:
+                pass
+
+        result_lock = threading.Lock()
+        request_start = threading.Barrier(2)
+        responses = []
+        errors = []
+
+        def retry_task(task_id):
+            client = TestClient(server.app)
+            try:
+                request_start.wait(timeout=5)
+                response = client.post(
+                    f"/v1/tasks/{task_id}/retry",
+                    headers={"Authorization": "Bearer concurrent-retry-key"},
+                )
+                with result_lock:
+                    responses.append(response)
+            except Exception as exc:
+                with result_lock:
+                    errors.append(exc)
+            finally:
+                client.close()
+
+        threads = [threading.Thread(target=retry_task, args=(task_id,)) for task_id in task_ids]
+        with patch.object(server, "check_daily_quota", side_effect=synchronized_check_daily_quota):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(response.status_code for response in responses), [200, 429])
+        rejected = next(response for response in responses if response.status_code == 429)
+        self.assertEqual(rejected.json()["error"]["code"], "DAILY_REQUEST_LIMIT_EXCEEDED")
+
+        conn = server.db_conn()
+        statuses = [
+            row["status"]
+            for row in conn.execute(
+                "SELECT status FROM tasks WHERE id IN (?,?) ORDER BY id",
+                task_ids,
+            ).fetchall()
+        ]
+        usage_count = conn.execute(
+            "SELECT COUNT(*) FROM usage_log WHERE api_key_id=?",
+            (api_key_id,),
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(sorted(statuses), ["failed", "queued"])
+        self.assertEqual(usage_count, 1)
+
+    def test_task_retry_selects_healthy_account_and_records_new_billable_attempt(self):
+        self.seed_account_with_capabilities("retry-first@example.com")
+        self.seed_account_with_capabilities("retry-second@example.com")
+        self.seed_api_key("retry-failover-key")
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "create_chat_session", side_effect=RuntimeError("upstream down")),
+        ):
+            created = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer retry-failover-key"},
+                json=self.valid_image_request(),
+            )
+            task_id = created.json()["task_id"]
+            original_account_id = created.json()["account_id"]
+            self.process_task_queue(limit=1)
+
+        retry = self.client.post(
+            f"/v1/tasks/{task_id}/retry",
+            headers={"Authorization": "Bearer retry-failover-key"},
+        )
+
+        self.assertEqual(retry.status_code, 200)
+        self.assertEqual(retry.json()["task"]["status"], "queued")
+        self.assertNotEqual(retry.json()["task"]["account_id"], original_account_id)
+        conn = server.db_conn()
+        usage_rows = conn.execute(
+            "SELECT estimated_point_cost,status FROM usage_log WHERE task_id=? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        conn.close()
+        self.assertEqual(len(usage_rows), 2)
+        self.assertEqual([row["estimated_point_cost"] for row in usage_rows], [12, 12])
+        self.assertEqual(usage_rows[-1]["status"], "queued")
 
     def test_task_hydrate_reprocesses_submitted_task(self):
         self.seed_account_with_capabilities()
@@ -690,6 +976,63 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(row["status"], "submitted")
         task = server.task_detail_for_row(row)
         self.assertEqual(len(task["attempts"]), 1)
+
+    def test_startup_recovery_expires_stale_running_task_and_attempt(self):
+        account_id = self.seed_account_with_capabilities()
+        api_key_id = self.seed_api_key("recovery-key")
+        task_id = server.save_task(
+            account_id,
+            "image",
+            "recover me",
+            self.valid_image_request(),
+            {"status": "running"},
+            status="running",
+            api_key_id=api_key_id,
+            request_id="req-recovery",
+            model_name="Google Nano Banana 2",
+            resolution="4K",
+            ratio="16:9",
+            started_at=100.0,
+        )
+        conn = server.db_conn()
+        conn.execute("UPDATE tasks SET updated_at=? WHERE id=?", (100.0, task_id))
+        conn.execute(
+            """
+            INSERT INTO task_attempts(task_id,attempt_no,phase,account_id,status,started_at)
+            VALUES(?,?,?,?,?,?)
+            """,
+            (task_id, 1, "generation", account_id, "running", 100.0),
+        )
+        conn.commit()
+        conn.close()
+
+        recovered = server.recover_stale_running_tasks(now=1000.0, stale_after_seconds=60.0)
+
+        self.assertEqual(recovered, 1)
+        conn = server.db_conn()
+        task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        attempt = conn.execute("SELECT * FROM task_attempts WHERE task_id=?", (task_id,)).fetchone()
+        conn.close()
+        self.assertEqual(task["status"], "expired")
+        self.assertEqual(task["error_code"], "WORKER_LOST")
+        self.assertEqual(task["finished_at"], 1000.0)
+        self.assertEqual(attempt["status"], "expired")
+        self.assertEqual(attempt["error_code"], "WORKER_LOST")
+
+    def test_readyz_fails_when_background_worker_is_enabled_but_not_alive(self):
+        self.seed_account_with_capabilities()
+        original = server.CFG["gateway"].get("enable_background_worker")
+        original_thread = server.TASK_WORKER_THREAD
+        server.CFG["gateway"]["enable_background_worker"] = True
+        server.TASK_WORKER_THREAD = None
+        try:
+            response = self.client.get("/readyz")
+        finally:
+            server.CFG["gateway"]["enable_background_worker"] = original
+            server.TASK_WORKER_THREAD = original_thread
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("task worker", response.json()["detail"])
 
     def test_generate_rejects_invalid_video_options_before_upstream_call(self):
         self.seed_account_with_capabilities()
@@ -913,6 +1256,47 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(fake.last_json["jt"], "helper-jt")
         self.assertEqual(fake.last_json["extra"]["bid"], "helper-bid")
 
+    def test_stream_generation_retries_banti_helper_until_bid_cookie_is_available(self):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def iter_lines(self, decode_unicode=True):
+                return iter(['data: {"event":"end","data":{}}'])
+
+        class FakeSession:
+            def __init__(self):
+                self.cookies = {"OUID": "ouid-secret"}
+                self.last_json = {}
+
+            def post(self, url, **kwargs):
+                self.last_json = kwargs["json"]
+                return FakeResponse()
+
+        fake = FakeSession()
+        client = server.OreateClient()
+        with patch.object(
+            server,
+            "generate_banti_artifacts",
+            side_effect=[
+                {"jt": "fallback-jt", "cookies": {}},
+                {"jt": "helper-jt", "cookies": {"__bid_n": "helper-bid"}},
+            ],
+        ) as helper:
+            client.stream_generation(
+                fake,
+                chat_id="chat-img",
+                focus_id="focus-img",
+                chat_type="aiImage",
+                prompt="hello",
+                image_config={"modelName": "Google Nano Banana 2", "ratio": "16:9", "resolution": "4K"},
+            )
+
+        self.assertEqual(helper.call_count, 2)
+        self.assertEqual(fake.cookies["__bid_n"], "helper-bid")
+        self.assertEqual(fake.last_json["jt"], "helper-jt")
+        self.assertEqual(fake.last_json["extra"]["bid"], "helper-bid")
+
     def test_stream_generation_fails_before_upstream_without_banti_bid(self):
         class FakeSession:
             def __init__(self):
@@ -980,6 +1364,39 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertNotIn("duration", config)
         self.assertFalse(config["isAudio"])
         self.assertEqual(config["aiType"], 0)
+
+    def test_video_motion_config_omits_duration_and_ratio_like_web_restrictions(self):
+        config = server.build_video_config(
+            {
+                "model_name": "Kling 2.6",
+                "ratio": "1:1",
+                "resolution": "720",
+                "duration": 5,
+                "scene_id": "motion",
+                "motion_duration": 3,
+                "is_audio": True,
+                "motion_video": self.uploaded_video("motion.mp4", "uploads/motion.mp4", duration=3),
+                "character_image": self.uploaded_image("character.png", "uploads/character.png"),
+            },
+            {
+                "name": "Kling 2.6",
+                "ratios": ["1:1"],
+                "resolutions": ["720"],
+                "durations": [5, 10],
+                "supports_audio": True,
+                "point_cost_motion": [
+                    {"motDuration": 3, "resolution": "720", "point": 15, "aiType": 14172}
+                ],
+            },
+        )
+
+        self.assertEqual(config["scene"], "motion")
+        self.assertEqual(config["ratio"], "")
+        self.assertNotIn("duration", config)
+        self.assertFalse(config["isAudio"])
+        self.assertEqual(config["resolution"], "720")
+        self.assertEqual(config["aiType"], 14172)
+        self.assertEqual(config["motion"]["motDuration"], 3)
 
     def test_video_cost_matching_treats_missing_audio_as_false(self):
         caps = {
@@ -1190,6 +1607,159 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(payload["message_attachment"]["bos_url"], "uploads/sample.png")
         upload_file.assert_called_once()
 
+    def test_concurrent_uploads_share_daily_request_admission(self):
+        self.seed_account_with_capabilities()
+        api_key_id = self.seed_api_key("concurrent-upload-key", daily_request_limit=1)
+        original_check_daily_quota = server.check_daily_quota
+        quota_checked = threading.Barrier(2)
+
+        def synchronized_check_daily_quota(*args, **kwargs):
+            original_check_daily_quota(*args, **kwargs)
+            try:
+                quota_checked.wait(timeout=0.5)
+            except threading.BrokenBarrierError:
+                pass
+
+        attachment = {
+            "fileName": "sample",
+            "fileExt": "png",
+            "originSize": 8,
+            "object": "uploads/sample.png",
+            "status": "completed",
+        }
+        files = [
+            ("first.png", b"\x89PNG\r\n\x1a\n", "image/png"),
+            ("second.png", b"\x89PNG\r\n\x1a\n", "image/png"),
+        ]
+        with (
+            patch.object(server, "check_daily_quota", side_effect=synchronized_check_daily_quota),
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "upload_file_bytes", return_value=attachment) as upload_file,
+        ):
+            responses = self.post_upload_requests_concurrently("concurrent-upload-key", files)
+
+        self.assertEqual(sorted(response.status_code for response in responses), [200, 429])
+        rejected = next(response for response in responses if response.status_code == 429)
+        self.assertEqual(rejected.json()["error"]["code"], "DAILY_REQUEST_LIMIT_EXCEEDED")
+        upload_file.assert_called_once()
+
+        conn = server.db_conn()
+        usage_count = conn.execute(
+            "SELECT COUNT(*) FROM usage_log WHERE api_key_id=?",
+            (api_key_id,),
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(usage_count, 1)
+
+    def test_upload_rejects_file_larger_than_configured_limit_before_upstream(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("upload-size-key")
+        original = server.CFG["gateway"].get("upload_max_bytes")
+        server.CFG["gateway"]["upload_max_bytes"] = 3
+        try:
+            with patch.object(server.CLIENT, "session_from_account") as session_from_account:
+                response = self.client.post(
+                    "/v1/uploads",
+                    headers={"Authorization": "Bearer upload-size-key"},
+                    files={"file": ("sample.png", b"data", "image/png")},
+                )
+        finally:
+            if original is None:
+                server.CFG["gateway"].pop("upload_max_bytes", None)
+            else:
+                server.CFG["gateway"]["upload_max_bytes"] = original
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["error"]["code"], "UPLOAD_TOO_LARGE")
+        session_from_account.assert_not_called()
+
+    def test_upload_rejects_non_media_extension_before_upstream(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("upload-type-key")
+
+        with patch.object(server.CLIENT, "session_from_account") as session_from_account:
+            response = self.client.post(
+                "/v1/uploads",
+                headers={"Authorization": "Bearer upload-type-key"},
+                files={"file": ("payload.exe", b"data", "application/octet-stream")},
+            )
+
+        self.assertEqual(response.status_code, 415)
+        self.assertEqual(response.json()["error"]["code"], "UNSUPPORTED_UPLOAD_TYPE")
+        session_from_account.assert_not_called()
+
+    def test_upload_rejects_exhausted_daily_quota_before_reading_body(self):
+        account_id = self.seed_account_with_capabilities()
+        api_key_id = self.seed_api_key("upload-quota-before-read-key", daily_request_limit=1)
+        conn = server.db_conn()
+        conn.execute(
+            "INSERT INTO usage_log(api_key_id,kind,account_id,prompt,status,response_summary,created_at) VALUES(?,?,?,?,?,?,?)",
+            (api_key_id, "upload", account_id, "previous upload", "completed", "ok", time.time()),
+        )
+        conn.commit()
+        conn.close()
+
+        async def fail_if_read(*args, **kwargs):
+            raise AssertionError("UploadFile.read should not run when quota is already exhausted")
+
+        with patch.object(server.UploadFile, "read", side_effect=fail_if_read):
+            response = self.client.post(
+                "/v1/uploads",
+                headers={"Authorization": "Bearer upload-quota-before-read-key"},
+                files={"file": ("sample.png", b"data", "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json()["error"]["code"], "DAILY_REQUEST_LIMIT_EXCEEDED")
+
+    def test_upload_obeys_api_key_rate_limit(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("upload-rate-key", rate_limit_per_minute=1)
+        attachment = {
+            "fileName": "sample",
+            "fileExt": "png",
+            "originSize": 4,
+            "object": "uploads/sample.png",
+            "status": "completed",
+        }
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "upload_file_bytes", return_value=attachment) as upload_file,
+        ):
+            first = self.client.post(
+                "/v1/uploads",
+                headers={"Authorization": "Bearer upload-rate-key"},
+                files={"file": ("sample.png", b"data", "image/png")},
+            )
+            second = self.client.post(
+                "/v1/uploads",
+                headers={"Authorization": "Bearer upload-rate-key"},
+                files={"file": ("sample.png", b"data", "image/png")},
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 429)
+        self.assertEqual(second.json()["error"]["code"], "RATE_LIMITED")
+        upload_file.assert_called_once()
+
+    def test_upload_failure_returns_sanitized_error_message(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("upload-error-key")
+        secret = "sessionkey-super-secret"
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "upload_file_bytes", side_effect=RuntimeError(f"upstream leaked {secret}")),
+        ):
+            response = self.client.post(
+                "/v1/uploads",
+                headers={"Authorization": "Bearer upload-error-key"},
+                files={"file": ("sample.png", b"data", "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "UPLOAD_FAILED")
+        self.assertNotIn(secret, response.text)
+
     def test_upload_file_bytes_accepts_web_keylist_object(self):
         class FakeResponse:
             def __init__(self, body=None, headers=None):
@@ -1235,7 +1805,14 @@ class GatewayHardeningTests(unittest.TestCase):
         init_upload.assert_called_once()
         put_upload.assert_called_once()
 
-    def test_media_upload_uses_web_ai_image_source_and_convert_submit(self):
+    def test_parse_mp4_video_metadata_extracts_duration_and_dimensions(self):
+        metadata = server.parse_mp4_video_metadata(self.sample_mp4_bytes(duration_sec=3, width=320, height=240))
+
+        self.assertEqual(metadata["videoDurationSec"], 3.0)
+        self.assertEqual(metadata["videoWidth"], 320)
+        self.assertEqual(metadata["videoHeight"], 240)
+
+    def test_video_upload_skips_convert_submit_after_bos_upload(self):
         class FakeResponse:
             def __init__(self, body=None, headers=None):
                 self._body = body or {}
@@ -1273,15 +1850,65 @@ class GatewayHardeningTests(unittest.TestCase):
             patch.object(server.requests, "post", return_value=FakeResponse(headers={"Location": "https://upload.example/session"})),
             patch.object(server.requests, "put", return_value=FakeResponse()),
         ):
-            attachment = client.upload_file_bytes(fake_session, "ref.mp4", b"data", "video/mp4")
+            attachment = client.upload_file_bytes(fake_session, "ref.mp4", self.sample_mp4_bytes(), "video/mp4")
+
+        token_payload = fake_session.posts[0][1]["json"]
+        self.assertEqual(token_payload["source"], "aiImage")
+        self.assertEqual(len(fake_session.posts), 1)
+        self.assertEqual(attachment["object"], "uploads/ref.mp4")
+        self.assertEqual(attachment["videoDurationSec"], 3.0)
+        self.assertEqual(attachment["videoWidth"], 320)
+        self.assertEqual(attachment["videoHeight"], 240)
+        self.assertNotIn("docId", attachment)
+        self.assertNotIn("parseInfo", attachment)
+
+    def test_image_upload_uses_convert_submit(self):
+        class FakeResponse:
+            def __init__(self, body=None, headers=None):
+                self._body = body or {}
+                self.headers = headers or {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._body
+
+        class FakeSession:
+            def __init__(self):
+                self.posts = []
+
+            def post(self, url, **kwargs):
+                self.posts.append((url, kwargs))
+                if url.endswith("/oreate/convert/submit"):
+                    return FakeResponse({"data": {"docId": "doc-image", "parseInfo": {"type": "image"}}})
+                return FakeResponse(
+                    {
+                        "KeyList": {
+                            "0": {
+                                "bucket": "bucket-a",
+                                "objectPath": "uploads/ref.png",
+                                "sessionkey": "token-a",
+                            }
+                        }
+                    }
+                )
+
+        fake_session = FakeSession()
+        client = server.OreateClient()
+        with (
+            patch.object(server.requests, "post", return_value=FakeResponse(headers={"Location": "https://upload.example/session"})),
+            patch.object(server.requests, "put", return_value=FakeResponse()),
+        ):
+            attachment = client.upload_file_bytes(fake_session, "ref.png", b"data", "image/png")
 
         token_payload = fake_session.posts[0][1]["json"]
         convert_payload = fake_session.posts[1][1]["json"]
         self.assertEqual(token_payload["source"], "aiImage")
-        self.assertEqual(convert_payload["object"], "uploads/ref.mp4")
-        self.assertEqual(convert_payload["fileName"], "ref.mp4")
-        self.assertEqual(attachment["docId"], "doc-video")
-        self.assertEqual(attachment["parseInfo"], {"type": "media"})
+        self.assertEqual(convert_payload["object"], "uploads/ref.png")
+        self.assertEqual(convert_payload["fileName"], "ref.png")
+        self.assertEqual(attachment["docId"], "doc-image")
+        self.assertEqual(attachment["parseInfo"], {"type": "image"})
 
     def test_non_media_upload_skips_ai_image_source_and_convert_submit(self):
         class FakeResponse:
@@ -1783,6 +2410,283 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(conflict.status_code, 409)
         self.assertEqual(conflict.json()["error"]["code"], "IDEMPOTENCY_KEY_CONFLICT")
 
+    def test_pending_idempotency_key_rejects_duplicate_without_queuing_task(self):
+        api_key_id = self.seed_api_key("idem-pending-key")
+        request = self.valid_image_request()
+        request_hash = server.request_hash_for_generation(server.GatewayGenerateIn(**request))
+        reservation = server.reserve_idempotency_record(
+            api_key_id,
+            "pending-request",
+            request_hash,
+        )
+        self.assertEqual(reservation["state"], "reserved")
+
+        response = self.client.post(
+            "/v1/generate",
+            headers={"Authorization": "Bearer idem-pending-key", "Idempotency-Key": "pending-request"},
+            json=request,
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "IDEMPOTENCY_KEY_IN_PROGRESS")
+        conn = server.db_conn()
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        conn.close()
+        self.assertEqual(task_count, 0)
+
+    def test_concurrent_idempotent_http_requests_submit_queue_once(self):
+        self.seed_account_with_capabilities()
+        api_key_id = self.seed_api_key("idem-route-concurrency-key")
+        request = self.valid_image_request()
+        headers = {
+            "Authorization": "Bearer idem-route-concurrency-key",
+            "Idempotency-Key": "shared-route-request",
+        }
+        original_queue_generation_task = server.queue_generation_task
+        queue_entered = threading.Event()
+        release_first_queue = threading.Event()
+        response_completed = threading.Event()
+        result_lock = threading.Lock()
+        responses = []
+        errors = []
+        queue_call_count = 0
+
+        def delayed_queue_generation_task(*args, **kwargs):
+            nonlocal queue_call_count
+            with result_lock:
+                queue_call_count += 1
+                call_number = queue_call_count
+            if call_number == 1:
+                queue_entered.set()
+                if not release_first_queue.wait(timeout=5):
+                    raise TimeoutError("test queue gate was not released")
+            return original_queue_generation_task(*args, **kwargs)
+
+        def post_generation():
+            client = TestClient(server.app)
+            try:
+                response = client.post(
+                    "/v1/generate",
+                    headers=headers,
+                    json=request,
+                )
+                with result_lock:
+                    responses.append(response)
+                response_completed.set()
+            except Exception as exc:
+                with result_lock:
+                    errors.append(exc)
+                response_completed.set()
+            finally:
+                client.close()
+
+        threads = [threading.Thread(target=post_generation)]
+        duplicate_finished_while_first_was_queued = False
+        with patch.object(server, "queue_generation_task", side_effect=delayed_queue_generation_task):
+            threads[0].start()
+            try:
+                self.assertTrue(queue_entered.wait(timeout=5))
+                duplicate_thread = threading.Thread(target=post_generation)
+                threads.append(duplicate_thread)
+                duplicate_thread.start()
+                duplicate_finished_while_first_was_queued = response_completed.wait(timeout=5)
+            finally:
+                release_first_queue.set()
+                for thread in threads:
+                    thread.join(timeout=5)
+
+        self.assertTrue(duplicate_finished_while_first_was_queued)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(queue_call_count, 1)
+        self.assertEqual(sorted(response.status_code for response in responses), [202, 409])
+        pending_response = next(response for response in responses if response.status_code == 409)
+        accepted_response = next(response for response in responses if response.status_code == 202)
+        self.assertEqual(pending_response.json()["error"]["code"], "IDEMPOTENCY_KEY_IN_PROGRESS")
+
+        conn = server.db_conn()
+        task_rows = conn.execute("SELECT id FROM tasks ORDER BY id").fetchall()
+        idempotency_row = conn.execute(
+            "SELECT task_id,status_code FROM idempotency_keys WHERE api_key_id=? AND idempotency_key=?",
+            (api_key_id, "shared-route-request"),
+        ).fetchone()
+        conn.close()
+
+        self.assertEqual(len(task_rows), 1)
+        self.assertEqual(accepted_response.json()["task_id"], task_rows[0]["id"])
+        self.assertEqual(idempotency_row["task_id"], task_rows[0]["id"])
+        self.assertEqual(idempotency_row["status_code"], 202)
+
+    def test_queue_failure_releases_idempotency_reservation(self):
+        self.seed_account_with_capabilities()
+        api_key_id = self.seed_api_key("idem-release-key")
+        request = self.valid_image_request()
+
+        with patch.object(server, "queue_generation_task", side_effect=RuntimeError("queue unavailable")):
+            with self.assertRaises(RuntimeError):
+                self.client.post(
+                    "/v1/generate",
+                    headers={"Authorization": "Bearer idem-release-key", "Idempotency-Key": "release-request"},
+                    json=request,
+                )
+
+        conn = server.db_conn()
+        row = conn.execute(
+            "SELECT * FROM idempotency_keys WHERE api_key_id=? AND idempotency_key=?",
+            (api_key_id, "release-request"),
+        ).fetchone()
+        conn.close()
+        self.assertIsNone(row)
+
+    def test_generation_rejects_prompt_over_configured_limit(self):
+        self.seed_api_key("prompt-limit-key")
+        original = server.CFG["gateway"].get("prompt_max_length")
+        server.CFG["gateway"]["prompt_max_length"] = 8
+        try:
+            response = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer prompt-limit-key"},
+                json={**self.valid_image_request(), "prompt": "123456789"},
+            )
+        finally:
+            server.CFG["gateway"]["prompt_max_length"] = original
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "PROMPT_TOO_LONG")
+
+    def test_generation_rejects_oversized_idempotency_key(self):
+        self.seed_api_key("idem-limit-key")
+        original = server.CFG["gateway"].get("idempotency_key_max_length")
+        server.CFG["gateway"]["idempotency_key_max_length"] = 8
+        try:
+            response = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer idem-limit-key", "Idempotency-Key": "123456789"},
+                json=self.valid_image_request(),
+            )
+        finally:
+            if original is None:
+                server.CFG["gateway"].pop("idempotency_key_max_length", None)
+            else:
+                server.CFG["gateway"]["idempotency_key_max_length"] = original
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "IDEMPOTENCY_KEY_TOO_LONG")
+
+    def test_generation_rejects_sync_wait_over_configured_limit(self):
+        self.seed_api_key("sync-limit-key")
+        original = server.CFG["gateway"].get("sync_wait_max_seconds")
+        server.CFG["gateway"]["sync_wait_max_seconds"] = 2
+        try:
+            response = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer sync-limit-key"},
+                json=self.valid_image_request(sync_wait_seconds=3),
+            )
+        finally:
+            if original is None:
+                server.CFG["gateway"].pop("sync_wait_max_seconds", None)
+            else:
+                server.CFG["gateway"]["sync_wait_max_seconds"] = original
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "SYNC_WAIT_OUT_OF_RANGE")
+
+    def test_oversized_request_id_is_replaced_with_bounded_server_id(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("request-id-limit-key")
+        original = server.CFG["gateway"].get("request_id_max_length")
+        server.CFG["gateway"]["request_id_max_length"] = 16
+        try:
+            response = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer request-id-limit-key", "X-Request-ID": "x" * 17},
+                json=self.valid_image_request(),
+            )
+        finally:
+            if original is None:
+                server.CFG["gateway"].pop("request_id_max_length", None)
+            else:
+                server.CFG["gateway"]["request_id_max_length"] = original
+
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(response.json()["request_id"].startswith("req_"))
+        self.assertLessEqual(len(response.json()["request_id"]), 16)
+
+    def test_idempotency_reservation_is_atomic_under_concurrency(self):
+        api_key_id = self.seed_api_key("atomic-idempotency-key")
+        barrier = threading.Barrier(6)
+        results = []
+        errors = []
+        result_lock = threading.Lock()
+
+        def reserve():
+            try:
+                barrier.wait(timeout=2)
+                result = server.reserve_idempotency_record(
+                    api_key_id,
+                    "shared-request",
+                    "same-request-hash",
+                )
+                with result_lock:
+                    results.append(result)
+            except Exception as exc:
+                with result_lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=reserve) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(sum(item["state"] == "reserved" for item in results), 1)
+        self.assertEqual(sum(item["state"] == "pending" for item in results), 5)
+        conn = server.db_conn()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM idempotency_keys WHERE api_key_id=? AND idempotency_key=?",
+            (api_key_id, "shared-request"),
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1)
+
+    def test_idempotency_reservation_reclaims_expired_record(self):
+        api_key_id = self.seed_api_key("ttl-idempotency-key")
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute(
+            """
+            INSERT INTO idempotency_keys(
+                api_key_id,idempotency_key,request_hash,status_code,response_json,task_id,created_at
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (api_key_id, "expired-request", "old-hash", 202, "{}", None, now - 7200),
+        )
+        conn.commit()
+        conn.close()
+        original = server.CFG["gateway"].get("idempotency_ttl_hours")
+        server.CFG["gateway"]["idempotency_ttl_hours"] = 1
+        try:
+            result = server.reserve_idempotency_record(
+                api_key_id,
+                "expired-request",
+                "new-hash",
+                now=now,
+            )
+        finally:
+            server.CFG["gateway"]["idempotency_ttl_hours"] = original
+
+        self.assertEqual(result["state"], "reserved")
+        conn = server.db_conn()
+        row = conn.execute(
+            "SELECT * FROM idempotency_keys WHERE api_key_id=? AND idempotency_key=?",
+            (api_key_id, "expired-request"),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row["request_hash"], "new-hash")
+        self.assertEqual(row["status_code"], 0)
+
     def test_api_key_rate_limit_rejects_second_request(self):
         self.seed_account_with_capabilities()
         self.seed_api_key("rate-key", rate_limit_per_minute=1)
@@ -1799,6 +2703,79 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(first.status_code, 202)
         self.assertEqual(second.status_code, 429)
         self.assertEqual(second.json()["error"]["code"], "RATE_LIMITED")
+
+    def test_api_key_explicit_zero_limits_override_nonzero_gateway_defaults(self):
+        api_key_id = self.seed_api_key(
+            "unlimited-key",
+            rate_limit_per_minute=0,
+            daily_request_limit=0,
+            daily_point_limit=0,
+        )
+        with patch.dict(
+            server.CFG["gateway"],
+            {
+                "default_rate_limit_per_minute": 7,
+                "default_daily_request_limit": 8,
+                "default_daily_point_limit": 9,
+            },
+        ):
+            policy = server.resolve_api_key_policy(server.get_api_key_record(api_key_id))
+
+        self.assertEqual(policy["rate_limit_per_minute"], 0)
+        self.assertEqual(policy["daily_request_limit"], 0)
+        self.assertEqual(policy["daily_point_limit"], 0)
+
+    def test_check_rate_limit_is_atomic_under_concurrency(self):
+        class CoordinatedBuckets(dict):
+            def __init__(self):
+                super().__init__()
+                self.read_barrier = threading.Barrier(2)
+
+            def get(self, key, default=None):
+                bucket = super().get(key, default)
+                try:
+                    self.read_barrier.wait(timeout=0.5)
+                except threading.BrokenBarrierError:
+                    pass
+                return list(bucket)
+
+        buckets = CoordinatedBuckets()
+        result_lock = threading.Lock()
+        admitted = []
+        errors = []
+        now = time.time()
+        check_start = threading.Barrier(2)
+
+        def check(request_id):
+            try:
+                check_start.wait(timeout=5)
+                server.check_rate_limit(
+                    999,
+                    {"rate_limit_per_minute": 1},
+                    now,
+                    request_id,
+                )
+                with result_lock:
+                    admitted.append(request_id)
+            except Exception as exc:
+                with result_lock:
+                    errors.append(exc)
+
+        threads = [
+            threading.Thread(target=check, args=("rate-request-1",)),
+            threading.Thread(target=check, args=("rate-request-2",)),
+        ]
+        with patch.object(server, "RATE_BUCKETS", buckets):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], server.GatewayAPIError)
+        self.assertEqual(errors[0].code, "RATE_LIMITED")
 
     def test_daily_request_limit_rejects_second_request(self):
         self.seed_account_with_capabilities()
@@ -1817,6 +2794,72 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(second.status_code, 429)
         self.assertEqual(second.json()["error"]["code"], "DAILY_REQUEST_LIMIT_EXCEEDED")
 
+    def test_concurrent_daily_request_limit_admission_allows_only_one_request(self):
+        self.seed_account_with_capabilities()
+        api_key_id = self.seed_api_key("concurrent-daily-key", daily_request_limit=1)
+        original_check_daily_quota = server.check_daily_quota
+        quota_checked = threading.Barrier(2)
+
+        def synchronized_check_daily_quota(*args, **kwargs):
+            original_check_daily_quota(*args, **kwargs)
+            try:
+                quota_checked.wait(timeout=0.5)
+            except threading.BrokenBarrierError:
+                pass
+
+        requests = [self.valid_image_request(), self.valid_image_request()]
+        requests[0]["prompt"] = "first concurrent request"
+        requests[1]["prompt"] = "second concurrent request"
+        with patch.object(server, "check_daily_quota", side_effect=synchronized_check_daily_quota):
+            responses = self.post_generation_requests_concurrently("concurrent-daily-key", requests)
+
+        self.assertEqual(sorted(response.status_code for response in responses), [202, 429])
+        rejected = next(response for response in responses if response.status_code == 429)
+        self.assertEqual(rejected.json()["error"]["code"], "DAILY_REQUEST_LIMIT_EXCEEDED")
+
+        conn = server.db_conn()
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        usage_count = conn.execute(
+            "SELECT COUNT(*) FROM usage_log WHERE api_key_id=?",
+            (api_key_id,),
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(task_count, 1)
+        self.assertEqual(usage_count, 1)
+
+    def test_concurrent_daily_point_limit_admission_allows_only_one_request(self):
+        self.seed_account_with_capabilities()
+        api_key_id = self.seed_api_key("concurrent-point-key", daily_point_limit=20)
+        original_check_daily_quota = server.check_daily_quota
+        quota_checked = threading.Barrier(2)
+
+        def synchronized_check_daily_quota(*args, **kwargs):
+            original_check_daily_quota(*args, **kwargs)
+            try:
+                quota_checked.wait(timeout=0.5)
+            except threading.BrokenBarrierError:
+                pass
+
+        requests = [self.valid_image_request(), self.valid_image_request()]
+        requests[0]["prompt"] = "first concurrent point request"
+        requests[1]["prompt"] = "second concurrent point request"
+        with patch.object(server, "check_daily_quota", side_effect=synchronized_check_daily_quota):
+            responses = self.post_generation_requests_concurrently("concurrent-point-key", requests)
+
+        self.assertEqual(sorted(response.status_code for response in responses), [202, 429])
+        rejected = next(response for response in responses if response.status_code == 429)
+        self.assertEqual(rejected.json()["error"]["code"], "DAILY_POINT_LIMIT_EXCEEDED")
+
+        conn = server.db_conn()
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        usage_count = conn.execute(
+            "SELECT COUNT(*) FROM usage_log WHERE api_key_id=?",
+            (api_key_id,),
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(task_count, 1)
+        self.assertEqual(usage_count, 1)
+
     def test_daily_point_limit_blocks_expensive_request(self):
         self.seed_account_with_capabilities()
         self.seed_api_key("point-key", daily_point_limit=10)
@@ -1830,6 +2873,33 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(response.status_code, 429)
         self.assertEqual(response.json()["error"]["code"], "DAILY_POINT_LIMIT_EXCEEDED")
         create_chat.assert_not_called()
+
+    def test_scheduler_prefers_account_with_fewer_inflight_tasks(self):
+        first_account_id = self.seed_account_with_capabilities("least-busy-1@example.com")
+        second_account_id = self.seed_account_with_capabilities("least-busy-2@example.com")
+        self.seed_api_key("least-busy-key")
+
+        first_request = self.valid_image_request()
+        first_request["prompt"] = "first queued request"
+        second_request = self.valid_image_request()
+        second_request["prompt"] = "second queued request"
+
+        first = self.client.post(
+            "/v1/generate",
+            headers={"Authorization": "Bearer least-busy-key"},
+            json=first_request,
+        )
+        second = self.client.post(
+            "/v1/generate",
+            headers={"Authorization": "Bearer least-busy-key"},
+            json=second_request,
+        )
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 202)
+        selected_account_ids = [first.json()["account_id"], second.json()["account_id"]]
+        self.assertEqual(set(selected_account_ids), {first_account_id, second_account_id})
+        self.assertNotEqual(selected_account_ids[0], selected_account_ids[1])
 
     def test_scheduler_skips_account_in_cooldown(self):
         cooling_id = self.seed_account_with_capabilities("cooling@example.com")
@@ -2289,6 +3359,66 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("allowed_resolutions", api_key_cols)
         self.assertIn("allowed_durations", api_key_cols)
 
+    def test_api_key_lifecycle_columns_exist(self):
+        conn = server.db_conn()
+        api_key_cols = {r["name"] for r in conn.execute("PRAGMA table_info(api_keys)").fetchall()}
+        conn.close()
+
+        self.assertIn("expires_at", api_key_cols)
+        self.assertIn("rotated_from_id", api_key_cols)
+        self.assertIn("rotation_note", api_key_cols)
+
+    def test_expired_api_key_is_rejected(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("expired-key")
+        conn = server.db_conn()
+        conn.execute("UPDATE api_keys SET expires_at=? WHERE key=?", (time.time() - 1, "expired-key"))
+        conn.commit()
+        conn.close()
+
+        native = self.client.post(
+            "/v1/generate",
+            headers={"Authorization": "Bearer expired-key"},
+            json=self.valid_image_request(),
+        )
+        self.assertEqual(native.status_code, 401)
+        self.assertEqual(native.json()["error"]["code"], "UNAUTHORIZED")
+
+        compat = self.client.get("/v1/models", headers={"Authorization": "Bearer expired-key"})
+        self.assertEqual(compat.status_code, 401)
+        self.assertIn("error", compat.json())
+
+    def test_api_key_plaintext_is_only_returned_on_create(self):
+        create_response = self.client.post(
+            "/api/admin/apikeys",
+            headers=self.admin_headers(),
+            json={"name": "lifecycle-key", "expires_at": time.time() + 3600, "rotation_note": "initial issue"},
+        )
+        self.assertEqual(create_response.status_code, 200)
+        created = create_response.json()["item"]
+        key_id = created["id"]
+        self.assertIn("key", created)
+        self.assertTrue(created["key"].startswith("oreate_"))
+        self.assertEqual(created["rotation_note"], "initial issue")
+        self.assertGreater(created["expires_at"], time.time())
+
+        listed = self.client.get("/api/admin/apikeys", headers=self.admin_headers())
+        self.assertEqual(listed.status_code, 200)
+        listed_item = next(item for item in listed.json()["items"] if item["id"] == key_id)
+        self.assertNotIn("key", listed_item)
+        self.assertIn("key_preview", listed_item)
+
+        updated = self.client.patch(
+            f"/api/admin/apikeys/{key_id}",
+            headers=self.admin_headers(),
+            json={"disabled_reason": "rotated", "rotation_note": "replaced by next key"},
+        )
+        self.assertEqual(updated.status_code, 200)
+        updated_item = updated.json()["item"]
+        self.assertNotIn("key", updated_item)
+        self.assertEqual(updated_item["disabled_reason"], "rotated")
+        self.assertEqual(updated_item["rotation_note"], "replaced by next key")
+
     def test_admin_can_update_api_key_scope_policy(self):
         key_id = self.seed_api_key("scoped-policy-key")
 
@@ -2506,6 +3636,301 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(row["actual_point_cost"], 11)
         self.assertEqual(row["success_actual_point_cost"], 8)
         self.assertEqual(row["failed_actual_point_cost"], 3)
+
+    def test_admin_tasks_support_limit_offset_and_status_filter(self):
+        account_id = self.seed_account_with_capabilities("tasks-page@example.com")
+        task_ids = [
+            server.save_task(account_id, "image", "queued task", self.valid_image_request(), {"status": "queued"}, status="queued"),
+            server.save_task(account_id, "video", "failed task", self.valid_video_request(), {"status": "failed"}, status="failed"),
+            server.save_task(account_id, "image", "completed task", self.valid_image_request(), {"status": "completed"}, status="completed"),
+        ]
+
+        page = self.client.get("/api/tasks?limit=2&offset=1", headers=self.admin_headers())
+        self.assertEqual(page.status_code, 200)
+        payload = page.json()
+        self.assertEqual(payload["limit"], 2)
+        self.assertEqual(payload["offset"], 1)
+        self.assertEqual(len(payload["items"]), 2)
+        self.assertEqual([item["id"] for item in payload["items"]], list(reversed(task_ids))[1:3])
+        self.assertFalse(payload["has_more"])
+
+        filtered = self.client.get("/api/tasks?status=failed&limit=10&offset=0", headers=self.admin_headers())
+        self.assertEqual(filtered.status_code, 200)
+        filtered_payload = filtered.json()
+        self.assertEqual(len(filtered_payload["items"]), 1)
+        self.assertEqual(filtered_payload["items"][0]["status"], "failed")
+        self.assertEqual(filtered_payload["items"][0]["id"], task_ids[1])
+
+    def test_admin_tasks_support_full_operational_filters(self):
+        first_account_id = self.seed_account_with_capabilities("tasks-filter-a@example.com")
+        second_account_id = self.seed_account_with_capabilities("tasks-filter-b@example.com")
+        now = time.time()
+        report_date = time.strftime("%Y-%m-%d", time.localtime(now))
+        conn = server.db_conn()
+        conn.execute("INSERT INTO clients(name,contact,status,created_at) VALUES(?,?,?,?)", ("Filter Client A", "", "active", now))
+        first_client_id = conn.execute("SELECT id FROM clients WHERE name='Filter Client A'").fetchone()[0]
+        conn.execute("INSERT INTO clients(name,contact,status,created_at) VALUES(?,?,?,?)", ("Filter Client B", "", "active", now))
+        second_client_id = conn.execute("SELECT id FROM clients WHERE name='Filter Client B'").fetchone()[0]
+        conn.execute("INSERT INTO api_keys(client_id,key,name,enabled,created_at) VALUES(?,?,?,?,?)", (first_client_id, "task-filter-key-a", "task-key-a", 1, now))
+        conn.execute("INSERT INTO api_keys(client_id,key,name,enabled,created_at) VALUES(?,?,?,?,?)", (second_client_id, "task-filter-key-b", "task-key-b", 1, now))
+        first_key_id = conn.execute("SELECT id FROM api_keys WHERE key='task-filter-key-a'").fetchone()[0]
+        second_key_id = conn.execute("SELECT id FROM api_keys WHERE key='task-filter-key-b'").fetchone()[0]
+        conn.commit()
+        conn.close()
+        target_id = server.save_task(
+            first_account_id,
+            "video",
+            "target failed video",
+            self.valid_video_request(),
+            {"status": "failed"},
+            status="failed",
+            api_key_id=first_key_id,
+            model_name="Seedance 2.0 Mini",
+            scene_id="text_or_image",
+            resolution="480",
+            ratio="16:9",
+            duration=5,
+            error_code="UPSTREAM_ERROR",
+        )
+        server.save_task(
+            second_account_id,
+            "image",
+            "other completed image",
+            self.valid_image_request(),
+            {"status": "completed"},
+            status="completed",
+            api_key_id=second_key_id,
+            model_name="Google Nano Banana 2",
+            resolution="4K",
+            ratio="16:9",
+        )
+
+        filtered = self.client.get(
+            "/api/tasks"
+            f"?client_id={first_client_id}&api_key_id={first_key_id}&account_id={first_account_id}"
+            "&kind=video&status=failed&model_name=Seedance+2.0+Mini&scene_id=text_or_image"
+            f"&error_code=UPSTREAM_ERROR&date_from={report_date}&date_to={report_date}&limit=10&offset=0",
+            headers=self.admin_headers(),
+        )
+
+        self.assertEqual(filtered.status_code, 200)
+        payload = filtered.json()
+        self.assertEqual(len(payload["items"]), 1)
+        item = payload["items"][0]
+        self.assertEqual(item["id"], target_id)
+        self.assertEqual(item["account_email"], "tasks-filter-a@example.com")
+        self.assertEqual(item["api_key_name"], "task-key-a")
+        self.assertEqual(item["client_name"], "Filter Client A")
+
+        bad_date = self.client.get("/api/tasks?date_from=not-a-date", headers=self.admin_headers())
+        self.assertEqual(bad_date.status_code, 400)
+
+    def test_gateway_tasks_support_limit_offset_and_status_filter(self):
+        self.seed_account_with_capabilities("tenant-a@example.com")
+        self.seed_api_key("tenant-a-key")
+        self.seed_account_with_capabilities("tenant-b@example.com")
+        self.seed_api_key("tenant-b-key")
+        conn = server.db_conn()
+        tenant_a_id = conn.execute("SELECT id FROM api_keys WHERE key=?", ("tenant-a-key",)).fetchone()[0]
+        tenant_b_id = conn.execute("SELECT id FROM api_keys WHERE key=?", ("tenant-b-key",)).fetchone()[0]
+        conn.close()
+        first = server.save_task(1, "image", "tenant-a queued", self.valid_image_request(), {"status": "queued"}, status="queued", api_key_id=tenant_a_id)
+        second = server.save_task(1, "video", "tenant-a failed", self.valid_video_request(), {"status": "failed"}, status="failed", api_key_id=tenant_a_id)
+        server.save_task(1, "image", "tenant-b completed", self.valid_image_request(), {"status": "completed"}, status="completed", api_key_id=tenant_b_id)
+
+        page = self.client.get("/v1/tasks?limit=1&offset=0", headers={"Authorization": "Bearer tenant-a-key"})
+        self.assertEqual(page.status_code, 200)
+        payload = page.json()
+        self.assertEqual(payload["limit"], 1)
+        self.assertEqual(payload["offset"], 0)
+        self.assertEqual(len(payload["items"]), 1)
+        self.assertEqual(payload["items"][0]["id"], second)
+        self.assertTrue(payload["has_more"])
+
+        filtered = self.client.get("/v1/tasks?status=queued&kind=image&limit=10&offset=0", headers={"Authorization": "Bearer tenant-a-key"})
+        self.assertEqual(filtered.status_code, 200)
+        filtered_payload = filtered.json()
+        self.assertEqual(len(filtered_payload["items"]), 1)
+        self.assertEqual(filtered_payload["items"][0]["id"], first)
+        self.assertEqual(filtered_payload["items"][0]["status"], "queued")
+
+        invalid = self.client.get("/v1/tasks?limit=0", headers={"Authorization": "Bearer tenant-a-key"})
+        self.assertEqual(invalid.status_code, 422)
+
+    def test_admin_usage_supports_limit_offset_and_filters(self):
+        first_account_id = self.seed_account_with_capabilities("usage-a@example.com")
+        second_account_id = self.seed_account_with_capabilities("usage-b@example.com")
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute("INSERT INTO api_keys(key,name,enabled,created_at) VALUES(?,?,1,?)", ("usage-key-a", "usage-a", now))
+        conn.execute("INSERT INTO api_keys(key,name,enabled,created_at) VALUES(?,?,1,?)", ("usage-key-b", "usage-b", now))
+        key_a_id = conn.execute("SELECT id FROM api_keys WHERE key='usage-key-a'").fetchone()[0]
+        key_b_id = conn.execute("SELECT id FROM api_keys WHERE key='usage-key-b'").fetchone()[0]
+        conn.executemany(
+            """
+            INSERT INTO usage_log(
+                api_key_id,task_id,kind,account_id,prompt,status,response_summary,actual_point_cost,
+                request_id,idempotency_key,model_name,resolution,ratio,duration,scene_id,
+                estimated_point_cost,error_code,status_code,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            [
+                (key_a_id, None, "image", first_account_id, "usage-1", "queued", "", 0, "req-1", "", "Provider Image", "1K", "1:1", None, "", 5, "", 202, now - 3),
+                (key_b_id, None, "video", second_account_id, "usage-2", "failed", "", 2, "req-2", "", "Provider Video", "720", "16:9", 5, "text_or_image", 10, "UPSTREAM_ERROR", 503, now - 2),
+                (key_a_id, None, "video", first_account_id, "usage-3", "completed", "", 8, "req-3", "", "Provider Video", "720", "16:9", 5, "text_or_image", 10, "", 200, now - 1),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        page = self.client.get("/api/admin/usage?limit=2&offset=1", headers=self.admin_headers())
+        self.assertEqual(page.status_code, 200)
+        payload = page.json()
+        self.assertEqual(payload["limit"], 2)
+        self.assertEqual(payload["offset"], 1)
+        self.assertEqual(len(payload["items"]), 2)
+        self.assertTrue(payload["has_more"] is False)
+        self.assertEqual([item["request_id"] for item in payload["items"]], ["req-2", "req-1"])
+
+        filtered = self.client.get(
+            f"/api/admin/usage?api_key_id={key_a_id}&account_id={first_account_id}&kind=video&status=completed&limit=10&offset=0",
+            headers=self.admin_headers(),
+        )
+        self.assertEqual(filtered.status_code, 200)
+        filtered_payload = filtered.json()
+        self.assertEqual(len(filtered_payload["items"]), 1)
+        self.assertEqual(filtered_payload["items"][0]["request_id"], "req-3")
+        self.assertEqual(filtered_payload["items"][0]["account_email"], "usage-a@example.com")
+
+        bad_limit = self.client.get("/api/admin/usage?limit=201", headers=self.admin_headers())
+        self.assertEqual(bad_limit.status_code, 422)
+        bad_offset = self.client.get("/api/admin/usage?offset=10001", headers=self.admin_headers())
+        self.assertEqual(bad_offset.status_code, 422)
+        bad_kind = self.client.get("/api/admin/usage?kind=nope", headers=self.admin_headers())
+        self.assertEqual(bad_kind.status_code, 422)
+
+    def test_admin_usage_supports_full_operational_filters(self):
+        account_id = self.seed_account_with_capabilities("usage-filter@example.com")
+        other_account_id = self.seed_account_with_capabilities("usage-filter-other@example.com")
+        now = time.time()
+        report_date = time.strftime("%Y-%m-%d", time.localtime(now))
+        conn = server.db_conn()
+        conn.execute("INSERT INTO clients(name,contact,status,created_at) VALUES(?,?,?,?)", ("Usage Client", "", "active", now))
+        client_id = conn.execute("SELECT id FROM clients WHERE name='Usage Client'").fetchone()[0]
+        conn.execute("INSERT INTO clients(name,contact,status,created_at) VALUES(?,?,?,?)", ("Other Usage Client", "", "active", now))
+        other_client_id = conn.execute("SELECT id FROM clients WHERE name='Other Usage Client'").fetchone()[0]
+        conn.execute("INSERT INTO api_keys(client_id,key,name,enabled,created_at) VALUES(?,?,?,?,?)", (client_id, "usage-filter-key", "usage-filter-key", 1, now))
+        conn.execute("INSERT INTO api_keys(client_id,key,name,enabled,created_at) VALUES(?,?,?,?,?)", (other_client_id, "usage-filter-other-key", "usage-filter-other-key", 1, now))
+        api_key_id = conn.execute("SELECT id FROM api_keys WHERE key='usage-filter-key'").fetchone()[0]
+        other_api_key_id = conn.execute("SELECT id FROM api_keys WHERE key='usage-filter-other-key'").fetchone()[0]
+        conn.executemany(
+            """
+            INSERT INTO usage_log(
+                api_key_id,task_id,kind,account_id,prompt,status,response_summary,actual_point_cost,
+                request_id,idempotency_key,model_name,resolution,ratio,duration,scene_id,
+                estimated_point_cost,error_code,status_code,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            [
+                (api_key_id, None, "video", account_id, "target", "failed", "", 3, "usage-target", "", "Seedance 2.0 Mini", "480", "16:9", 5, "text_or_image", 10, "UPSTREAM_ERROR", 503, now),
+                (other_api_key_id, None, "image", other_account_id, "other", "completed", "", 0, "usage-other", "", "Google Nano Banana 2", "4K", "16:9", None, "", 12, "", 200, now),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        filtered = self.client.get(
+            "/api/admin/usage"
+            f"?client_id={client_id}&api_key_id={api_key_id}&account_id={account_id}"
+            "&kind=video&status=failed&model_name=Seedance+2.0+Mini&error_code=UPSTREAM_ERROR"
+            f"&date_from={report_date}&date_to={report_date}&limit=10&offset=0",
+            headers=self.admin_headers(),
+        )
+
+        self.assertEqual(filtered.status_code, 200)
+        payload = filtered.json()
+        self.assertEqual(len(payload["items"]), 1)
+        item = payload["items"][0]
+        self.assertEqual(item["request_id"], "usage-target")
+        self.assertEqual(item["account_email"], "usage-filter@example.com")
+        self.assertEqual(item["api_key_name"], "usage-filter-key")
+        self.assertEqual(item["client_name"], "Usage Client")
+
+        bad_date = self.client.get("/api/admin/usage?date_to=bad-date", headers=self.admin_headers())
+        self.assertEqual(bad_date.status_code, 400)
+
+    def test_admin_uploads_support_listing_filters_and_sanitized_attachments(self):
+        account_id = self.seed_account_with_capabilities("upload-admin@example.com")
+        other_account_id = self.seed_account_with_capabilities("upload-admin-other@example.com")
+        now = time.time()
+        report_date = time.strftime("%Y-%m-%d", time.localtime(now))
+        conn = server.db_conn()
+        conn.execute("INSERT INTO clients(name,contact,status,created_at) VALUES(?,?,?,?)", ("Upload Client", "", "active", now))
+        client_id = conn.execute("SELECT id FROM clients WHERE name='Upload Client'").fetchone()[0]
+        conn.execute("INSERT INTO api_keys(client_id,key,name,enabled,created_at) VALUES(?,?,?,?,?)", (client_id, "upload-admin-key", "upload-admin-key", 1, now))
+        conn.execute("INSERT INTO api_keys(key,name,enabled,created_at) VALUES(?,?,1,?)", ("upload-admin-other-key", "upload-admin-other-key", now))
+        api_key_id = conn.execute("SELECT id FROM api_keys WHERE key='upload-admin-key'").fetchone()[0]
+        other_api_key_id = conn.execute("SELECT id FROM api_keys WHERE key='upload-admin-other-key'").fetchone()[0]
+        conn.commit()
+        conn.close()
+        attachment = {
+            "fileName": "admin-upload",
+            "fileExt": "png",
+            "contentType": "image/png",
+            "originSize": 1234,
+            "object": "uploads/admin-upload.png",
+            "status": "completed",
+            "sessionkey": "temporary-upload-session",
+            "cookies": {"OUID": "upload-ouid", "ouss": "upload-ouss"},
+        }
+        server.save_uploaded_media_record(api_key_id, account_id, attachment)
+        server.save_uploaded_media_record(
+            other_api_key_id,
+            other_account_id,
+            {
+                "fileName": "other-upload",
+                "fileExt": "mp4",
+                "contentType": "video/mp4",
+                "originSize": 4567,
+                "object": "uploads/other-upload.mp4",
+                "status": "completed",
+            },
+        )
+        server.save_task(
+            account_id,
+            "video",
+            "uses upload",
+            {**self.valid_video_request(), "image": attachment},
+            {"status": "queued"},
+            status="queued",
+            api_key_id=api_key_id,
+            scene_id="text_or_image",
+        )
+
+        filtered = self.client.get(
+            "/api/admin/uploads"
+            f"?api_key_id={api_key_id}&account_id={account_id}&kind=image&status=completed"
+            f"&date_from={report_date}&date_to={report_date}&limit=10&offset=0",
+            headers=self.admin_headers(),
+        )
+
+        self.assertEqual(filtered.status_code, 200)
+        payload = filtered.json()
+        self.assertEqual(len(payload["items"]), 1)
+        item = payload["items"][0]
+        self.assertEqual(item["object_path"], "uploads/admin-upload.png")
+        self.assertEqual(item["kind"], "image")
+        self.assertEqual(item["account_email"], "upload-admin@example.com")
+        self.assertEqual(item["api_key_name"], "upload-admin-key")
+        self.assertEqual(item["client_name"], "Upload Client")
+        self.assertEqual(item["related_task_count"], 1)
+        body_text = json.dumps(item, ensure_ascii=False)
+        self.assertNotIn("temporary-upload-session", body_text)
+        self.assertNotIn("upload-ouid", body_text)
+        self.assertNotIn("upload-ouss", body_text)
+
+        bad_kind = self.client.get("/api/admin/uploads?kind=archive", headers=self.admin_headers())
+        self.assertEqual(bad_kind.status_code, 422)
 
     def test_admin_can_patch_scene_policy_and_reflect_in_capabilities(self):
         self.seed_account_with_capabilities()

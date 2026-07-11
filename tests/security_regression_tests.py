@@ -77,6 +77,121 @@ class SecurityRegressionTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 500)
 
+    def test_readyz_rejects_placeholder_admin_password(self):
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {"server": {"admin_username": "admin", "admin_password": "CHANGE_ME"}},
+        )
+        try:
+            response = self.client.get("/readyz")
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("administrator", response.json()["detail"])
+
+    def test_readyz_requires_encryption_key_when_account_secrets_exist(self):
+        server.save_account(
+            "encrypted@example.com",
+            "plain-password",
+            server.OreateSession(
+                email="encrypted@example.com",
+                password="plain-password",
+                cookies={"OUID": "encrypted-ouid", "ouss": "encrypted-ouss"},
+            ),
+            model_info={},
+            video_info={},
+            status="verified",
+            source="manual",
+        )
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(original_cfg, {"server": {"encryption_key": ""}})
+        try:
+            with patch.dict(server.os.environ, {"OREATE_ENCRYPTION_KEY": ""}):
+                response = self.client.get("/readyz")
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("encryption key", response.json()["detail"])
+
+    def test_readyz_sanitizes_database_failures(self):
+        with patch.object(server, "db_conn", side_effect=RuntimeError("accounts.db is locked at C:/secret/path")):
+            response = self.client.get("/readyz")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "database not ready")
+        self.assertNotIn("secret/path", response.text)
+
+    def test_readyz_rejects_plaintext_account_secrets(self):
+        self.seed_account()
+
+        response = self.client.get("/readyz")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("plaintext account secrets", response.json()["detail"])
+
+    def test_readyz_rejects_public_bind_without_explicit_proxy_tls_acknowledgement(self):
+        account_id = self.seed_account()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET model_info_json=?, video_info_json=? WHERE id=?",
+            (json.dumps(self.sample_image_info()), json.dumps(self.sample_video_info()), account_id),
+        )
+        conn.commit()
+        conn.close()
+        server.init_db()
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "server": {"host": "0.0.0.0"},
+                "deployment": {
+                    "allow_public_bind": False,
+                    "trust_reverse_proxy": False,
+                    "tls_terminated_by_proxy": False,
+                },
+            },
+        )
+        try:
+            response = self.client.get("/readyz")
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("public bind", response.json()["detail"])
+
+    def test_readyz_allows_public_bind_with_explicit_proxy_tls_acknowledgement(self):
+        account_id = self.seed_account()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET model_info_json=?, video_info_json=? WHERE id=?",
+            (json.dumps(self.sample_image_info()), json.dumps(self.sample_video_info()), account_id),
+        )
+        conn.commit()
+        conn.close()
+        server.init_db()
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "server": {"host": "0.0.0.0"},
+                "deployment": {
+                    "allow_public_bind": True,
+                    "trust_reverse_proxy": True,
+                    "tls_terminated_by_proxy": True,
+                },
+            },
+        )
+        try:
+            response = self.client.get("/readyz")
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ready")
+
     def seed_account(self):
         now = time.time()
         conn = server.db_conn()
@@ -738,6 +853,28 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertIn("hydrateTask", html)
         self.assertIn("task-preview", html)
         self.assertNotIn("s-admin-pwd", html)
+
+    def test_admin_html_escapes_untrusted_usage_account_and_client_values(self):
+        html = server.ADMIN_HTML
+
+        self.assertIn("${escapeHtml((u.prompt||'').substring(0,40))}", html)
+        self.assertIn("${escapeHtml(u.account_email||u.account_id||'-')}", html)
+        self.assertIn("${escapeHtml(u.model_name||'-')}", html)
+        self.assertIn("${escapeHtml(em)}", html)
+        self.assertIn("data-copy-value=\"${escapeHtml(em)}\"", html)
+        self.assertIn("${escapeHtml(c.name||'-')}", html)
+        self.assertIn("${escapeHtml(c.contact||'-')}", html)
+        self.assertNotIn("${(u.prompt||'').substring(0,40)}", html)
+
+    def test_admin_page_sets_defensive_browser_headers(self):
+        response = self.client.get("/admin")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(response.headers["x-frame-options"], "DENY")
+        csp = response.headers["content-security-policy"]
+        self.assertIn("object-src 'none'", csp)
+        self.assertIn("frame-ancestors 'none'", csp)
 
 
 if __name__ == "__main__":

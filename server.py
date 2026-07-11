@@ -3,6 +3,7 @@ import io
 import base64
 import hashlib
 import json
+import math
 import os
 import secrets
 import sqlite3
@@ -24,15 +25,35 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from banti_token_generator import generate_banti_artifacts, generate_jt_token
+from gateway.openai_compat import (
+    OpenAICompatError,
+    decode_video_id,
+    image_size_to_ratio,
+    openai_error_payload,
+    openai_model_list,
+    openai_model_name_for_provider,
+    resolve_openai_model,
+    split_input_reference_attachments,
+    task_to_video_object,
+    video_size_to_ratio,
+    video_size_to_resolution,
+)
+from gateway.runtime import (
+    SingleWorkerLock,
+    validate_single_worker_configuration,
+    worker_lock_path,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 DB_PATH = BASE_DIR / "accounts.db"
+MIGRATIONS_DIR = BASE_DIR / "migrations"
 SECRET_PLACEHOLDER = "__redacted__"
 ENCRYPTED_SECRET_PREFIX = "enc:v1:"
 ACCOUNT_SECRET_FIELDS = ("password", "ouid", "ouss")
@@ -47,9 +68,21 @@ API_KEY_SCOPE_BOOL_DEFAULTS = {
     "allow_uploads": True,
     "allow_experimental": True,
 }
+API_LIST_KINDS = {"image", "video", "upload"}
+MEDIA_ADMIN_KINDS = {"image", "video"}
+IMAGE_UPLOAD_EXTENSIONS = {"jpg", "jpeg", "png", "bmp", "webp"}
+VIDEO_UPLOAD_EXTENSIONS = {"mp4", "mov"}
+TASK_LIST_STATUSES = {"queued", "running", "submitted", "hydrating", "completed", "failed", "cancelled", "expired"}
+MAX_LIST_LIMIT = 200
+MAX_LIST_OFFSET = 10000
 UNSAFE_ADMIN_PASSWORDS = {"", "admin123", "CHANGE_ME", "changeme", "password"}
 
 DEFAULT_CONFIG = {
+    "database": {
+        "busy_timeout_ms": 5000,
+        "journal_mode": "WAL",
+        "synchronous": "NORMAL",
+    },
     "server": {
         "host": "127.0.0.1",
         "port": 8890,
@@ -57,6 +90,11 @@ DEFAULT_CONFIG = {
         "admin_password": "",
         "encryption_key": "",
         "admin_session_ttl_hours": 12,
+    },
+    "deployment": {
+        "allow_public_bind": False,
+        "trust_reverse_proxy": False,
+        "tls_terminated_by_proxy": False,
     },
     "oreate": {
         "base_url": "https://www.oreateai.com",
@@ -93,11 +131,18 @@ DEFAULT_CONFIG = {
         "default_daily_request_limit": 0,
         "default_daily_point_limit": 0,
         "idempotency_ttl_hours": 24,
+        "idempotency_key_max_length": 255,
         "account_cooldown_seconds": 300,
         "prompt_max_length": 4000,
+        "request_id_max_length": 128,
+        "upload_max_bytes": 104857600,
+        "upload_read_chunk_bytes": 1048576,
         "sync_wait_seconds": 0,
+        "sync_wait_max_seconds": 120,
         "enable_background_worker": True,
         "task_worker_poll_interval_seconds": 1,
+        "worker_shutdown_timeout_seconds": 30,
+        "running_task_stale_seconds": 300,
         "task_hydration_attempt_timeout_seconds": 0,
         "submitted_task_retry_interval_seconds": 10,
         "hydrating_task_retry_interval_seconds": 10,
@@ -130,6 +175,13 @@ DEFAULT_CONFIG = {
             },
         },
         "model_policies": {},
+    },
+    "openai_compat": {
+        "image_sync_timeout_seconds": 120,
+        "max_sync_timeout_seconds": 120,
+        "image_model_aliases": {},
+        "video_model_aliases": {},
+        "asset_host_allowlist": ["cdn.oreateai.com"],
     },
 }
 
@@ -214,8 +266,20 @@ def gateway_cfg() -> Dict[str, Any]:
     return CFG.get("gateway", {}) if isinstance(CFG.get("gateway", {}), dict) else {}
 
 
+def database_cfg() -> Dict[str, Any]:
+    return CFG.get("database", {}) if isinstance(CFG.get("database", {}), dict) else {}
+
+
 def oreate_cfg() -> Dict[str, Any]:
     return CFG.get("oreate", {}) if isinstance(CFG.get("oreate", {}), dict) else {}
+
+
+def deployment_cfg() -> Dict[str, Any]:
+    return CFG.get("deployment", {}) if isinstance(CFG.get("deployment", {}), dict) else {}
+
+
+def openai_compat_cfg() -> Dict[str, Any]:
+    return CFG.get("openai_compat", {}) if isinstance(CFG.get("openai_compat", {}), dict) else {}
 
 
 def tls_verify_enabled() -> bool:
@@ -322,7 +386,15 @@ def public_api_key(row: sqlite3.Row, reveal: bool = False) -> Dict[str, Any]:
     key = item.get("key", "")
     item["key_preview"] = f"{key[:16]}..." if key else ""
     item["deleted"] = bool(item.get("deleted_at"))
-    item["status"] = "deleted" if item["deleted"] else ("enabled" if item.get("enabled") else "disabled")
+    expired = item.get("expires_at") not in (None, "") and float_or_default(item.get("expires_at"), 0) <= time.time()
+    if item["deleted"]:
+        item["status"] = "deleted"
+    elif not item.get("enabled"):
+        item["status"] = "disabled"
+    elif expired:
+        item["status"] = "expired"
+    else:
+        item["status"] = "enabled"
     if item.get("client_name") is None and item.get("client_id") is not None:
         item["client_name"] = ""
     item["client_name"] = item.get("client_name") or ""
@@ -1241,6 +1313,79 @@ def normalize_upload_attachment(value: Any) -> Dict[str, Any]:
     return normalized
 
 
+def parse_mp4_video_metadata(data: bytes) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    if len(data) < 8:
+        return metadata
+
+    def read_uint(offset: int, size: int) -> Optional[int]:
+        if offset < 0 or offset + size > len(data):
+            return None
+        return int.from_bytes(data[offset:offset + size], "big")
+
+    def fixed_16_16(offset: int) -> Optional[int]:
+        raw = read_uint(offset, 4)
+        if raw is None:
+            return None
+        value = raw / 65536
+        return int(round(value)) if value > 0 else None
+
+    containers = {"moov", "trak", "mdia", "minf", "stbl", "edts", "udta"}
+    stack: List[Tuple[int, int]] = [(0, len(data))]
+    while stack:
+        start, end = stack.pop()
+        pos = start
+        while pos + 8 <= end:
+            box_size = read_uint(pos, 4)
+            if box_size is None:
+                break
+            try:
+                box_type = data[pos + 4:pos + 8].decode("latin1")
+            except Exception:
+                break
+            header_size = 8
+            if box_size == 1:
+                large_size = read_uint(pos + 8, 8)
+                if large_size is None:
+                    break
+                box_size = large_size
+                header_size = 16
+            elif box_size == 0:
+                box_size = end - pos
+            if box_size < header_size:
+                break
+            content_start = pos + header_size
+            box_end = pos + box_size
+            if box_end > end or box_end <= pos:
+                break
+
+            if box_type == "mvhd" and "videoDurationSec" not in metadata and content_start + 20 <= box_end:
+                version = data[content_start]
+                if version == 0:
+                    timescale = read_uint(content_start + 12, 4)
+                    duration = read_uint(content_start + 16, 4)
+                elif version == 1 and content_start + 32 <= box_end:
+                    timescale = read_uint(content_start + 20, 4)
+                    duration = read_uint(content_start + 24, 8)
+                else:
+                    timescale = None
+                    duration = None
+                if timescale and duration:
+                    metadata["videoDurationSec"] = round(duration / timescale, 3)
+            elif box_type == "tkhd":
+                version = data[content_start] if content_start < box_end else 0
+                size_offset = content_start + (88 if version == 1 else 76)
+                width = fixed_16_16(size_offset)
+                height = fixed_16_16(size_offset + 4)
+                if width and height:
+                    metadata["videoWidth"] = max(int(metadata.get("videoWidth") or 0), width)
+                    metadata["videoHeight"] = max(int(metadata.get("videoHeight") or 0), height)
+            elif box_type in containers:
+                stack.append((content_start, box_end))
+            pos = box_end
+    return metadata
+
+
 def first_upload_key_entry(key_list: Any) -> Dict[str, Any]:
     if isinstance(key_list, list) and key_list:
         first = key_list[0]
@@ -1317,6 +1462,18 @@ def should_send_model_option(model: Optional[Dict[str, Any]], field: str) -> boo
     return values is None or bool(values)
 
 
+def should_send_video_model_option(scene_id: str, model: Optional[Dict[str, Any]], field: str) -> bool:
+    if scene_id == "motion" and field in {"ratios", "durations"}:
+        return False
+    return should_send_model_option(model, field)
+
+
+def video_audio_enabled_for_scene(scene_id: str, options: Dict[str, Any], model: Optional[Dict[str, Any]]) -> bool:
+    if scene_id == "motion":
+        return False
+    return bool(options.get("is_audio")) if (not isinstance(model, dict) or model.get("supports_audio")) else False
+
+
 def build_video_message_attachments(options: Dict[str, Any]) -> List[Dict[str, Any]]:
     scene_id = options.get("scene_id") or CFG["oreate"]["default_video_scene"]
     raw: List[Dict[str, Any]] = []
@@ -1345,12 +1502,12 @@ def build_video_config(options: Dict[str, Any], model: Optional[Dict[str, Any]] 
     scene_id = options.get("scene_id") or CFG["oreate"]["default_video_scene"]
     config: Dict[str, Any] = {
         "modelName": options.get("model_name") or "",
-        "ratio": (options.get("ratio") or "") if should_send_model_option(model, "ratios") else "",
-        "resolution": str(options.get("resolution") or "") if should_send_model_option(model, "resolutions") else "",
-        "isAudio": bool(options.get("is_audio")) if (not isinstance(model, dict) or model.get("supports_audio")) else False,
+        "ratio": (options.get("ratio") or "") if should_send_video_model_option(scene_id, model, "ratios") else "",
+        "resolution": str(options.get("resolution") or "") if should_send_video_model_option(scene_id, model, "resolutions") else "",
+        "isAudio": video_audio_enabled_for_scene(scene_id, options, model),
         "scene": scene_id,
     }
-    if should_send_model_option(model, "durations"):
+    if should_send_video_model_option(scene_id, model, "durations"):
         config["duration"] = options.get("duration") or CFG["oreate"]["default_video_duration"]
     ai_type = resolve_video_ai_type(options, model)
     config["aiType"] = ai_type if ai_type is not None else 0
@@ -1565,17 +1722,96 @@ def find_idempotency_record(api_key_id: int, idempotency_key: str) -> Optional[s
     return row
 
 
-def save_idempotency_record(api_key_id: int, idempotency_key: str, request_hash: str, status_code: int, response: Dict[str, Any], task_id: Optional[int]) -> None:
+def reserve_idempotency_record(
+    api_key_id: int,
+    idempotency_key: str,
+    request_hash: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    if not idempotency_key:
+        return {"state": "disabled", "record": None}
+    current = time.time() if now is None else float(now)
+    ttl_hours = max(0.0, float_or_default(gateway_cfg().get("idempotency_ttl_hours"), 24.0))
+    cutoff = current - (ttl_hours * 3600.0)
+    conn = db_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if ttl_hours > 0:
+            conn.execute(
+                "DELETE FROM idempotency_keys WHERE api_key_id=? AND idempotency_key=? AND created_at<?",
+                (api_key_id, idempotency_key, cutoff),
+            )
+        row = conn.execute(
+            "SELECT * FROM idempotency_keys WHERE api_key_id=? AND idempotency_key=?",
+            (api_key_id, idempotency_key),
+        ).fetchone()
+        if row:
+            record = dict(row)
+            if record.get("request_hash") != request_hash:
+                state = "conflict"
+            elif int(record.get("status_code") or 0) > 0:
+                state = "replay"
+            else:
+                state = "pending"
+            conn.commit()
+            return {"state": state, "record": record}
+        conn.execute(
+            """
+            INSERT INTO idempotency_keys(
+                api_key_id,idempotency_key,request_hash,status_code,response_json,task_id,created_at
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (api_key_id, idempotency_key, request_hash, 0, "{}", None, current),
+        )
+        row = conn.execute(
+            "SELECT * FROM idempotency_keys WHERE api_key_id=? AND idempotency_key=?",
+            (api_key_id, idempotency_key),
+        ).fetchone()
+        conn.commit()
+        return {"state": "reserved", "record": dict(row) if row else None}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def release_idempotency_reservation(api_key_id: int, idempotency_key: str, request_hash: str) -> None:
     if not idempotency_key:
         return
     conn = db_conn()
     conn.execute(
         """
-        INSERT OR IGNORE INTO idempotency_keys(api_key_id,idempotency_key,request_hash,status_code,response_json,task_id,created_at)
-        VALUES(?,?,?,?,?,?,?)
+        DELETE FROM idempotency_keys
+        WHERE api_key_id=? AND idempotency_key=? AND request_hash=? AND status_code=0
         """,
-        (api_key_id, idempotency_key, request_hash, status_code, json.dumps(response, ensure_ascii=False), task_id, time.time()),
+        (api_key_id, idempotency_key, request_hash),
     )
+    conn.commit()
+    conn.close()
+
+
+def save_idempotency_record(api_key_id: int, idempotency_key: str, request_hash: str, status_code: int, response: Dict[str, Any], task_id: Optional[int]) -> None:
+    if not idempotency_key:
+        return
+    conn = db_conn()
+    result = conn.execute(
+        """
+        UPDATE idempotency_keys
+        SET status_code=?, response_json=?, task_id=?
+        WHERE api_key_id=? AND idempotency_key=? AND request_hash=?
+        """,
+        (status_code, json.dumps(response, ensure_ascii=False), task_id, api_key_id, idempotency_key, request_hash),
+    )
+    if result.rowcount == 0:
+        conn.execute(
+            """
+            INSERT INTO idempotency_keys(api_key_id,idempotency_key,request_hash,status_code,response_json,task_id,created_at)
+            VALUES(?,?,?,?,?,?,?)
+            """,
+            (api_key_id, idempotency_key, request_hash, status_code, json.dumps(response, ensure_ascii=False), task_id, time.time()),
+        )
     conn.commit()
     conn.close()
 
@@ -1592,9 +1828,21 @@ def get_api_key_record(api_key_id: int) -> sqlite3.Row:
 def resolve_api_key_policy(row: sqlite3.Row) -> Dict[str, Any]:
     gateway_cfg = CFG.get("gateway", {})
     return {
-        "rate_limit_per_minute": int(row["rate_limit_per_minute"] or gateway_cfg.get("default_rate_limit_per_minute") or 0),
-        "daily_request_limit": int(row["daily_request_limit"] or gateway_cfg.get("default_daily_request_limit") or 0),
-        "daily_point_limit": int(row["daily_point_limit"] or gateway_cfg.get("default_daily_point_limit") or 0),
+        "rate_limit_per_minute": int(
+            row["rate_limit_per_minute"]
+            if row["rate_limit_per_minute"] is not None
+            else gateway_cfg.get("default_rate_limit_per_minute") or 0
+        ),
+        "daily_request_limit": int(
+            row["daily_request_limit"]
+            if row["daily_request_limit"] is not None
+            else gateway_cfg.get("default_daily_request_limit") or 0
+        ),
+        "daily_point_limit": int(
+            row["daily_point_limit"]
+            if row["daily_point_limit"] is not None
+            else gateway_cfg.get("default_daily_point_limit") or 0
+        ),
         "allowed_kinds": scope_values_from_db(row["allowed_kinds"], "allowed_kinds"),
         "allowed_models": scope_values_from_db(row["allowed_models"], "allowed_models"),
         "allowed_scenes": scope_values_from_db(row["allowed_scenes"], "allowed_scenes"),
@@ -1657,19 +1905,20 @@ def check_rate_limit(api_key_id: int, policy: Dict[str, int], now: float, reques
     limit = policy.get("rate_limit_per_minute") or 0
     if limit <= 0:
         return
-    window_start = now - 60
-    bucket = [t for t in RATE_BUCKETS.get(api_key_id, []) if t >= window_start]
-    if len(bucket) >= limit:
+    with RATE_BUCKETS_LOCK:
+        window_start = now - 60
+        bucket = [t for t in RATE_BUCKETS.get(api_key_id, []) if t >= window_start]
+        if len(bucket) >= limit:
+            RATE_BUCKETS[api_key_id] = bucket
+            raise GatewayAPIError(
+                429,
+                "RATE_LIMITED",
+                "API key rate limit exceeded",
+                {"rate_limit_per_minute": limit},
+                request_id=request_id,
+            )
+        bucket.append(now)
         RATE_BUCKETS[api_key_id] = bucket
-        raise GatewayAPIError(
-            429,
-            "RATE_LIMITED",
-            "API key rate limit exceeded",
-            {"rate_limit_per_minute": limit},
-            request_id=request_id,
-        )
-    bucket.append(now)
-    RATE_BUCKETS[api_key_id] = bucket
 
 
 def day_start_timestamp(now: float) -> float:
@@ -1712,21 +1961,30 @@ def check_daily_quota(api_key_id: int, estimated_point_cost: Optional[int], poli
 
 def candidate_accounts_for_generation(kind: str, requested_account_id: Optional[int] = None) -> List[sqlite3.Row]:
     now = time.time()
-    capability_clause = "model_info_json IS NOT NULL AND model_info_json != ''" if kind == "image" else "video_info_json IS NOT NULL AND video_info_json != ''"
+    capability_clause = "a.model_info_json IS NOT NULL AND a.model_info_json != ''" if kind == "image" else "a.video_info_json IS NOT NULL AND a.video_info_json != ''"
     params: List[Any] = [now]
     account_clause = ""
     if requested_account_id:
-        account_clause = "AND id=?"
+        account_clause = "AND a.id=?"
         params.append(requested_account_id)
     conn = db_conn()
     rows = conn.execute(
         f"""
-        SELECT * FROM accounts
-        WHERE status IN ('verified', 'active')
+        SELECT a.* FROM accounts AS a
+        WHERE a.status IN ('verified', 'active')
           AND ({capability_clause})
-          AND (cooldown_until IS NULL OR cooldown_until <= ?)
+          AND (a.cooldown_until IS NULL OR a.cooldown_until <= ?)
           {account_clause}
-        ORDER BY COALESCE(failure_count, 0) ASC, COALESCE(last_used_at, 0) ASC, updated_at DESC, id ASC
+        ORDER BY (
+            SELECT COUNT(*)
+            FROM tasks AS t
+            WHERE t.account_id=a.id
+              AND t.status IN ('queued', 'running', 'submitted', 'hydrating')
+        ) ASC,
+        COALESCE(a.failure_count, 0) ASC,
+        COALESCE(a.last_used_at, 0) ASC,
+        a.updated_at DESC,
+        a.id ASC
         """,
         tuple(params),
     ).fetchall()
@@ -1831,15 +2089,22 @@ CFG = load_config()
 ADMIN_TOKENS: Dict[str, str] = {}
 WS_CLIENTS: List[WebSocket] = []
 RATE_BUCKETS: Dict[int, List[float]] = {}
+RATE_BUCKETS_LOCK = threading.Lock()
+REQUEST_ADMISSION_LOCK = threading.Lock()
 TASK_WORKER_LOCK = threading.Lock()
 TASK_WORKER_THREAD: Optional[threading.Thread] = None
 TASK_WORKER_STOP = threading.Event()
 TASK_WORKER_WAKE = threading.Event()
+APPLICATION_WORKER_LOCK: Optional[SingleWorkerLock] = None
+APP_LIFECYCLE_STARTED = False
 
 
 def db_conn():
-    conn = sqlite3.connect(DB_PATH)
+    busy_timeout_ms = max(0, int_or_default(database_cfg().get("busy_timeout_ms"), 5000))
+    conn = sqlite3.connect(DB_PATH, timeout=max(0.001, busy_timeout_ms / 1000.0))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     return conn
 
 
@@ -1849,8 +2114,55 @@ def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, def
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+def apply_sql_migrations(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at REAL NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    if not MIGRATIONS_DIR.exists():
+        return
+    for migration_path in sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9]_*.sql")):
+        version_text, separator, name = migration_path.stem.partition("_")
+        if not separator or not version_text.isdigit() or not name:
+            continue
+        version = int(version_text)
+        applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=?",
+            (version,),
+        ).fetchone()
+        if applied:
+            continue
+        statements = [statement.strip() for statement in migration_path.read_text(encoding="utf-8").split(";") if statement.strip()]
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for statement in statements:
+                conn.execute(statement)
+            conn.execute(
+                "INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+                (version, name, time.time()),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def init_db():
     conn = db_conn()
+    journal_mode = str(database_cfg().get("journal_mode") or "WAL").strip().upper()
+    if journal_mode not in {"WAL", "DELETE"}:
+        journal_mode = "WAL"
+    synchronous = str(database_cfg().get("synchronous") or "NORMAL").strip().upper()
+    if synchronous not in {"OFF", "NORMAL", "FULL", "EXTRA"}:
+        synchronous = "NORMAL"
+    conn.execute(f"PRAGMA journal_mode={journal_mode}")
+    conn.execute(f"PRAGMA synchronous={synchronous}")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS accounts (
@@ -1957,8 +2269,12 @@ def init_db():
             allowed_durations TEXT,
             deleted_at REAL,
             disabled_reason TEXT,
+            expires_at REAL,
+            rotated_from_id INTEGER,
+            rotation_note TEXT,
             created_at REAL NOT NULL,
-            last_used_at REAL
+            last_used_at REAL,
+            FOREIGN KEY(rotated_from_id) REFERENCES api_keys(id)
         )
         """
     )
@@ -2027,6 +2343,23 @@ def init_db():
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS uploaded_media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            api_key_id INTEGER NOT NULL,
+            account_id INTEGER NOT NULL,
+            object_path TEXT NOT NULL,
+            attachment_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'completed',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(api_key_id, object_path),
+            FOREIGN KEY(api_key_id) REFERENCES api_keys(id),
+            FOREIGN KEY(account_id) REFERENCES accounts(id)
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS idempotency_keys (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             api_key_id INTEGER NOT NULL,
@@ -2055,6 +2388,9 @@ def init_db():
     add_column_if_missing(conn, "api_keys", "allowed_durations", "TEXT")
     add_column_if_missing(conn, "api_keys", "deleted_at", "REAL")
     add_column_if_missing(conn, "api_keys", "disabled_reason", "TEXT")
+    add_column_if_missing(conn, "api_keys", "expires_at", "REAL")
+    add_column_if_missing(conn, "api_keys", "rotated_from_id", "INTEGER")
+    add_column_if_missing(conn, "api_keys", "rotation_note", "TEXT")
     add_column_if_missing(conn, "clients", "contact", "TEXT NOT NULL DEFAULT ''")
     add_column_if_missing(conn, "clients", "status", "TEXT NOT NULL DEFAULT 'active'")
     add_column_if_missing(conn, "tasks", "api_key_id", "INTEGER")
@@ -2125,6 +2461,7 @@ def init_db():
     )
     migrate_plaintext_account_secrets(conn)
     conn.commit()
+    apply_sql_migrations(conn)
     conn.close()
 
 
@@ -2662,7 +2999,9 @@ class OreateClient:
             "bosObjectPath": object_path,
             "status": "completed",
         }
-        if is_media_upload:
+        if file_ext in VIDEO_UPLOAD_EXTENSIONS:
+            attachment.update(parse_mp4_video_metadata(data))
+        if file_ext in IMAGE_UPLOAD_EXTENSIONS:
             convert_payload = {
                 "fileName": f"{file_name}.{file_ext}" if file_ext else file_name,
                 "fileExt": file_ext,
@@ -2743,9 +3082,13 @@ class OreateClient:
     ) -> Dict[str, Any]:
         banti_artifacts: Dict[str, Any] = {"jt": jt or "", "cookies": {}}
         if jt is None:
-            banti_artifacts = generate_banti_artifacts()
-            helper_cookies = banti_artifacts.get("cookies") if isinstance(banti_artifacts.get("cookies"), dict) else {}
-            bid = helper_cookies.get("__bid_n")
+            bid = ""
+            for _ in range(3):
+                banti_artifacts = generate_banti_artifacts()
+                helper_cookies = banti_artifacts.get("cookies") if isinstance(banti_artifacts.get("cookies"), dict) else {}
+                bid = helper_cookies.get("__bid_n") or ""
+                if banti_artifacts.get("jt") and bid:
+                    break
             if not banti_artifacts.get("jt") or not bid:
                 raise RuntimeError("banti mirror artifacts unavailable for generation")
             self._set_cookie_unique(s, "__bid_n", str(bid))
@@ -3320,6 +3663,68 @@ def claim_next_task() -> Optional[Dict[str, Any]]:
         conn.close()
 
 
+def recover_stale_running_tasks(
+    *,
+    now: Optional[float] = None,
+    stale_after_seconds: Optional[float] = None,
+) -> int:
+    current = time.time() if now is None else float(now)
+    stale_after = (
+        float_or_default(stale_after_seconds, 300.0)
+        if stale_after_seconds is not None
+        else float_or_default(gateway_cfg().get("running_task_stale_seconds"), 300.0)
+    )
+    cutoff = current - max(0.0, stale_after)
+    message = "task worker stopped before the generation attempt completed"
+    conn = db_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM tasks
+            WHERE status='running'
+              AND COALESCE(updated_at, started_at, created_at) <= ?
+            ORDER BY id ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+        task_ids = [int(row["id"]) for row in rows]
+        for task_id in task_ids:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status='expired', error_code='WORKER_LOST', error_message=?,
+                    finished_at=?, next_attempt_at=NULL, updated_at=?
+                WHERE id=? AND status='running'
+                """,
+                (message, current, current, task_id),
+            )
+            conn.execute(
+                """
+                UPDATE task_attempts
+                SET status='expired', error_code='WORKER_LOST', error_message=?, finished_at=?
+                WHERE task_id=? AND status='running'
+                """,
+                (message, current, task_id),
+            )
+            conn.execute(
+                """
+                UPDATE usage_log
+                SET status='expired', response_summary=?, error_code='WORKER_LOST', status_code=503
+                WHERE task_id=?
+                """,
+                (message[:200], task_id),
+            )
+        conn.commit()
+        return len(task_ids)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def task_worker_enabled() -> bool:
     return bool(gateway_cfg().get("enable_background_worker", True))
 
@@ -3729,6 +4134,28 @@ def ensure_task_worker_started() -> None:
     TASK_WORKER_THREAD.start()
 
 
+def stop_task_worker(timeout: float) -> bool:
+    """Request worker shutdown and wait for at most ``timeout`` seconds."""
+
+    global TASK_WORKER_THREAD
+    TASK_WORKER_STOP.set()
+    TASK_WORKER_WAKE.set()
+    worker = TASK_WORKER_THREAD
+    if worker is None or not worker.is_alive():
+        TASK_WORKER_THREAD = None
+        return True
+
+    join_timeout = float_or_default(timeout, 0.0)
+    if not math.isfinite(join_timeout):
+        join_timeout = 0.0
+    worker.join(timeout=max(0.0, join_timeout))
+    if worker.is_alive():
+        return False
+
+    TASK_WORKER_THREAD = None
+    return True
+
+
 def pick_account_for_task(kind: str) -> Optional[sqlite3.Row]:
     conn = db_conn()
     row = conn.execute(
@@ -4076,6 +4503,36 @@ class GatewayAPIError(Exception):
         self.request_id = request_id
 
 
+def is_openai_compat_path(path: str) -> bool:
+    return path == "/v1/models" or path.startswith("/v1/images/") or path == "/v1/videos" or path.startswith("/v1/videos/")
+
+
+def openai_error_response(
+    status_code: int,
+    message: str,
+    *,
+    code: Optional[str] = None,
+    param: Optional[str] = None,
+) -> JSONResponse:
+    if status_code == 401:
+        error_type = "authentication_error"
+    elif status_code == 429:
+        error_type = "rate_limit_error"
+    elif status_code >= 500:
+        error_type = "api_error"
+    else:
+        error_type = "invalid_request_error"
+    return JSONResponse(
+        status_code=status_code,
+        content=openai_error_payload(
+            message,
+            error_type=error_type,
+            param=param,
+            code=str(code).lower() if code else None,
+        ),
+    )
+
+
 @app.middleware("http")
 async def admin_audit_middleware(request: Request, call_next):
     try:
@@ -4108,11 +4565,13 @@ async def admin_audit_middleware(request: Request, call_next):
 
 
 def gateway_request_id(request: Optional[Request] = None) -> str:
+    max_length = max(8, int_or_default(gateway_cfg().get("request_id_max_length"), 128))
     if request is not None:
-        incoming = request.headers.get("X-Request-ID")
-        if incoming:
+        incoming = str(request.headers.get("X-Request-ID") or "").strip()
+        if incoming and len(incoming) <= max_length:
             return incoming
-    return "req_" + secrets.token_hex(8)
+    random_length = max_length - len("req_")
+    return "req_" + secrets.token_hex((random_length + 1) // 2)[:random_length]
 
 
 def gateway_error_response(request_id: str, status_code: int, code: str, message: str, details: Optional[Dict[str, Any]] = None) -> JSONResponse:
@@ -4132,6 +4591,14 @@ def gateway_error_response(request_id: str, status_code: int, code: str, message
 
 @app.exception_handler(GatewayAPIError)
 def handle_gateway_api_error(request: Request, exc: GatewayAPIError):
+    if is_openai_compat_path(request.url.path):
+        param = exc.details.get("field") if isinstance(exc.details, dict) else None
+        return openai_error_response(
+            exc.status_code,
+            exc.message,
+            code=exc.code,
+            param=str(param) if param not in (None, "") else None,
+        )
     return gateway_error_response(
         exc.request_id or gateway_request_id(request),
         exc.status_code,
@@ -4141,8 +4608,20 @@ def handle_gateway_api_error(request: Request, exc: GatewayAPIError):
     )
 
 
+@app.exception_handler(OpenAICompatError)
+def handle_openai_compat_error(request: Request, exc: OpenAICompatError):
+    return openai_error_response(
+        exc.status_code,
+        exc.message,
+        code=exc.code,
+        param=exc.param,
+    )
+
+
 @app.exception_handler(HTTPException)
 def handle_http_exception(request: Request, exc: HTTPException):
+    if is_openai_compat_path(request.url.path):
+        return openai_error_response(exc.status_code, str(exc.detail))
     if request.url.path.startswith("/v1/"):
         code_by_status = {
             400: "BAD_REQUEST",
@@ -4162,6 +4641,36 @@ def handle_http_exception(request: Request, exc: HTTPException):
         )
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
 
+
+@app.exception_handler(RequestValidationError)
+def handle_request_validation_error(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    first = errors[0] if errors else {}
+    location = first.get("loc") if isinstance(first, dict) else ()
+    field = None
+    if isinstance(location, (list, tuple)):
+        for item in reversed(location):
+            if item not in {"body", "query", "path", "header"}:
+                field = str(item)
+                break
+    message = str(first.get("msg") or "request validation failed") if isinstance(first, dict) else "request validation failed"
+    if is_openai_compat_path(request.url.path):
+        return openai_error_response(
+            422,
+            message,
+            code="validation_error",
+            param=field,
+        )
+    if request.url.path.startswith("/v1/"):
+        return gateway_error_response(
+            gateway_request_id(request),
+            422,
+            "VALIDATION_ERROR",
+            message,
+            {"field": field, "errors": errors},
+        )
+    return JSONResponse(status_code=422, content={"detail": errors})
+
 # === API Key Auth ===
 security = HTTPBearer(auto_error=False)
 
@@ -4169,14 +4678,18 @@ def get_api_key(credentials: Optional[HTTPAuthorizationCredentials] = Depends(se
     if credentials is None:
         return None
     conn = db_conn()
-    row = conn.execute("SELECT id, enabled FROM api_keys WHERE key=?", (credentials.credentials,)).fetchone()
-    conn.close()
-    if row and row["enabled"]:
-        conn = db_conn()
+    row = conn.execute(
+        "SELECT id, enabled, deleted_at, expires_at FROM api_keys WHERE key=?",
+        (credentials.credentials,),
+    ).fetchone()
+    if row and row["enabled"] and row["deleted_at"] is None and (
+        row["expires_at"] is None or float_or_default(row["expires_at"], 0) > time.time()
+    ):
         conn.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (time.time(), row["id"]))
         conn.commit()
         conn.close()
         return row["id"]
+    conn.close()
     return None
 
 def require_api_key(request: Request, api_key_id: Optional[int] = Depends(get_api_key)):
@@ -4189,7 +4702,8 @@ def require_api_key(request: Request, api_key_id: Optional[int] = Depends(get_ap
         )
     return api_key_id
 
-def log_usage(
+def insert_usage_log(
+    conn: sqlite3.Connection,
     api_key_id: int,
     kind: str,
     account_id: int,
@@ -4207,9 +4721,8 @@ def log_usage(
     estimated_point_cost: Optional[int] = None,
     error_code: str = "",
     status_code: Optional[int] = None,
-):
-    conn = db_conn()
-    conn.execute(
+) -> int:
+    cursor = conn.execute(
         """
         INSERT INTO usage_log (
             api_key_id, task_id, kind, account_id, prompt, status, response_summary,
@@ -4239,10 +4752,229 @@ def log_usage(
             time.time(),
         ),
     )
-    conn.commit()
-    row = conn.execute("SELECT last_insert_rowid()").fetchone()
-    conn.close()
-    return row[0] if row else None
+    return int(cursor.lastrowid)
+
+
+def log_usage(
+    api_key_id: int,
+    kind: str,
+    account_id: int,
+    prompt: str,
+    status: str,
+    summary: str = "",
+    task_id: Optional[int] = None,
+    request_id: str = "",
+    idempotency_key: str = "",
+    model_name: str = "",
+    resolution: str = "",
+    ratio: str = "",
+    duration: Optional[int] = None,
+    scene_id: str = "",
+    estimated_point_cost: Optional[int] = None,
+    error_code: str = "",
+    status_code: Optional[int] = None,
+):
+    conn = db_conn()
+    try:
+        usage_id = insert_usage_log(
+            conn,
+            api_key_id,
+            kind,
+            account_id,
+            prompt,
+            status,
+            summary,
+            task_id,
+            request_id,
+            idempotency_key,
+            model_name,
+            resolution,
+            ratio,
+            duration,
+            scene_id,
+            estimated_point_cost,
+            error_code,
+            status_code,
+        )
+        conn.commit()
+        return usage_id
+    finally:
+        conn.close()
+
+
+def save_uploaded_media_record(api_key_id: int, account_id: int, attachment: Dict[str, Any]) -> None:
+    object_path = upload_object_value(attachment)
+    if not object_path:
+        raise RuntimeError("uploaded media record requires an object path")
+    payload = encode_json_value(attachment)
+    now = time.time()
+    conn = db_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO uploaded_media(api_key_id, account_id, object_path, attachment_json, status, created_at, updated_at)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(api_key_id, object_path)
+            DO UPDATE SET account_id=excluded.account_id, attachment_json=excluded.attachment_json,
+                          status=excluded.status, updated_at=excluded.updated_at
+            """,
+            (api_key_id, account_id, object_path, payload, "completed", now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def upload_media_kind(attachment: Dict[str, Any], object_path: str = "") -> str:
+    content_type = str(
+        attachment.get("contentType")
+        or attachment.get("content_type")
+        or attachment.get("mimeType")
+        or attachment.get("mime_type")
+        or ""
+    ).strip().lower()
+    ext = normalized_file_extension(
+        attachment.get("fileExt")
+        or attachment.get("file_ext")
+        or Path(urlparse(str(object_path or "")).path).suffix
+    )
+    if content_type.startswith("image/") or ext in IMAGE_UPLOAD_EXTENSIONS:
+        return "image"
+    if content_type.startswith("video/") or ext in VIDEO_UPLOAD_EXTENSIONS:
+        return "video"
+    return "unknown"
+
+
+def sanitize_upload_attachment(value: Any) -> Any:
+    sensitive_keys = {"sessionkey", "session_key", "cookies", "cookie", "ouid", "ouss", "authorization", "token", "access_token"}
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, nested in value.items():
+            lowered = str(key).strip().lower()
+            if lowered in sensitive_keys or lowered.endswith("cookie") or lowered.endswith("cookies"):
+                continue
+            sanitized[key] = sanitize_upload_attachment(nested)
+        return sanitized
+    if isinstance(value, list):
+        return [sanitize_upload_attachment(item) for item in value]
+    return value
+
+
+def upload_kind_filter_clause(kind: str) -> tuple[str, List[Any]]:
+    if kind not in MEDIA_ADMIN_KINDS:
+        raise HTTPException(422, "kind is not supported")
+    if kind == "image":
+        content_prefix = "image/"
+        extensions = IMAGE_UPLOAD_EXTENSIONS
+    else:
+        content_prefix = "video/"
+        extensions = VIDEO_UPLOAD_EXTENSIONS
+    clauses = [
+        "LOWER(um.attachment_json) LIKE ?",
+        "LOWER(um.attachment_json) LIKE ?",
+    ]
+    params: List[Any] = [
+        f'%"contenttype": "{content_prefix}%',
+        f'%"contenttype":"{content_prefix}%',
+    ]
+    for ext in sorted(extensions):
+        clauses.extend(
+            [
+                "LOWER(um.object_path) LIKE ?",
+                "LOWER(um.attachment_json) LIKE ?",
+                "LOWER(um.attachment_json) LIKE ?",
+            ]
+        )
+        params.extend(
+            [
+                f"%.{ext}%",
+                f'%"fileext": "{ext}"%',
+                f'%"fileext":"{ext}"%',
+            ]
+        )
+    return f"({' OR '.join(clauses)})", params
+
+
+def public_uploaded_media(row: sqlite3.Row) -> Dict[str, Any]:
+    item = dict(row)
+    attachment = json_value_from_db(item.pop("attachment_json", None)) or {}
+    object_path = str(item.get("object_path") or upload_object_value(attachment) or "")
+    sanitized_attachment = sanitize_upload_attachment(attachment)
+    item["object_path"] = object_path
+    item["attachment"] = sanitized_attachment
+    item["kind"] = upload_media_kind(attachment, object_path)
+    item["account_email"] = item.get("account_email") or ""
+    item["api_key_name"] = item.get("api_key_name") or ""
+    item["client_name"] = item.get("client_name") or ""
+    item["related_task_count"] = int_or_default(item.get("related_task_count"), 0)
+    item["file_name"] = sanitized_attachment.get("fileName") or sanitized_attachment.get("doc_title") or Path(urlparse(object_path).path).name
+    item["content_type"] = sanitized_attachment.get("contentType") or sanitized_attachment.get("doc_type") or ""
+    item["size"] = sanitized_attachment.get("originSize") or sanitized_attachment.get("fileSize") or sanitized_attachment.get("size") or 0
+    return item
+
+
+def resolve_uploaded_input_reference(
+    api_key_id: int,
+    input_reference: Any,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    attachments = upload_attachment_list(input_reference)
+    if not attachments:
+        raise OpenAICompatError(
+            "input_reference must contain at least one uploaded attachment",
+            param="input_reference",
+            code="invalid_input_reference",
+        )
+    resolved: List[Dict[str, Any]] = []
+    account_ids = set()
+    conn = db_conn()
+    try:
+        for item in attachments:
+            object_path = upload_object_value(item)
+            if not object_path:
+                raise OpenAICompatError(
+                    "input_reference items must contain an uploaded object path",
+                    param="input_reference",
+                    code="invalid_input_reference",
+                )
+            row = conn.execute(
+                "SELECT account_id, attachment_json, status FROM uploaded_media WHERE api_key_id=? AND object_path=?",
+                (api_key_id, object_path),
+            ).fetchone()
+            if not row or str(row["status"] or "") != "completed":
+                raise OpenAICompatError(
+                    "input_reference must reference a completed upload owned by this API key",
+                    param="input_reference",
+                    code="invalid_input_reference",
+                )
+            account_ids.add(int(row["account_id"]))
+            resolved.append(json_value_from_db(row["attachment_json"]) or {})
+    finally:
+        conn.close()
+    if len(account_ids) != 1:
+        raise OpenAICompatError(
+            "input_reference attachments must originate from the same uploaded-media account",
+            param="input_reference",
+            code="invalid_input_reference",
+        )
+    reference_images, reference_videos = split_input_reference_attachments(resolved)
+    return reference_images, reference_videos, next(iter(account_ids))
+
+
+def update_usage_log(usage_id: int, **fields: Any) -> None:
+    if not fields:
+        return
+    conn = db_conn()
+    try:
+        payload = dict(fields)
+        for key in ("response_summary",):
+            if key in payload and payload[key] is not None:
+                payload[key] = str(payload[key])[:200]
+        assignments = ", ".join(f"{key}=?" for key in payload)
+        values = list(payload.values()) + [usage_id]
+        conn.execute(f"UPDATE usage_log SET {assignments} WHERE id=?", values)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def admin_session_ttl_seconds() -> float:
@@ -4509,6 +5241,47 @@ def api_key_scope_payload_values(payload: Dict[str, Any], current: Optional[sqli
     }
 
 
+def optional_timestamp_payload_value(payload: Dict[str, Any], field: str, current: Optional[sqlite3.Row] = None) -> Optional[float]:
+    if field not in payload:
+        return current[field] if current is not None else None
+    value = payload.get(field)
+    if value in (None, ""):
+        return None
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"{field} must be a unix timestamp")
+    if timestamp <= 0:
+        raise HTTPException(400, f"{field} must be a positive unix timestamp")
+    return timestamp
+
+
+def optional_api_key_id_payload_value(payload: Dict[str, Any], field: str, current: Optional[sqlite3.Row] = None) -> Optional[int]:
+    if field not in payload:
+        return current[field] if current is not None else None
+    value = payload.get(field)
+    if value in (None, ""):
+        return None
+    try:
+        key_id = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"{field} must be an integer")
+    if key_id <= 0:
+        raise HTTPException(400, f"{field} must be positive")
+    conn = db_conn()
+    row = conn.execute("SELECT id FROM api_keys WHERE id=?", (key_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(400, f"{field} does not reference an existing API key")
+    return key_id
+
+
+def optional_text_payload_value(payload: Dict[str, Any], field: str, current: Optional[sqlite3.Row] = None) -> str:
+    if field not in payload:
+        return str(current[field] or "") if current is not None else ""
+    return str(payload.get(field) or "").strip()
+
+
 @app.get("/api/admin/apikeys")
 def list_api_keys(_=Depends(require_admin)):
     conn = db_conn()
@@ -4588,20 +5361,26 @@ def create_api_key(body: Dict[str, Any] = None, _=Depends(require_admin)):
         get_client_record(client_id_value)
     key = "oreate_" + secrets.token_hex(24)
     scopes = api_key_scope_payload_values(payload)
+    expires_at = optional_timestamp_payload_value(payload, "expires_at")
+    rotated_from_id = optional_api_key_id_payload_value(payload, "rotated_from_id")
+    rotation_note = optional_text_payload_value(payload, "rotation_note")
+    disabled_reason = optional_text_payload_value(payload, "disabled_reason")
+    enabled = 0 if disabled_reason else 1
     conn = db_conn()
     conn.execute(
         """
         INSERT INTO api_keys (
             client_id, key, name, enabled, created_at,
             allowed_kinds, allowed_models, allowed_scenes,
-            allow_uploads, allow_experimental, allowed_resolutions, allowed_durations
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            allow_uploads, allow_experimental, allowed_resolutions, allowed_durations,
+            expires_at, rotated_from_id, rotation_note, disabled_reason
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             client_id_value,
             key,
             name,
-            1,
+            enabled,
             time.time(),
             scopes["allowed_kinds"],
             scopes["allowed_models"],
@@ -4610,6 +5389,10 @@ def create_api_key(body: Dict[str, Any] = None, _=Depends(require_admin)):
             scopes["allow_experimental"],
             scopes["allowed_resolutions"],
             scopes["allowed_durations"],
+            expires_at,
+            rotated_from_id,
+            rotation_note,
+            disabled_reason,
         ),
     )
     conn.commit()
@@ -4628,8 +5411,10 @@ def create_api_key(body: Dict[str, Any] = None, _=Depends(require_admin)):
 
 @app.patch("/api/admin/apikeys/{key_id}")
 def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_admin)):
+    payload = body or {}
+
     def limit_value(name: str) -> Optional[int]:
-        value = body.get(name)
+        value = payload.get(name)
         if value in (None, ""):
             return None
         value = int(value)
@@ -4642,7 +5427,7 @@ def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_a
     if not current:
         conn.close()
         raise HTTPException(404, "api key not found")
-    client_id = body.get("client_id") if isinstance(body, dict) else None
+    client_id = payload.get("client_id")
     client_id_value: Optional[int]
     if client_id in (None, ""):
         client_id_value = current["client_id"]
@@ -4653,13 +5438,24 @@ def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_a
             conn.close()
             raise HTTPException(400, "client_id must be an integer")
         get_client_record(client_id_value)
-    scopes = api_key_scope_payload_values(body or {}, current)
+    scopes = api_key_scope_payload_values(payload, current)
+    expires_at = optional_timestamp_payload_value(payload, "expires_at", current)
+    rotated_from_id = optional_api_key_id_payload_value(payload, "rotated_from_id", current)
+    rotation_note = optional_text_payload_value(payload, "rotation_note", current)
+    disabled_reason = optional_text_payload_value(payload, "disabled_reason", current)
+    if "enabled" in payload:
+        enabled = int(parse_boolean_flag(payload.get("enabled"), "enabled"))
+    elif "disabled_reason" in payload and disabled_reason:
+        enabled = 0
+    else:
+        enabled = int(current["enabled"])
     conn.execute(
         """
         UPDATE api_keys
         SET client_id=?, rate_limit_per_minute=?, daily_request_limit=?, daily_point_limit=?,
             allowed_kinds=?, allowed_models=?, allowed_scenes=?,
-            allow_uploads=?, allow_experimental=?, allowed_resolutions=?, allowed_durations=?
+            allow_uploads=?, allow_experimental=?, allowed_resolutions=?, allowed_durations=?,
+            expires_at=?, rotated_from_id=?, rotation_note=?, disabled_reason=?, enabled=?
         WHERE id=?
         """,
         (
@@ -4674,6 +5470,11 @@ def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_a
             scopes["allow_experimental"],
             scopes["allowed_resolutions"],
             scopes["allowed_durations"],
+            expires_at,
+            rotated_from_id,
+            rotation_note,
+            disabled_reason,
+            enabled,
             key_id,
         ),
     )
@@ -4710,13 +5511,80 @@ def delete_api_key(key_id: int, _=Depends(require_admin)):
 
 
 @app.get("/api/admin/usage")
-def get_usage(_=Depends(require_admin)):
+def get_usage(
+    limit: int = 200,
+    offset: int = 0,
+    client_id: Optional[int] = None,
+    api_key_id: Optional[int] = None,
+    account_id: Optional[int] = None,
+    kind: Optional[str] = None,
+    model_name: Optional[str] = None,
+    status: Optional[str] = None,
+    error_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    _=Depends(require_admin),
+):
+    if limit < 1 or limit > MAX_LIST_LIMIT:
+        raise HTTPException(422, f"limit must be between 1 and {MAX_LIST_LIMIT}")
+    if offset < 0 or offset > MAX_LIST_OFFSET:
+        raise HTTPException(422, f"offset must be between 0 and {MAX_LIST_OFFSET}")
+    if kind and kind not in API_LIST_KINDS:
+        raise HTTPException(422, "kind is not supported")
+    if status and status not in TASK_LIST_STATUSES:
+        raise HTTPException(422, "status is not supported")
+    where = ["1=1"]
+    params: List[Any] = []
+    start = parse_report_date_boundary(date_from, end_of_day=False)
+    end = parse_report_date_boundary(date_to, end_of_day=True)
+    if start is not None:
+        where.append("u.created_at>=?")
+        params.append(start)
+    if end is not None:
+        where.append("u.created_at<=?")
+        params.append(end)
+    if client_id is not None:
+        where.append("k.client_id=?")
+        params.append(client_id)
+    if api_key_id is not None:
+        where.append("u.api_key_id=?")
+        params.append(api_key_id)
+    if account_id is not None:
+        where.append("u.account_id=?")
+        params.append(account_id)
+    if kind:
+        where.append("u.kind=?")
+        params.append(kind)
+    if model_name:
+        where.append("u.model_name=?")
+        params.append(model_name)
+    if status:
+        where.append("u.status=?")
+        params.append(status)
+    if error_code:
+        where.append("u.error_code=?")
+        params.append(error_code)
     conn = db_conn()
     rows = conn.execute(
-        "SELECT u.*, a.email as account_email FROM usage_log u LEFT JOIN accounts a ON u.account_id=a.id ORDER BY u.id DESC LIMIT 200"
+        f"""
+        SELECT
+            u.*,
+            a.email AS account_email,
+            k.name AS api_key_name,
+            c.name AS client_name
+        FROM usage_log u
+        LEFT JOIN accounts a ON u.account_id=a.id
+        LEFT JOIN api_keys k ON u.api_key_id=k.id
+        LEFT JOIN clients c ON k.client_id=c.id
+        WHERE {' AND '.join(where)}
+        ORDER BY u.id DESC
+        LIMIT ? OFFSET ?
+        """,
+        tuple(params + [limit + 1, offset]),
     ).fetchall()
     conn.close()
-    return {"items": [dict(r) for r in rows]}
+    items = [dict(r) for r in rows[:limit]]
+    return {"items": items, "limit": limit, "offset": offset, "has_more": len(rows) > limit}
 
 
 def parse_report_date_boundary(value: Optional[str], end_of_day: bool = False) -> Optional[float]:
@@ -4729,6 +5597,75 @@ def parse_report_date_boundary(value: Optional[str], end_of_day: bool = False) -
     if end_of_day:
         dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
     return dt.timestamp()
+
+
+@app.get("/api/admin/uploads")
+def list_admin_uploads(
+    limit: int = 200,
+    offset: int = 0,
+    api_key_id: Optional[int] = None,
+    account_id: Optional[int] = None,
+    status: Optional[str] = None,
+    kind: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    _=Depends(require_admin),
+):
+    if limit < 1 or limit > MAX_LIST_LIMIT:
+        raise HTTPException(422, f"limit must be between 1 and {MAX_LIST_LIMIT}")
+    if offset < 0 or offset > MAX_LIST_OFFSET:
+        raise HTTPException(422, f"offset must be between 0 and {MAX_LIST_OFFSET}")
+    where = ["1=1"]
+    params: List[Any] = []
+    start = parse_report_date_boundary(date_from, end_of_day=False)
+    end = parse_report_date_boundary(date_to, end_of_day=True)
+    if start is not None:
+        where.append("um.created_at>=?")
+        params.append(start)
+    if end is not None:
+        where.append("um.created_at<=?")
+        params.append(end)
+    if api_key_id is not None:
+        where.append("um.api_key_id=?")
+        params.append(api_key_id)
+    if account_id is not None:
+        where.append("um.account_id=?")
+        params.append(account_id)
+    if status:
+        where.append("um.status=?")
+        params.append(status)
+    if kind:
+        clause, kind_params = upload_kind_filter_clause(kind)
+        where.append(clause)
+        params.extend(kind_params)
+    conn = db_conn()
+    rows = conn.execute(
+        f"""
+        SELECT
+            um.*,
+            a.email AS account_email,
+            k.name AS api_key_name,
+            c.name AS client_name,
+            (
+                SELECT COUNT(*)
+                FROM tasks t
+                WHERE t.api_key_id=um.api_key_id
+                  AND t.account_id=um.account_id
+                  AND INSTR(COALESCE(t.payload_json, ''), um.object_path) > 0
+            ) AS related_task_count
+        FROM uploaded_media um
+        LEFT JOIN accounts a ON um.account_id=a.id
+        LEFT JOIN api_keys k ON um.api_key_id=k.id
+        LEFT JOIN clients c ON k.client_id=c.id
+        WHERE {' AND '.join(where)}
+        ORDER BY um.id DESC
+        LIMIT ? OFFSET ?
+        """,
+        tuple(params + [limit + 1, offset]),
+    ).fetchall()
+    conn.close()
+    items = [public_uploaded_media(row) for row in rows[:limit]]
+    return {"items": items, "limit": limit, "offset": offset, "has_more": len(rows) > limit}
 
 
 @app.get("/api/admin/cost-report")
@@ -4831,6 +5768,75 @@ class GatewayGenerateIn(BaseModel):
     sync_wait_seconds: Optional[float] = None
 
 
+class OpenAIImageGenerationIn(BaseModel):
+    model: Optional[str] = "gpt-image-1"
+    prompt: str
+    n: int = 1
+    size: Optional[str] = "auto"
+    quality: Optional[str] = "auto"
+    response_format: Optional[str] = "url"
+    user: Optional[str] = None
+    ratio: Optional[str] = None
+    resolution: Optional[str] = None
+    timeout: Optional[float] = None
+
+
+class OpenAIVideoGenerationIn(BaseModel):
+    model: Optional[str] = "sora-2"
+    prompt: str
+    seconds: Optional[Any] = None
+    size: Optional[str] = "auto"
+    user: Optional[str] = None
+    scene_id: Optional[str] = None
+    ratio: Optional[str] = None
+    resolution: Optional[str] = None
+    image: Optional[Dict[str, Any]] = None
+    input_reference: Optional[List[Dict[str, Any]]] = None
+
+
+def validate_generation_request_boundaries(
+    body: GatewayGenerateIn,
+    idempotency_key: str,
+    request_id: str,
+) -> None:
+    prompt_max_length = max(1, int_or_default(gateway_cfg().get("prompt_max_length"), 4000))
+    if len(body.prompt) > prompt_max_length:
+        raise GatewayAPIError(
+            400,
+            "PROMPT_TOO_LONG",
+            "prompt exceeds the configured length limit",
+            {"field": "prompt", "max_length": prompt_max_length},
+            request_id=request_id,
+        )
+    idempotency_key_max_length = max(
+        1,
+        int_or_default(gateway_cfg().get("idempotency_key_max_length"), 255),
+    )
+    if len(idempotency_key) > idempotency_key_max_length:
+        raise GatewayAPIError(
+            400,
+            "IDEMPOTENCY_KEY_TOO_LONG",
+            "Idempotency-Key exceeds the configured length limit",
+            {"field": "Idempotency-Key", "max_length": idempotency_key_max_length},
+            request_id=request_id,
+        )
+    if body.sync_wait_seconds is None:
+        return
+    sync_wait_seconds = float(body.sync_wait_seconds)
+    sync_wait_max_seconds = max(
+        0.0,
+        float_or_default(gateway_cfg().get("sync_wait_max_seconds"), 120.0),
+    )
+    if not math.isfinite(sync_wait_seconds) or not 0.0 <= sync_wait_seconds <= sync_wait_max_seconds:
+        raise GatewayAPIError(
+            400,
+            "SYNC_WAIT_OUT_OF_RANGE",
+            "sync_wait_seconds is outside the configured range",
+            {"field": "sync_wait_seconds", "min": 0, "max": sync_wait_max_seconds},
+            request_id=request_id,
+        )
+
+
 def request_body_from_generation(body: GatewayGenerateIn) -> Dict[str, Any]:
     data = model_data(body)
     data.pop("sync_wait_seconds", None)
@@ -4909,32 +5915,52 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
     """Generate image or video via the account pool. Auto-selects account if not specified."""
     request_id = gateway_request_id(request)
     idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+    validate_generation_request_boundaries(body, idempotency_key, request_id)
     request_hash = request_hash_for_generation(body)
+    idempotency_reserved = False
     if idempotency_key:
-        existing_idempotency = find_idempotency_record(api_key_id, idempotency_key)
-        if existing_idempotency:
-            if existing_idempotency["request_hash"] != request_hash:
-                raise GatewayAPIError(
-                    409,
-                    "IDEMPOTENCY_KEY_CONFLICT",
-                    "Idempotency-Key was already used with a different request body",
-                    {"field": "Idempotency-Key"},
-                    request_id=request_id,
-                )
-            replay = json.loads(existing_idempotency["response_json"])
+        reservation = reserve_idempotency_record(api_key_id, idempotency_key, request_hash)
+        reservation_state = reservation["state"]
+        existing_idempotency = reservation.get("record") or {}
+        if reservation_state == "conflict":
+            raise GatewayAPIError(
+                409,
+                "IDEMPOTENCY_KEY_CONFLICT",
+                "Idempotency-Key was already used with a different request body",
+                {"field": "Idempotency-Key"},
+                request_id=request_id,
+            )
+        if reservation_state == "pending":
+            raise GatewayAPIError(
+                409,
+                "IDEMPOTENCY_KEY_IN_PROGRESS",
+                "a request with this Idempotency-Key is still being processed",
+                {"field": "Idempotency-Key", "retryable": True},
+                request_id=request_id,
+            )
+        if reservation_state == "replay":
+            replay = json.loads(existing_idempotency.get("response_json") or "{}")
             replay["idempotent_replay"] = True
             replay["request_id"] = request_id
-            return JSONResponse(status_code=existing_idempotency["status_code"], content=replay)
-    policy = resolve_api_key_policy(get_api_key_record(api_key_id))
-    now = time.time()
-    check_rate_limit(api_key_id, policy, now, request_id)
-    if body.kind not in ("image", "video"):
-        raise GatewayAPIError(400, "UNSUPPORTED_KIND", f"unsupported kind: {body.kind}", {"field": "kind"}, request_id=request_id)
-    account, caps, options, estimated_point_cost = select_generation_account(body, request_id=request_id)
-    enforce_api_key_scope(policy, body.kind, options, caps, request_id)
-    check_daily_quota(api_key_id, estimated_point_cost, policy, now, request_id)
+            return JSONResponse(status_code=int(existing_idempotency["status_code"]), content=replay)
+        idempotency_reserved = reservation_state == "reserved"
 
-    task_id = queue_generation_task(api_key_id, request_id, account, body, options, estimated_point_cost)
+    try:
+        with REQUEST_ADMISSION_LOCK:
+            policy = resolve_api_key_policy(get_api_key_record(api_key_id))
+            now = time.time()
+            check_rate_limit(api_key_id, policy, now, request_id)
+            if body.kind not in ("image", "video"):
+                raise GatewayAPIError(400, "UNSUPPORTED_KIND", f"unsupported kind: {body.kind}", {"field": "kind"}, request_id=request_id)
+            account, caps, options, estimated_point_cost = select_generation_account(body, request_id=request_id)
+            enforce_api_key_scope(policy, body.kind, options, caps, request_id)
+            check_daily_quota(api_key_id, estimated_point_cost, policy, now, request_id)
+            task_id = queue_generation_task(api_key_id, request_id, account, body, options, estimated_point_cost)
+    except Exception:
+        if idempotency_reserved:
+            release_idempotency_reservation(api_key_id, idempotency_key, request_hash)
+        raise
+
     result: Dict[str, Any] = {
         "ok": True,
         "task_id": task_id,
@@ -4945,6 +5971,8 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
         "status": "queued",
     }
     status_code = 202
+    if idempotency_key:
+        save_idempotency_record(api_key_id, idempotency_key, request_hash, status_code, result, task_id)
     sync_wait_seconds = body.sync_wait_seconds if body.sync_wait_seconds is not None else gateway_cfg().get("sync_wait_seconds") or 0
     if sync_wait_seconds and float(sync_wait_seconds) > 0:
         snapshot = wait_for_task_snapshot(task_id, api_key_id, float(sync_wait_seconds))
@@ -4995,6 +6023,372 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
     return JSONResponse(status_code=status_code, content=result)
 
 
+def json_response_content(response: JSONResponse) -> Dict[str, Any]:
+    try:
+        body = json.loads(bytes(response.body).decode("utf-8"))
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+@app.post("/v1/images/generations")
+def gateway_openai_image_generation(
+    body: OpenAIImageGenerationIn,
+    request: Request,
+    api_key_id: int = Depends(require_api_key),
+):
+    if body.n != 1:
+        raise OpenAICompatError(
+            "only n=1 is supported",
+            param="n",
+            code="unsupported_n",
+        )
+    if str(body.response_format or "url").lower() != "url":
+        raise OpenAICompatError(
+            "only response_format=url is supported",
+            param="response_format",
+            code="unsupported_response_format",
+        )
+
+    provider_model = resolve_openai_model("image", body.model, CFG)
+    mapped_ratio = image_size_to_ratio(body.size)
+    compat = openai_compat_cfg()
+    configured_timeout = float_or_default(
+        body.timeout if body.timeout is not None else compat.get("image_sync_timeout_seconds"),
+        120.0,
+    )
+    max_timeout = max(0.01, float_or_default(compat.get("max_sync_timeout_seconds"), 120.0))
+    sync_timeout = min(max(0.01, configured_timeout), max_timeout)
+    native_body = GatewayGenerateIn(
+        kind="image",
+        prompt=body.prompt,
+        model_name=provider_model,
+        ratio=body.ratio or mapped_ratio or CFG["oreate"]["default_image_ratio"],
+        resolution=body.resolution or CFG["oreate"]["default_image_resolution"],
+        sync_wait_seconds=sync_timeout,
+    )
+    native_response = gateway_generate(native_body, request, api_key_id)
+    content = json_response_content(native_response)
+    if native_response.status_code >= 400:
+        error = content.get("error") if isinstance(content.get("error"), dict) else {}
+        return openai_error_response(
+            native_response.status_code,
+            str(error.get("message") or "image generation failed"),
+            code=str(error.get("code") or "image_generation_failed"),
+        )
+
+    assets = content.get("assets") if isinstance(content.get("assets"), list) else []
+    if native_response.status_code == 202 or content.get("status") != "completed":
+        return openai_error_response(
+            504,
+            "image generation did not complete before the compatibility timeout",
+            code="image_generation_timeout",
+        )
+    if not assets:
+        return openai_error_response(
+            502,
+            "image generation completed without an image asset",
+            code="image_asset_missing",
+        )
+    task = content.get("task") if isinstance(content.get("task"), dict) else {}
+    created = int(float(task.get("created_at") or time.time()))
+    return {
+        "created": created,
+        "data": [
+            {
+                "url": str(assets[0]),
+                "revised_prompt": body.prompt,
+            }
+        ],
+    }
+
+
+def openai_video_task(task_id: int, api_key_id: int) -> Dict[str, Any]:
+    row = fetch_task_row(task_id, api_key_id)
+    if not row or str(row["kind"] or "") != "video":
+        raise OpenAICompatError(
+            "video not found",
+            param="video_id",
+            code="video_not_found",
+            status_code=404,
+        )
+    return task_detail_for_row(row)
+
+
+async def upload_openai_input_reference_files(
+    files: List[UploadFile],
+    api_key_id: int,
+    account: sqlite3.Row,
+    request_id: str,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if not files:
+        return [], []
+    max_bytes = max(1, int_or_default(gateway_cfg().get("upload_max_bytes"), 104857600))
+    chunk_bytes = max(1, int_or_default(gateway_cfg().get("upload_read_chunk_bytes"), 1048576))
+    attachments: List[Dict[str, Any]] = []
+    try:
+        session = CLIENT.session_from_account(account)
+        for file in files:
+            try:
+                filename = Path(file.filename or "upload.bin").name
+                extension = normalized_file_extension(Path(filename).suffix)
+                if extension not in MEDIA_UPLOAD_EXTENSIONS:
+                    raise OpenAICompatError(
+                        "input_reference contains an unsupported media type",
+                        param="input_reference",
+                        code="invalid_input_reference",
+                    )
+                chunks: List[bytes] = []
+                total_bytes = 0
+                while True:
+                    chunk = await file.read(chunk_bytes)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    if total_bytes > max_bytes:
+                        raise OpenAICompatError(
+                            "input_reference file exceeds the configured size limit",
+                            param="input_reference",
+                            code="invalid_input_reference",
+                            status_code=413,
+                        )
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+                if not data:
+                    raise OpenAICompatError(
+                        "input_reference file is empty",
+                        param="input_reference",
+                        code="invalid_input_reference",
+                    )
+                attachment = CLIENT.upload_file_bytes(
+                    session,
+                    filename,
+                    data,
+                    file.content_type or "application/octet-stream",
+                )
+                save_uploaded_media_record(api_key_id, int(account["id"]), attachment)
+                attachments.append(attachment)
+            finally:
+                await file.close()
+    except OpenAICompatError:
+        raise
+    except Exception as exc:
+        mark_account_failure(account["id"], exc)
+        raise GatewayAPIError(
+            503,
+            "UPLOAD_FAILED",
+            "upstream upload failed",
+            request_id=request_id,
+        ) from exc
+    mark_account_success(account["id"])
+    return split_input_reference_attachments(attachments)
+
+
+def openai_video_body_from_request(
+    body: OpenAIVideoGenerationIn,
+    *,
+    reference_images: Optional[List[Dict[str, Any]]] = None,
+    reference_videos: Optional[List[Dict[str, Any]]] = None,
+    account_id: Optional[int] = None,
+) -> GatewayGenerateIn:
+    provider_model = resolve_openai_model("video", body.model, CFG)
+    try:
+        duration = int(body.seconds if body.seconds not in (None, "") else CFG["oreate"]["default_video_duration"])
+    except (TypeError, ValueError) as exc:
+        raise OpenAICompatError(
+            "seconds must be an integer",
+            param="seconds",
+            code="invalid_seconds",
+        ) from exc
+    if duration <= 0:
+        raise OpenAICompatError(
+            "seconds must be positive",
+            param="seconds",
+            code="invalid_seconds",
+        )
+    mapped_ratio = video_size_to_ratio(body.size)
+    mapped_resolution = video_size_to_resolution(body.size)
+    has_reference_inputs = bool(reference_images or reference_videos or body.input_reference)
+    scene_id = body.scene_id or ("reference" if has_reference_inputs else CFG["oreate"]["default_video_scene"])
+    if has_reference_inputs and scene_id != "reference":
+        raise OpenAICompatError(
+            "input_reference requires the reference scene",
+            param="input_reference",
+            code="invalid_input_reference",
+        )
+    return GatewayGenerateIn(
+        kind="video",
+        prompt=body.prompt,
+        model_name=provider_model,
+        ratio=body.ratio or mapped_ratio or CFG["oreate"]["default_video_ratio"],
+        resolution=body.resolution or mapped_resolution or CFG["oreate"]["default_video_resolution"],
+        duration=duration,
+        scene_id=scene_id,
+        account_id=account_id,
+        image=body.image,
+        reference_images=reference_images or None,
+        reference_videos=reference_videos or None,
+    )
+
+
+async def parse_openai_video_generation_request(request: Request) -> OpenAIVideoGenerationIn:
+    return OpenAIVideoGenerationIn(**(await request.json()))
+
+
+def openai_video_generation_payload_from_form(form: Any) -> Dict[str, Any]:
+    payload = {
+        "model": form.get("model"),
+        "prompt": form.get("prompt"),
+        "seconds": form.get("seconds"),
+        "size": form.get("size"),
+        "user": form.get("user"),
+        "scene_id": form.get("scene_id"),
+        "ratio": form.get("ratio"),
+        "resolution": form.get("resolution"),
+    }
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def openai_video_object(task: Dict[str, Any]) -> Dict[str, Any]:
+    return task_to_video_object(
+        task,
+        requested_model=openai_model_name_for_provider("video", task.get("model_name"), CFG),
+    )
+
+
+@app.post("/v1/videos/generations")
+@app.post("/v1/videos")
+async def gateway_openai_video_generation(
+    request: Request,
+    api_key_id: int = Depends(require_api_key),
+):
+    reference_images: List[Dict[str, Any]] = []
+    reference_videos: List[Dict[str, Any]] = []
+    content_type = str(request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" in content_type:
+        async with request.form() as form:
+            try:
+                body = OpenAIVideoGenerationIn(**openai_video_generation_payload_from_form(form))
+            except ValidationError as exc:
+                raise RequestValidationError(exc.errors()) from exc
+            requested_model = str(body.model or "sora-2")
+            requested_size = str(body.size or "auto")
+            multipart_references = [
+                item
+                for item in form.getlist("input_reference")
+                if hasattr(item, "read") and hasattr(item, "filename")
+            ]
+            if multipart_references:
+                policy = resolve_api_key_policy(get_api_key_record(api_key_id))
+                if not policy.get("allow_uploads", True):
+                    raise GatewayAPIError(
+                        403,
+                        "API_KEY_UPLOAD_FORBIDDEN",
+                        "API key is not allowed to upload files",
+                        request_id=gateway_request_id(request),
+                    )
+                account = pick_account_for_generation("video") or pick_account_for_generation("image")
+                if not account:
+                    raise GatewayAPIError(503, "NO_ACCOUNT_AVAILABLE", "no verified account available", request_id=gateway_request_id(request))
+                reference_images, reference_videos = await upload_openai_input_reference_files(
+                    multipart_references,
+                    api_key_id,
+                    account,
+                    gateway_request_id(request),
+                )
+            native_body = openai_video_body_from_request(
+                body,
+                reference_images=reference_images,
+                reference_videos=reference_videos,
+                account_id=int(account["id"]) if multipart_references else None,
+            )
+    else:
+        try:
+            body = await parse_openai_video_generation_request(request)
+        except ValidationError as exc:
+            raise RequestValidationError(exc.errors()) from exc
+        requested_model = str(body.model or "sora-2")
+        requested_size = str(body.size or "auto")
+        if body.input_reference:
+            reference_images, reference_videos, upload_account_id = resolve_uploaded_input_reference(
+                api_key_id,
+                body.input_reference,
+            )
+            native_body = openai_video_body_from_request(
+                body,
+                reference_images=reference_images,
+                reference_videos=reference_videos,
+                account_id=upload_account_id,
+            )
+        else:
+            native_body = openai_video_body_from_request(body)
+    native_response = gateway_generate(native_body, request, api_key_id)
+    content = json_response_content(native_response)
+    if native_response.status_code >= 400:
+        error = content.get("error") if isinstance(content.get("error"), dict) else {}
+        return openai_error_response(
+            native_response.status_code,
+            str(error.get("message") or "video generation failed"),
+            code=str(error.get("code") or "video_generation_failed"),
+        )
+    task_id = int(content.get("task_id") or 0)
+    task = openai_video_task(task_id, api_key_id)
+    return task_to_video_object(
+        task,
+        requested_model=requested_model,
+        requested_size=requested_size,
+    )
+
+
+@app.get("/v1/videos/{video_id}/content")
+def gateway_openai_video_content(video_id: str, api_key_id: int = Depends(require_api_key)):
+    task = openai_video_task(decode_video_id(video_id), api_key_id)
+    if task.get("status") != "completed":
+        raise OpenAICompatError(
+            "video is not completed",
+            param="video_id",
+            code="video_not_completed",
+            status_code=409,
+        )
+    assets = task.get("assets") if isinstance(task.get("assets"), list) else []
+    asset = str(assets[0] if assets else "")
+    parsed = urlparse(asset)
+    allowlist = {
+        str(item).strip().lower()
+        for item in openai_compat_cfg().get("asset_host_allowlist", ["cdn.oreateai.com"])
+        if str(item).strip()
+    }
+    if parsed.scheme != "https" or not parsed.hostname or parsed.hostname.lower() not in allowlist:
+        raise OpenAICompatError(
+            "video asset is unavailable",
+            param="video_id",
+            code="invalid_video_asset",
+            status_code=502,
+        )
+    return RedirectResponse(asset, status_code=307)
+
+
+@app.get("/v1/videos/{video_id}")
+def gateway_openai_video_detail(video_id: str, api_key_id: int = Depends(require_api_key)):
+    task = openai_video_task(decode_video_id(video_id), api_key_id)
+    return openai_video_object(task)
+
+
+@app.delete("/v1/videos/{video_id}")
+def gateway_openai_video_delete(video_id: str, api_key_id: int = Depends(require_api_key)):
+    task_id = decode_video_id(video_id)
+    task = openai_video_task(task_id, api_key_id)
+    if task.get("status") in TASK_TERMINAL_STATUSES:
+        raise OpenAICompatError(
+            "terminal video jobs cannot be cancelled",
+            param="video_id",
+            code="video_not_cancellable",
+            status_code=409,
+        )
+    cancel_task_record(task_id, api_key_id)
+    return openai_video_object(openai_video_task(task_id, api_key_id))
+
+
 @app.post("/v1/uploads")
 async def gateway_upload(
     request: Request,
@@ -5007,24 +6401,94 @@ async def gateway_upload(
     policy = resolve_api_key_policy(get_api_key_record(api_key_id))
     if not policy.get("allow_uploads", True):
         raise GatewayAPIError(403, "API_KEY_UPLOAD_FORBIDDEN", "API key is not allowed to upload files", request_id=request_id)
-    account = pick_account_for_generation("video", account_id) or pick_account_for_generation("image", account_id)
-    if not account:
-        raise GatewayAPIError(503, "NO_ACCOUNT_AVAILABLE", "no verified account available", request_id=request_id)
-    data = await file.read()
+    now = time.time()
+    filename = Path(file.filename or "upload.bin").name
+    extension = normalized_file_extension(Path(filename).suffix)
+    if extension not in MEDIA_UPLOAD_EXTENSIONS:
+        raise GatewayAPIError(
+            415,
+            "UNSUPPORTED_UPLOAD_TYPE",
+            "only supported image and video files can be uploaded",
+            {"field": "file"},
+            request_id=request_id,
+        )
+    with REQUEST_ADMISSION_LOCK:
+        check_rate_limit(api_key_id, policy, now, request_id)
+        check_daily_quota(api_key_id, 0, policy, now, request_id)
+        account = pick_account_for_generation("video", account_id) or pick_account_for_generation("image", account_id)
+        if not account:
+            raise GatewayAPIError(503, "NO_ACCOUNT_AVAILABLE", "no verified account available", request_id=request_id)
+        usage_id = log_usage(
+            api_key_id,
+            "upload",
+            account["id"],
+            filename,
+            "uploading",
+            "upload admitted",
+            request_id=request_id,
+            estimated_point_cost=0,
+        )
+    max_bytes = max(1, int_or_default(gateway_cfg().get("upload_max_bytes"), 104857600))
+    chunk_bytes = max(1, int_or_default(gateway_cfg().get("upload_read_chunk_bytes"), 1048576))
+    chunks: List[bytes] = []
+    total_bytes = 0
+    while True:
+        chunk = await file.read(chunk_bytes)
+        if not chunk:
+            break
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            update_usage_log(
+                usage_id,
+                status="failed",
+                response_summary="uploaded file exceeds the configured size limit",
+                error_code="UPLOAD_TOO_LARGE",
+                status_code=413,
+            )
+            raise GatewayAPIError(
+                413,
+                "UPLOAD_TOO_LARGE",
+                "uploaded file exceeds the configured size limit",
+                {"field": "file", "max_bytes": max_bytes},
+                request_id=request_id,
+            )
+        chunks.append(chunk)
+    data = b"".join(chunks)
     if not data:
+        update_usage_log(
+            usage_id,
+            status="failed",
+            response_summary="uploaded file is empty",
+            error_code="EMPTY_UPLOAD",
+            status_code=400,
+        )
         raise GatewayAPIError(400, "EMPTY_UPLOAD", "uploaded file is empty", {"field": "file"}, request_id=request_id)
     try:
         session = CLIENT.session_from_account(account)
         attachment = CLIENT.upload_file_bytes(
             session,
-            file.filename or "upload.bin",
+            filename,
             data,
             file.content_type or "application/octet-stream",
         )
     except Exception as e:
         mark_account_failure(account["id"], e)
-        raise GatewayAPIError(503, "UPLOAD_FAILED", str(e), request_id=request_id)
+        update_usage_log(
+            usage_id,
+            status="failed",
+            response_summary="upstream upload failed",
+            error_code="UPLOAD_FAILED",
+            status_code=503,
+        )
+        raise GatewayAPIError(503, "UPLOAD_FAILED", "upstream upload failed", request_id=request_id)
     mark_account_success(account["id"])
+    save_uploaded_media_record(api_key_id, int(account["id"]), attachment)
+    update_usage_log(
+        usage_id,
+        status="completed",
+        response_summary="upload completed",
+        status_code=200,
+    )
     return {
         "ok": True,
         "request_id": request_id,
@@ -5035,15 +6499,38 @@ async def gateway_upload(
 
 
 @app.get("/v1/tasks")
-def gateway_tasks(api_key_id: int = Depends(require_api_key)):
+def gateway_tasks(
+    limit: int = 50,
+    offset: int = 0,
+    status: Optional[str] = None,
+    kind: Optional[str] = None,
+    api_key_id: int = Depends(require_api_key),
+):
     """List tasks created by this API key."""
+    if limit < 1 or limit > MAX_LIST_LIMIT:
+        raise HTTPException(422, f"limit must be between 1 and {MAX_LIST_LIMIT}")
+    if offset < 0 or offset > MAX_LIST_OFFSET:
+        raise HTTPException(422, f"offset must be between 0 and {MAX_LIST_OFFSET}")
+    if kind and kind not in API_LIST_KINDS:
+        raise HTTPException(422, "kind is not supported")
+    if status and status not in TASK_LIST_STATUSES:
+        raise HTTPException(422, "status is not supported")
+    where = ["api_key_id=?"]
+    params: List[Any] = [api_key_id]
+    if status:
+        where.append("status=?")
+        params.append(status)
+    if kind:
+        where.append("kind=?")
+        params.append(kind)
     conn = db_conn()
     rows = conn.execute(
-        "SELECT * FROM tasks WHERE api_key_id=? ORDER BY id DESC LIMIT 50",
-        (api_key_id,),
+        f"SELECT * FROM tasks WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ? OFFSET ?",
+        tuple(params + [limit + 1, offset]),
     ).fetchall()
     conn.close()
-    return {"items": [task_row_to_public(r) for r in rows]}
+    items = [task_row_to_public(r) for r in rows[:limit]]
+    return {"items": items, "limit": limit, "offset": offset, "has_more": len(rows) > limit}
 
 
 @app.get("/v1/accounts/status")
@@ -5069,17 +6556,86 @@ def healthz():
     return {"ok": True, "status": "ok"}
 
 
+def validate_account_secret_storage_readiness() -> None:
+    conn = db_conn()
+    try:
+        rows = conn.execute("SELECT password,ouid,ouss FROM accounts").fetchall()
+    finally:
+        conn.close()
+    stored_values = [
+        value
+        for row in rows
+        for value in (row["password"], row["ouid"], row["ouss"])
+        if value not in (None, "")
+    ]
+    if not stored_values:
+        return
+    if not active_encryption_key():
+        raise HTTPException(503, "account secrets exist but the server encryption key is not configured")
+    try:
+        secret_fernet(required=True)
+    except RuntimeError as exc:
+        raise HTTPException(503, "server encryption key is invalid") from exc
+    if any(not is_encrypted_secret(value) for value in stored_values):
+        raise HTTPException(503, "plaintext account secrets remain; run the secret migration before serving traffic")
+    try:
+        for value in stored_values:
+            decrypt_secret_value(value, required=True)
+    except RuntimeError as exc:
+        raise HTTPException(503, "server encryption key cannot decrypt stored account secrets") from exc
+
+
+def server_host_requires_public_deployment_acknowledgement(host: Any) -> bool:
+    normalized = str(host or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized in {"localhost", "::1"}:
+        return False
+    return not normalized.startswith("127.")
+
+
+def validate_public_bind_readiness() -> None:
+    if not server_host_requires_public_deployment_acknowledgement(CFG.get("server", {}).get("host")):
+        return
+    deployment = deployment_cfg()
+    if (
+        bool(deployment.get("allow_public_bind"))
+        and bool(deployment.get("trust_reverse_proxy"))
+        and bool(deployment.get("tls_terminated_by_proxy"))
+    ):
+        return
+    raise HTTPException(
+        503,
+        "public bind requires explicit reverse-proxy and TLS acknowledgement before serving traffic",
+    )
+
+
 @app.get("/readyz")
 def readyz():
+    application_lock = APPLICATION_WORKER_LOCK
+    if application_lock is not None and not APP_LIFECYCLE_STARTED:
+        raise HTTPException(503, "application worker lifecycle is not in a ready state")
+    if APP_LIFECYCLE_STARTED:
+        if application_lock is None or not application_lock.is_held:
+            raise HTTPException(503, "single application worker lock is not held")
     try:
         conn = db_conn()
         conn.execute("BEGIN IMMEDIATE")
         conn.rollback()
         conn.close()
     except Exception as exc:
-        raise HTTPException(503, f"database not ready: {exc}")
+        raise HTTPException(503, "database not ready") from exc
     if not isinstance(CFG, dict) or not isinstance(gateway_cfg(), dict):
         raise HTTPException(503, "config not ready")
+    admin_password = str(CFG.get("server", {}).get("admin_password") or "")
+    if is_unsafe_admin_password(admin_password):
+        raise HTTPException(503, "administrator credentials are not production-safe")
+    validate_public_bind_readiness()
+    validate_account_secret_storage_readiness()
+    if task_worker_enabled():
+        worker = TASK_WORKER_THREAD
+        if worker is None or not worker.is_alive():
+            raise HTTPException(503, "task worker not ready")
     rows = list_accounts()
     summary = account_pool_summary(rows)
     if summary["healthy"] <= 0:
@@ -5114,7 +6670,15 @@ def metrics():
 
 @app.get("/v1/capabilities")
 def gateway_capabilities(api_key_id: int = Depends(require_api_key)):
-    return load_capabilities_from_pool()
+    policy = resolve_api_key_policy(get_api_key_record(api_key_id))
+    return load_capabilities_from_pool(policy)
+
+
+@app.get("/v1/models")
+def gateway_openai_models(api_key_id: int = Depends(require_api_key)):
+    policy = resolve_api_key_policy(get_api_key_record(api_key_id))
+    capabilities = load_capabilities_from_pool(policy)
+    return openai_model_list(capabilities, CFG)
 
 
 def gateway_task_detail_payload(task_id: int, api_key_id: Optional[int] = None) -> Dict[str, Any]:
@@ -5145,36 +6709,127 @@ def gateway_task_detail_payload(task_id: int, api_key_id: Optional[int] = None) 
     return {"ok": True, "task": task}
 
 
-def retry_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[str, Any]:
-    row = fetch_task_row(task_id, api_key_id)
-    if not row:
-        raise GatewayAPIError(404, "TASK_NOT_FOUND", "task not found")
-    task = dict(row)
-    if not task_retryable_status(task.get("status") or ""):
-        raise GatewayAPIError(409, "TASK_NOT_RETRYABLE", "only failed or expired tasks can be retried")
-    update_task_record(
-        task_id,
-        status="queued",
-        error_code="",
-        error_message="",
-        response_json={},
-        assets_json=[],
-        chat_id="",
-        focus_id="",
-        cancel_requested_at=None,
-        next_attempt_at=None,
-        started_at=None,
-        finished_at=None,
-    )
-    if task.get("api_key_id"):
-        update_usage_log_for_task(
-            task_id,
-            task.get("api_key_id"),
-            status="queued",
-            response_summary="retry requested",
-            error_code="",
-            status_code=202,
+def retry_task_record(
+    task_id: int,
+    api_key_id: Optional[int] = None,
+    request_id: str = "",
+) -> Dict[str, Any]:
+    retry_request_id = request_id or gateway_request_id()
+    with REQUEST_ADMISSION_LOCK:
+        row = fetch_task_row(task_id, api_key_id)
+        if not row:
+            raise GatewayAPIError(404, "TASK_NOT_FOUND", "task not found")
+        task = dict(row)
+        if not task_retryable_status(task.get("status") or ""):
+            raise GatewayAPIError(409, "TASK_NOT_RETRYABLE", "only failed or expired tasks can be retried")
+        body_data = model_data(resolve_task_body(row))
+        body_data["account_id"] = None
+        body = GatewayGenerateIn(**body_data)
+        tenant_api_key_id = int_or_default(task.get("api_key_id"), 0) or None
+        policy: Optional[Dict[str, Any]] = None
+        now = time.time()
+        if tenant_api_key_id is not None:
+            api_key_row = get_api_key_record(tenant_api_key_id)
+            if not bool(api_key_row["enabled"]) or api_key_row["deleted_at"] is not None:
+                raise GatewayAPIError(
+                    403,
+                    "API_KEY_DISABLED",
+                    "the API key associated with this task is disabled",
+                    request_id=retry_request_id,
+                )
+            policy = resolve_api_key_policy(api_key_row)
+            check_rate_limit(tenant_api_key_id, policy, now, retry_request_id)
+
+        account, caps, options, estimated_point_cost = select_generation_account(
+            body,
+            request_id=retry_request_id,
         )
+        if tenant_api_key_id is not None and policy is not None:
+            enforce_api_key_scope(policy, body.kind, options, caps, retry_request_id)
+            check_daily_quota(
+                tenant_api_key_id,
+                estimated_point_cost,
+                policy,
+                now,
+                retry_request_id,
+            )
+
+        queued_response = {
+            "ok": True,
+            "task_id": task_id,
+            "account_id": account["id"],
+            "request_id": retry_request_id,
+            "idempotent_replay": False,
+            "estimated_point_cost": estimated_point_cost,
+            "status": "queued",
+        }
+        conn = db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            source_usage = conn.execute(
+                "SELECT idempotency_key FROM usage_log WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            result = conn.execute(
+                """
+                UPDATE tasks
+                SET status='queued', account_id=?, estimated_point_cost=?, actual_point_cost=NULL,
+                    error_code='', error_message='', response_json=?, assets_json=?, chat_id='', focus_id='',
+                    cancel_requested_at=NULL, next_attempt_at=NULL, started_at=NULL, finished_at=NULL,
+                    balance_before_json=NULL, balance_after_json=NULL,
+                    balance_before_rest_point=NULL, balance_before_daily_point=NULL, balance_before_bonus_point=NULL,
+                    balance_after_rest_point=NULL, balance_after_daily_point=NULL, balance_after_bonus_point=NULL,
+                    updated_at=?
+                WHERE id=? AND status IN ('failed', 'expired')
+                """,
+                (
+                    account["id"],
+                    estimated_point_cost,
+                    encode_json_value({}),
+                    encode_json_value([]),
+                    now,
+                    task_id,
+                ),
+            )
+            if result.rowcount != 1:
+                raise GatewayAPIError(
+                    409,
+                    "TASK_NOT_RETRYABLE",
+                    "task state changed before the retry could be reserved",
+                    request_id=retry_request_id,
+                )
+            if tenant_api_key_id is not None:
+                insert_usage_log(
+                    conn,
+                    tenant_api_key_id,
+                    body.kind,
+                    account["id"],
+                    body.prompt,
+                    "queued",
+                    "retry requested",
+                    task_id,
+                    retry_request_id,
+                    str(source_usage["idempotency_key"] or "") if source_usage else "",
+                    str(options.get("model_name") or ""),
+                    str(options.get("resolution") or ""),
+                    str(options.get("ratio") or ""),
+                    int_or_default(options.get("duration"), 0) or None,
+                    str(options.get("scene_id") or ""),
+                    estimated_point_cost,
+                    "",
+                    202,
+                )
+            conn.execute(
+                "UPDATE idempotency_keys SET status_code=202, response_json=? WHERE task_id=?",
+                (json.dumps(queued_response, ensure_ascii=False), task_id),
+            )
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
     TASK_WORKER_WAKE.set()
     return gateway_task_detail_payload(task_id, api_key_id)
 
@@ -5248,8 +6903,8 @@ def gateway_task_detail_alias(task_id: int, api_key_id: int = Depends(require_ap
 
 
 @app.post("/v1/tasks/{task_id}/retry")
-def gateway_task_retry(task_id: int, api_key_id: int = Depends(require_api_key)):
-    return retry_task_record(task_id, api_key_id)
+def gateway_task_retry(task_id: int, request: Request, api_key_id: int = Depends(require_api_key)):
+    return retry_task_record(task_id, api_key_id, gateway_request_id(request))
 
 
 @app.post("/v1/tasks/{task_id}/cancel")
@@ -5264,10 +6919,54 @@ def gateway_task_hydrate(task_id: int, api_key_id: int = Depends(require_api_key
 
 @app.on_event("startup")
 def on_startup():
-    init_db()
-    if not CONFIG_PATH.exists():
-        save_config(CFG)
-    ensure_task_worker_started()
+    global APPLICATION_WORKER_LOCK, APP_LIFECYCLE_STARTED
+    validate_single_worker_configuration(os.environ)
+    application_lock = APPLICATION_WORKER_LOCK
+    if application_lock is None:
+        application_lock = SingleWorkerLock(worker_lock_path(DB_PATH, os.environ))
+        APPLICATION_WORKER_LOCK = application_lock
+
+    try:
+        application_lock.acquire()
+        if APP_LIFECYCLE_STARTED:
+            return
+        try:
+            validate_public_bind_readiness()
+        except HTTPException as exc:
+            raise RuntimeError(str(exc.detail)) from exc
+        init_db()
+        if not CONFIG_PATH.exists():
+            save_config(CFG)
+        recover_stale_running_tasks()
+        ensure_task_worker_started()
+    except BaseException:
+        APP_LIFECYCLE_STARTED = False
+        application_lock.release()
+        if APPLICATION_WORKER_LOCK is application_lock:
+            APPLICATION_WORKER_LOCK = None
+        raise
+
+    APP_LIFECYCLE_STARTED = True
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> bool:
+    global APPLICATION_WORKER_LOCK, APP_LIFECYCLE_STARTED
+    shutdown_timeout = float_or_default(
+        gateway_cfg().get("worker_shutdown_timeout_seconds"), 30.0
+    )
+    if not math.isfinite(shutdown_timeout):
+        shutdown_timeout = 30.0
+    worker_stopped = stop_task_worker(max(0.0, shutdown_timeout))
+    APP_LIFECYCLE_STARTED = False
+    if not worker_stopped:
+        return False
+
+    application_lock = APPLICATION_WORKER_LOCK
+    if application_lock is not None:
+        application_lock.release()
+        APPLICATION_WORKER_LOCK = None
+    return True
 
 
 @app.get("/")
@@ -5460,11 +7159,84 @@ def generate_media(body: MediaTaskIn, request: Request, _=Depends(require_admin)
 
 
 @app.get("/api/tasks")
-def list_tasks(_=Depends(require_admin)):
+def list_tasks(
+    limit: int = 200,
+    offset: int = 0,
+    status: Optional[str] = None,
+    kind: Optional[str] = None,
+    model_name: Optional[str] = None,
+    scene_id: Optional[str] = None,
+    api_key_id: Optional[int] = None,
+    client_id: Optional[int] = None,
+    account_id: Optional[int] = None,
+    error_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    _=Depends(require_admin),
+):
+    if limit < 1 or limit > MAX_LIST_LIMIT:
+        raise HTTPException(422, f"limit must be between 1 and {MAX_LIST_LIMIT}")
+    if offset < 0 or offset > MAX_LIST_OFFSET:
+        raise HTTPException(422, f"offset must be between 0 and {MAX_LIST_OFFSET}")
+    if kind and kind not in API_LIST_KINDS:
+        raise HTTPException(422, "kind is not supported")
+    if status and status not in TASK_LIST_STATUSES:
+        raise HTTPException(422, "status is not supported")
+    where = ["1=1"]
+    params: List[Any] = []
+    start = parse_report_date_boundary(date_from, end_of_day=False)
+    end = parse_report_date_boundary(date_to, end_of_day=True)
+    if start is not None:
+        where.append("t.created_at>=?")
+        params.append(start)
+    if end is not None:
+        where.append("t.created_at<=?")
+        params.append(end)
+    if status:
+        where.append("t.status=?")
+        params.append(status)
+    if kind:
+        where.append("t.kind=?")
+        params.append(kind)
+    if model_name:
+        where.append("t.model_name=?")
+        params.append(model_name)
+    if scene_id:
+        where.append("t.scene_id=?")
+        params.append(scene_id)
+    if api_key_id is not None:
+        where.append("t.api_key_id=?")
+        params.append(api_key_id)
+    if client_id is not None:
+        where.append("k.client_id=?")
+        params.append(client_id)
+    if account_id is not None:
+        where.append("t.account_id=?")
+        params.append(account_id)
+    if error_code:
+        where.append("t.error_code=?")
+        params.append(error_code)
     conn = db_conn()
-    rows = conn.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()
+    rows = conn.execute(
+        f"""
+        SELECT
+            t.*,
+            a.email AS account_email,
+            k.name AS api_key_name,
+            c.name AS client_name
+        FROM tasks t
+        LEFT JOIN accounts a ON t.account_id=a.id
+        LEFT JOIN api_keys k ON t.api_key_id=k.id
+        LEFT JOIN clients c ON k.client_id=c.id
+        WHERE {' AND '.join(where)}
+        ORDER BY t.id DESC
+        LIMIT ? OFFSET ?
+        """,
+        tuple(params + [limit + 1, offset]),
+    ).fetchall()
     conn.close()
-    return {"items": [task_row_to_public(r) for r in rows]}
+    items = [task_row_to_public(r) for r in rows[:limit]]
+    return {"items": items, "limit": limit, "offset": offset, "has_more": len(rows) > limit}
 
 
 @app.get("/api/tasks/{task_id}")
@@ -5473,8 +7245,8 @@ def admin_task_detail(task_id: int, _=Depends(require_admin)):
 
 
 @app.post("/api/tasks/{task_id}/retry")
-def admin_task_retry(task_id: int, _=Depends(require_admin)):
-    return retry_task_record(task_id)
+def admin_task_retry(task_id: int, request: Request, _=Depends(require_admin)):
+    return retry_task_record(task_id, request_id=gateway_request_id(request))
 
 
 @app.post("/api/tasks/{task_id}/cancel")
@@ -5758,6 +7530,14 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
       <tbody id="usage-tbody"></tbody>
     </table>
   </div>
+  <h2 style="margin-top:24px">上传素材</h2>
+  <button class="btn-secondary btn-sm" onclick="loadUploads()" style="margin-bottom:12px">刷新</button>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>类型</th><th>账号</th><th>Key</th><th>文件</th><th>Object</th><th>关联任务</th><th>状态</th><th>时间</th><th>操作</th></tr></thead>
+      <tbody id="uploads-tbody"></tbody>
+    </table>
+  </div>
   <h2 style="margin-top:24px">💹 成本报表</h2>
   <div class="row" style="margin-bottom:16px">
     <div class="col"><label>开始日期</label><input id="cost-date-from" type="date"></div>
@@ -5931,7 +7711,7 @@ async function init() {
   document.getElementById('status-text').textContent = '加载中...';
   try {
     await loadClients();
-    await Promise.all([loadAccounts(), loadTasks(), loadApiKeys(), loadUsage(), loadCostReport(), loadAuditLogs(), loadSettings()]);
+    await Promise.all([loadAccounts(), loadTasks(), loadApiKeys(), loadUsage(), loadUploads(), loadCostReport(), loadAuditLogs(), loadSettings()]);
     await loadCapabilities();
   } catch (e) {
     document.getElementById('status-text').textContent = '未授权';
@@ -5947,7 +7727,7 @@ async function init() {
 function copyExample() { copyText(document.getElementById('gw-example').textContent); }
 
 // === Accounts ===
-let state = {accounts:[],tasks:[],apikeys:[],clients:[],usage:[],costReport:[],auditLogs:[],settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}}};
+let state = {accounts:[],tasks:[],apikeys:[],clients:[],usage:[],uploads:[],costReport:[],auditLogs:[],settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}}};
 async function api(m,u,b){
   const o={method:m,headers:authHeaders()};
   if(b) o.body=JSON.stringify(b);
@@ -6061,11 +7841,11 @@ function renderAccounts(){
     const healthMeta = `${a.risk_status||'clean'}${a.cooling ? ` · ${a.cooldown_remaining_seconds || 0}s` : ''}`;
     return `<tr>
       <td>${a.id}</td>
-      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis">${em}<button class="copy-btn" onclick="copyText('${em.replace(/'/g,"\\'")}')">📋</button></td>
-      <td><span class="tag ${sc}">${a.status}</span></td>
-      <td><span class="tag ${hc}">${a.health_status || '-'}</span><div style="font-size:11px;color:#86868b">${healthMeta}</div></td>
-      <td>${a.source||'-'}</td>
-      <td style="font-family:monospace;font-size:11px">${a.ouid_preview||''}</td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(em)}<button class="copy-btn" data-copy-value="${escapeHtml(em)}" onclick="copyText(this.dataset.copyValue)">📋</button></td>
+      <td><span class="tag ${sc}">${escapeHtml(a.status||'-')}</span></td>
+      <td><span class="tag ${hc}">${escapeHtml(a.health_status || '-')}</span><div style="font-size:11px;color:#86868b">${escapeHtml(healthMeta)}</div></td>
+      <td>${escapeHtml(a.source||'-')}</td>
+      <td style="font-family:monospace;font-size:11px">${escapeHtml(a.ouid_preview||'')}</td>
       <td>${restPoint}</td>
       <td style="font-size:11px">${balanceUpdatedAt}</td>
       <td style="font-size:11px">${new Date((a.created_at||0)*1000).toLocaleString()}</td>
@@ -6205,7 +7985,7 @@ function renderTasks(){
 function renderTaskAsset(asset){
   const url = String(asset || '');
   if(!url) return '';
-  if(/\.(mp4|mov|webm)(\?|$)/i.test(url)) {
+  if(/\\.(mp4|mov|webm)(\\?|$)/i.test(url)) {
     return `<video class="task-preview-media" controls src="${escapeHtml(url)}"></video>`;
   }
   return `<img class="task-preview-media" src="${escapeHtml(url)}" alt="task result">`;
@@ -6287,7 +8067,7 @@ function renderClients(){
   const tbody=document.getElementById('clients-tbody');
   if(!tbody) return;
   tbody.innerHTML = (state.clients||[]).map(c => {
-    return `<tr><td>${c.id}</td><td>${c.name||'-'}</td><td>${c.contact||'-'}</td><td><span class="tag ${c.status==='active'?'tag-green':'tag-gray'}">${c.status||'active'}</span></td><td style="font-size:11px">${new Date((c.created_at||0)*1000).toLocaleString()}</td></tr>`;
+    return `<tr><td>${c.id}</td><td>${escapeHtml(c.name||'-')}</td><td>${escapeHtml(c.contact||'-')}</td><td><span class="tag ${c.status==='active'?'tag-green':'tag-gray'}">${escapeHtml(c.status||'active')}</span></td><td style="font-size:11px">${new Date((c.created_at||0)*1000).toLocaleString()}</td></tr>`;
   }).join('');
 }
 async function createClient(){
@@ -6351,7 +8131,19 @@ async function deleteKey(id){if(!confirm('确认删除此 API Key？')) return; 
 async function loadUsage(){const r=await api('GET','/api/admin/usage');state.usage=r.items||[];renderUsage();}
 function renderUsage(){
   document.getElementById('usage-tbody').innerHTML = state.usage.slice(0,50).map(u => {
-    return `<tr><td>${u.id}</td><td><span class="tag ${u.kind==='image'?'tag-blue':'tag-green'}">${u.kind}</span></td><td>${u.account_email||u.account_id||'-'}</td><td>${u.model_name||'-'}</td><td>${u.estimated_point_cost ?? '-'}</td><td>${u.error_code||'-'}</td><td>${u.status}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${(u.prompt||'').substring(0,40)}</td><td style="font-size:11px">${new Date((u.created_at||0)*1000).toLocaleString()}</td></tr>`;
+    return `<tr><td>${u.id}</td><td><span class="tag ${u.kind==='image'?'tag-blue':'tag-green'}">${escapeHtml(u.kind||'-')}</span></td><td>${escapeHtml(u.account_email||u.account_id||'-')}</td><td>${escapeHtml(u.model_name||'-')}</td><td>${u.estimated_point_cost ?? '-'}</td><td>${escapeHtml(u.error_code||'-')}</td><td>${escapeHtml(u.status||'-')}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${escapeHtml((u.prompt||'').substring(0,40))}</td><td style="font-size:11px">${new Date((u.created_at||0)*1000).toLocaleString()}</td></tr>`;
+  }).join('');
+}
+
+async function loadUploads(){const r=await api('GET','/api/admin/uploads');state.uploads=r.items||[];renderUploads();}
+function renderUploads(){
+  const tbody=document.getElementById('uploads-tbody');
+  if(!tbody) return;
+  tbody.innerHTML = (state.uploads||[]).slice(0,50).map(item => {
+    const objectPath=String(item.object_path||'');
+    const attachment=JSON.stringify(item.attachment||{});
+    const kindClass=item.kind==='image'?'tag-blue':item.kind==='video'?'tag-green':'tag-gray';
+    return `<tr><td>${item.id}</td><td><span class="tag ${kindClass}">${escapeHtml(item.kind||'-')}</span></td><td>${escapeHtml(item.account_email||item.account_id||'-')}</td><td>${escapeHtml(item.api_key_name||item.api_key_id||'-')}</td><td>${escapeHtml(item.file_name||'-')}<div style="font-size:11px;color:#86868b">${escapeHtml(item.content_type||'')}</div></td><td style="font-family:monospace;font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(objectPath)}</td><td>${item.related_task_count ?? 0}</td><td>${escapeHtml(item.status||'-')}</td><td style="font-size:11px">${new Date((item.created_at||0)*1000).toLocaleString()}</td><td><button class="btn-sm btn-secondary" data-copy-value="${escapeHtml(objectPath)}" onclick="copyText(this.dataset.copyValue)">Object</button> <button class="btn-sm btn-secondary" data-copy-value="${escapeHtml(attachment)}" onclick="copyText(this.dataset.copyValue)">Attachment</button></td></tr>`;
   }).join('');
 }
 
@@ -6462,9 +8254,31 @@ init();
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
-    return HTMLResponse(ADMIN_HTML)
+    return HTMLResponse(
+        ADMIN_HTML,
+        headers={
+            "Content-Security-Policy": (
+                "default-src 'self'; "
+                "script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: https://cdn.oreateai.com; "
+                "media-src 'self' https://cdn.oreateai.com; "
+                "connect-src 'self' ws: wss:; "
+                "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+            ),
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "no-referrer",
+            "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+        },
+    )
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=CFG["server"]["host"], port=int(CFG["server"]["port"]))
+    uvicorn.run(
+        app,
+        host=CFG["server"]["host"],
+        port=int(CFG["server"]["port"]),
+        workers=1,
+    )

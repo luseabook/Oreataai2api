@@ -25,6 +25,26 @@
 - `accounts.db` — SQLite 号池数据库（运行后自动生成）
 
 ## 运行
+
+运行要求：
+- Python 3.11 或更高版本。
+- Node.js 18 或更高版本；`banti_jt_helper.js` 是生成请求的必要运行依赖。
+- 必须配置独立保存的 Fernet 密钥 `OREATE_ENCRYPTION_KEY`，否则已有明文账号不会迁移，新账号也不能安全写入。
+
+生成密钥（仅在受控终端执行，输出不要写入 Git、日志或普通备份）：
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Windows PowerShell 示例：
+
+```powershell
+$env:OREATE_ENCRYPTION_KEY = "<上一步生成的密钥>"
+```
+
+密钥必须和数据库备份分开保存；丢失密钥将无法解密账号凭据。
+
 ```bash
 pip install -r requirements.txt
 cp config.example.json config.json
@@ -32,9 +52,36 @@ cp config.example.json config.json
 python server.py
 ```
 
+### 单应用 worker 部署边界
+
+当前限流、调度唤醒和部分运行状态是进程内状态，因此一个网关实例必须只运行 **1 个应用 worker**。`python server.py` 已显式使用 `workers=1`；外部进程管理器也必须保持单 worker，例如：
+
+```bash
+uvicorn server:app --workers 1
+gunicorn server:app --worker-class uvicorn.workers.UvicornWorker --workers 1
+```
+
+启动时会读取并交叉校验以下 worker 声明：
+
+- `OREATE_APP_WORKERS=1`（网关的明确部署声明；旧的 `OREATE_WORKER_COUNT=1` 仍兼容）
+- `WEB_CONCURRENCY=1`
+- `GUNICORN_CMD_ARGS="--workers 1"`
+
+任何大于 1、非法或互相冲突的声明都会在数据库初始化前拒绝启动。除声明校验外，进程还会持有与当前数据库绑定的 `<accounts.db>.worker.lock` 文件锁作为最终防线；即使漏配 worker 环境变量，同一个数据库也不能被第二个应用 worker 同时启动。服务管理器需要单独的运行目录时，可用 `OREATE_WORKER_LOCK_PATH` 覆盖锁文件位置。锁文件本身不含凭据，正常退出时会释放；若后台任务线程未能在 `gateway.worker_shutdown_timeout_seconds`（默认 30 秒）内停止，进程会保留锁直到退出，避免旧线程和新实例并行处理任务。
+
 默认监听：
 - `http://127.0.0.1:8890`
 - 管理页：`http://127.0.0.1:8890/admin`
+
+### 公网监听 / 反向代理 / TLS 边界
+
+默认只建议绑定回环地址 `127.0.0.1`。如果要把 `server.host` 改成 `0.0.0.0`、公网 IP 或其他非回环地址，必须同时满足这三个显式声明：
+
+- `deployment.allow_public_bind=true`
+- `deployment.trust_reverse_proxy=true`
+- `deployment.tls_terminated_by_proxy=true`
+
+这三个开关是上线确认，不是功能开关。`/readyz` 会把“公网监听但未明确声明反向代理与 TLS 边界”判成不就绪，避免把管理面和网关直接裸露在明文 HTTP 或未审计入口上。推荐部署形态是：公网入口只放经过 TLS 的反向代理，网关进程自己仍保持单应用 worker，并且只接收来自该代理的流量。
 
 管理页和 `/api/*` 管理接口需要先用 `config.json` 中的管理员账号登录。`/v1/*` 网关接口继续使用 `Authorization: Bearer <API Key>`。
 占位密码（如 `admin123`、`CHANGE_ME`）会被拒绝登录；已有 `config.json` 也需要改掉旧默认密码。

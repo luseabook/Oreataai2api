@@ -1,14 +1,25 @@
 {
+  "database": {
+    "busy_timeout_ms": 5000,
+    "journal_mode": "WAL",
+    "synchronous": "NORMAL"
+  },
   "server": {
     "host": "127.0.0.1",
     "port": 8890,
     "admin_username": "admin",
     "admin_password": "CHANGE_ME"
   },
+  "deployment": {
+    "allow_public_bind": false,
+    "trust_reverse_proxy": false,
+    "tls_terminated_by_proxy": false
+  },
   "oreate": {
     "base_url": "https://www.oreateai.com",
     "default_fr": "main",
     "request_timeout": 30,
+    "verify_tls": true,
     "default_image_model": "Google Nano Banana 2",
     "default_image_ratio": "16:9",
     "default_image_resolution": "4K",
@@ -35,7 +46,24 @@
     "default_daily_request_limit": 0,
     "default_daily_point_limit": 0,
     "idempotency_ttl_hours": 24,
+    "idempotency_key_max_length": 255,
     "account_cooldown_seconds": 300,
-    "prompt_max_length": 4000
+    "prompt_max_length": 4000,
+    "request_id_max_length": 128,
+    "upload_max_bytes": 104857600,
+    "upload_read_chunk_bytes": 1048576,
+    "sync_wait_seconds": 0,
+    "sync_wait_max_seconds": 120,
+    "worker_shutdown_timeout_seconds": 30,
+    "running_task_stale_seconds": 300
+  },
+  "openai_compat": {
+    "image_sync_timeout_seconds": 120,
+    "max_sync_timeout_seconds": 120,
+    "image_model_aliases": {},
+    "video_model_aliases": {},
+    "asset_host_allowlist": [
+      "cdn.oreateai.com"
+    ]
   }
 }
