@@ -685,8 +685,29 @@ class GatewayHardeningTests(unittest.TestCase):
             self.assertEqual(detail.status_code, 200)
             task = detail.json()["task"]
             self.assertEqual(task["status"], "completed")
-            self.assertEqual(task["assets"], ["https://cdn.oreateai.com/static/result/x.jpg"])
+            self.assertRegex(
+                task["assets"][0],
+                rf"^http://testserver/v1/tasks/{payload['task_id']}/assets/0/clean\?signature=[0-9a-f]{{64}}$",
+            )
+            self.assertEqual(
+                server.task_response_assets(task["response"]),
+                task["assets"],
+            )
             self.assertEqual(task["attempt_count"], 1)
+            conn = server.db_conn()
+            stored = conn.execute(
+                "SELECT assets_json,response_json FROM tasks WHERE id=?",
+                (payload["task_id"],),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(
+                json.loads(stored["assets_json"]),
+                ["https://cdn.oreateai.com/static/result/x.jpg"],
+            )
+            self.assertEqual(
+                server.task_response_assets(json.loads(stored["response_json"])),
+                ["https://cdn.oreateai.com/static/result/x.jpg"],
+            )
 
     def test_task_retry_cancel_and_hydrate_actions_work(self):
         self.seed_account_with_capabilities()
@@ -3003,7 +3024,10 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["response"]["chat"]["chatId"], "chat-web")
-        self.assertEqual(payload["assets"], ["https://cdn.oreateai.com/static/result/x.jpg"])
+        self.assertRegex(
+            payload["assets"][0],
+            r"^http://testserver/v1/tasks/\d+/assets/0/clean\?signature=[0-9a-f]{64}$",
+        )
         create_session.assert_called_once()
         stream_generation.assert_called_once()
         hydrate.assert_called_once()

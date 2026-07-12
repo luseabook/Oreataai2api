@@ -3,10 +3,13 @@ import json
 import tempfile
 import time
 import unittest
+from io import BytesIO
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from PIL import Image, ImageDraw, ImageFont
 
 import server
 
@@ -355,6 +358,17 @@ class OpenAICompatEndpointTests(unittest.TestCase):
         self.assertIsNotNone(row)
         return int(row["id"])
 
+    @staticmethod
+    def synthetic_watermarked_image_bytes() -> bytes:
+        image = Image.new("RGB", (360, 640), (74, 52, 96))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, 359, 560), fill=(105, 78, 130))
+        font = ImageFont.load_default(size=24)
+        draw.text((232, 588), "Oreate AI", fill=(245, 245, 245), font=font)
+        payload = BytesIO()
+        image.save(payload, format="JPEG", quality=95)
+        return payload.getvalue()
+
     def seed_video_task(self, *, status: str = "queued", assets=None, api_key: str = "openai-video-key") -> int:
         return server.save_task(
             1,
@@ -498,6 +512,7 @@ class OpenAICompatEndpointTests(unittest.TestCase):
         self.assertEqual(response.json()["video"]["scenes"], [])
 
     def test_image_generation_returns_openai_url_response_and_maps_options(self):
+        source_image = self.synthetic_watermarked_image_bytes()
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
             patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-image", "focusId": "focus-image"}),
@@ -526,10 +541,14 @@ class OpenAICompatEndpointTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(set(response.json()), {"created", "data"})
-        self.assertEqual(
-            response.json()["data"],
-            [{"url": "https://cdn.oreateai.com/aiimage/result.png", "revised_prompt": "a production gateway"}],
-        )
+        data = response.json()["data"]
+        self.assertEqual(data[0]["revised_prompt"], "a production gateway")
+        clean_url = data[0]["url"]
+        parsed_clean_url = urlparse(clean_url)
+        self.assertEqual(parsed_clean_url.scheme, "http")
+        self.assertEqual(parsed_clean_url.netloc, "testserver")
+        self.assertRegex(parsed_clean_url.path, r"^/v1/tasks/\d+/assets/0/clean$")
+        self.assertEqual(len(parse_qs(parsed_clean_url.query).get("signature", [])), 1)
         conn = server.db_conn()
         task = conn.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT 1").fetchone()
         conn.close()
@@ -537,9 +556,33 @@ class OpenAICompatEndpointTests(unittest.TestCase):
         self.assertEqual(task["ratio"], "1:1")
         self.assertEqual(task["resolution"], "1K")
         self.assertEqual(task["status"], "completed")
+        self.assertEqual(
+            json.loads(task["assets_json"]),
+            ["https://cdn.oreateai.com/aiimage/result.png"],
+        )
+
+        with patch.object(server, "fetch_remote_image_asset", return_value=source_image):
+            cleaned = self.client.get(
+                clean_url,
+                headers={"Origin": "https://canvas.best"},
+            )
+        self.assertEqual(cleaned.status_code, 200)
+        self.assertEqual(cleaned.headers["access-control-allow-origin"], "https://canvas.best")
+        self.assertEqual(cleaned.headers["x-watermark-removed"], "true")
+        self.assertIn("public", cleaned.headers["cache-control"])
+        self.assertNotEqual(cleaned.content, source_image)
+        with Image.open(BytesIO(cleaned.content)) as result:
+            self.assertEqual(result.size, (360, 640))
+
+        tampered_query = parse_qs(parsed_clean_url.query)
+        tampered_query["signature"] = ["0" * 64]
+        tampered = self.client.get(
+            f"{parsed_clean_url.path}?signature={tampered_query['signature'][0]}"
+        )
+        self.assertEqual(tampered.status_code, 404)
 
     def test_image_generation_returns_base64_for_canvas_openai_requests(self):
-        source_image = b"\x89PNG\r\n\x1a\ncanvas-image"
+        source_image = self.synthetic_watermarked_image_bytes()
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
             patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-image", "focusId": "focus-image"}),
@@ -573,15 +616,15 @@ class OpenAICompatEndpointTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["access-control-allow-origin"], "https://canvas.best")
-        self.assertEqual(
-            response.json()["data"],
-            [
-                {
-                    "b64_json": base64.b64encode(source_image).decode("ascii"),
-                    "revised_prompt": "a canvas integration",
-                }
-            ],
-        )
+        result_data = response.json()["data"][0]
+        self.assertEqual(result_data["revised_prompt"], "a canvas integration")
+        cleaned_image = base64.b64decode(result_data["b64_json"])
+        self.assertNotEqual(cleaned_image, source_image)
+        with Image.open(BytesIO(cleaned_image)) as result:
+            self.assertEqual(result.size, (360, 640))
+            bottom_right = result.crop((250, 570, 360, 640))
+            extrema = bottom_right.convert("L").getextrema()
+            self.assertLess(extrema[1] - extrema[0], 35)
         fetch_asset.assert_called_once_with("https://cdn.oreateai.com/aiimage/result.png")
         conn = server.db_conn()
         task = conn.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT 1").fetchone()
@@ -659,14 +702,11 @@ class OpenAICompatEndpointTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json()["data"],
-            [
-                {
-                    "url": "https://cdn.oreateai.com/aiimage/edited.png",
-                    "revised_prompt": "replace the background",
-                }
-            ],
+        result = response.json()["data"][0]
+        self.assertEqual(result["revised_prompt"], "replace the background")
+        self.assertRegex(
+            result["url"],
+            r"^http://testserver/v1/tasks/\d+/assets/0/clean\?signature=[0-9a-f]{64}$",
         )
         upload_file.assert_called_once()
         conn = server.db_conn()

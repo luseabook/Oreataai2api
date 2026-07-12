@@ -73,6 +73,7 @@
     "max_sync_timeout_seconds": 120,
     "image_model_aliases": {},
     "video_model_aliases": {},
+    "public_base_url": "https://example.com",
     "cors_allowed_origins": [
       "https://canvas.best"
     ],

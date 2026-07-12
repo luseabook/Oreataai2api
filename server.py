@@ -1,7 +1,9 @@
 import asyncio
 import io
 import base64
+import copy
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -204,6 +206,7 @@ DEFAULT_CONFIG = {
         "max_sync_timeout_seconds": 120,
         "image_model_aliases": {},
         "video_model_aliases": {},
+        "public_base_url": "",
         "cors_allowed_origins": ["https://canvas.best"],
         "asset_host_allowlist": ["cdn.oreateai.com"],
         "asset_insecure_tls_fallback_hosts": ["cdn.oreateai.com"],
@@ -3684,6 +3687,117 @@ def validate_clean_asset_url(asset_url: str) -> str:
     return url
 
 
+def clean_asset_signature(task_id: int, asset_index: int, asset_url: str) -> str:
+    signing_secret = active_encryption_key()
+    if not signing_secret:
+        raise RuntimeError("server encryption key is not configured")
+    message = f"clean-asset:v1:{int(task_id)}:{int(asset_index)}:{asset_url}".encode("utf-8")
+    key = hashlib.sha256(signing_secret.encode("utf-8")).digest()
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
+def clean_asset_public_base_url(request: Request) -> str:
+    configured = str(openai_compat_cfg().get("public_base_url") or "").strip()
+    if configured:
+        parsed = urlparse(configured)
+        try:
+            parsed_port = parsed.port
+        except ValueError as exc:
+            raise RuntimeError("openai_compat.public_base_url is invalid") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise RuntimeError("openai_compat.public_base_url is invalid")
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = f":{parsed_port}" if parsed_port is not None else ""
+        return f"{parsed.scheme}://{host}{port}"
+    return str(request.base_url).rstrip("/")
+
+
+def public_clean_asset_url(
+    request: Request,
+    task_id: int,
+    asset_index: int,
+    asset_url: str,
+) -> str:
+    validated_url = validate_clean_asset_url(asset_url)
+    signature = clean_asset_signature(task_id, asset_index, validated_url)
+    return (
+        f"{clean_asset_public_base_url(request)}/v1/tasks/{int(task_id)}"
+        f"/assets/{int(asset_index)}/clean?signature={signature}"
+    )
+
+
+def public_task_for_request(task: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    public_task = copy.deepcopy(task)
+    if (
+        str(public_task.get("kind") or "").lower() != "image"
+        or str(public_task.get("status") or "").lower() != "completed"
+    ):
+        return public_task
+    source_assets = public_task.get("assets")
+    if not isinstance(source_assets, list):
+        return public_task
+
+    task_id = int_or_default(public_task.get("id"), 0)
+    if task_id <= 0:
+        return public_task
+    clean_assets = [
+        public_clean_asset_url(request, task_id, index, str(asset_url or ""))
+        for index, asset_url in enumerate(source_assets)
+    ]
+    clean_asset_by_source = {
+        str(asset_url or ""): clean_assets[index]
+        for index, asset_url in enumerate(source_assets)
+    }
+    public_task["assets"] = clean_assets
+
+    response = public_task.get("response")
+    if isinstance(response, dict):
+        if isinstance(response.get("assets"), list):
+            response["assets"] = list(clean_assets)
+        hydration = response.get("hydration")
+        if isinstance(hydration, dict) and isinstance(hydration.get("assets"), list):
+            hydration["assets"] = list(clean_assets)
+
+    attempts = public_task.get("attempts")
+    if isinstance(attempts, list):
+        for attempt in attempts:
+            if isinstance(attempt, dict) and isinstance(attempt.get("assets"), list):
+                attempt["assets"] = [
+                    clean_asset_by_source[str(asset_url or "")]
+                    for asset_url in attempt["assets"]
+                    if str(asset_url or "") in clean_asset_by_source
+                ]
+    return public_task
+
+
+def public_task_payload_for_request(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    result = copy.deepcopy(payload)
+    task = result.get("task")
+    if isinstance(task, dict):
+        result["task"] = public_task_for_request(task, request)
+    return result
+
+
+def public_gateway_result_for_request(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    result = public_task_payload_for_request(payload, request)
+    task = result.get("task")
+    if isinstance(task, dict):
+        result["assets"] = list(task.get("assets") or [])
+        response = task.get("response")
+        result["response"] = copy.deepcopy(response) if isinstance(response, dict) else {}
+    return result
+
+
 def fetch_remote_image_asset_with_requests(asset_url: str, *, verify_tls: bool) -> bytes:
     current_url = validate_clean_asset_url(asset_url)
     response = None
@@ -3756,6 +3870,52 @@ def fetch_remote_image_asset(asset_url: str) -> bytes:
                 )
             except requests.exceptions.SSLError:
                 raise HTTPException(502, "image asset download failed")
+
+
+def cleaned_image_asset(asset_url: str) -> Tuple[bytes, str, bool]:
+    source = fetch_remote_image_asset(validate_clean_asset_url(asset_url))
+    try:
+        return watermark_free_image_bytes(source, force_bottom_strip=True)
+    except WatermarkImageError as exc:
+        raise HTTPException(exc.status_code, exc.message) from exc
+
+
+def completed_image_task_asset(task_id: int, asset_index: int) -> Tuple[Dict[str, Any], str]:
+    row = fetch_task_row(task_id)
+    if not row:
+        raise HTTPException(404, "image asset not found")
+    task = task_detail_for_row(row)
+    assets = task.get("assets") if isinstance(task.get("assets"), list) else []
+    if asset_index < 0 or asset_index >= len(assets):
+        raise HTTPException(404, "image asset not found")
+    if str(task.get("kind") or "").lower() != "image":
+        raise HTTPException(409, "watermark removal only supports image tasks")
+    if str(task.get("status") or "").lower() != "completed":
+        raise HTTPException(409, "image task is not completed")
+    return task, validate_clean_asset_url(str(assets[asset_index] or ""))
+
+
+def clean_image_asset_response(
+    task_id: int,
+    asset_index: int,
+    *,
+    cache_control: str,
+    asset_url: Optional[str] = None,
+) -> Response:
+    if asset_url is None:
+        _task, asset_url = completed_image_task_asset(task_id, asset_index)
+    cleaned, media_type, removed = cleaned_image_asset(asset_url)
+    extension = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}[media_type]
+    return Response(
+        content=cleaned,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'inline; filename="task-{task_id}-clean-{asset_index + 1}.{extension}"',
+            "Cache-Control": cache_control,
+            "X-Watermark-Removed": "true" if removed else "false",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def update_task_record(task_id: int, **fields: Any) -> None:
@@ -6378,7 +6538,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id"],
-    expose_headers=["X-Request-Id"],
+    expose_headers=["X-Request-Id", "X-Watermark-Removed"],
     max_age=600,
 )
 
@@ -7917,6 +8077,7 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
             replay = json.loads(existing_idempotency.get("response_json") or "{}")
             replay["idempotent_replay"] = True
             replay["request_id"] = request_id
+            replay = public_gateway_result_for_request(replay, request)
             return JSONResponse(status_code=int(existing_idempotency["status_code"]), content=replay)
         idempotency_reserved = reservation_state == "reserved"
 
@@ -7996,7 +8157,10 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
             status_code = 202
     if idempotency_key:
         save_idempotency_record(api_key_id, idempotency_key, request_hash, status_code, result, task_id)
-    return JSONResponse(status_code=status_code, content=result)
+    return JSONResponse(
+        status_code=status_code,
+        content=public_gateway_result_for_request(result, request),
+    )
 
 
 def json_response_content(response: JSONResponse) -> Dict[str, Any]:
@@ -8090,14 +8254,16 @@ def execute_openai_image_request(
         )
     task = content.get("task") if isinstance(content.get("task"), dict) else {}
     created = int(float(task.get("created_at") or time.time()))
+    task_id = int_or_default(content.get("task_id") or task.get("id"), 0)
     if response_format == "b64_json":
         try:
-            image_bytes = fetch_remote_image_asset(str(assets[0]))
+            _stored_task, original_asset_url = completed_image_task_asset(task_id, 0)
+            image_bytes, _media_type, _removed = cleaned_image_asset(original_asset_url)
         except HTTPException as exc:
             return openai_error_response(
                 exc.status_code,
-                str(exc.detail or "image asset download failed"),
-                code="image_asset_download_failed",
+                str(exc.detail or "image asset processing failed"),
+                code="image_asset_processing_failed",
             )
         return {
             "created": created,
@@ -8640,6 +8806,7 @@ async def gateway_upload(
 
 @app.get("/v1/tasks")
 def gateway_tasks(
+    request: Request,
     limit: int = 50,
     offset: int = 0,
     status: Optional[str] = None,
@@ -8669,7 +8836,7 @@ def gateway_tasks(
         tuple(params + [limit + 1, offset]),
     ).fetchall()
     conn.close()
-    items = [task_row_to_public(r) for r in rows[:limit]]
+    items = [public_task_for_request(task_row_to_public(r), request) for r in rows[:limit]]
     return {"items": items, "limit": limit, "offset": offset, "has_more": len(rows) > limit}
 
 
@@ -9147,29 +9314,78 @@ def hydrate_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[
     return gateway_task_detail_payload(task_id, api_key_id)
 
 
+@app.get("/v1/tasks/{task_id}/assets/{asset_index}/clean")
+def gateway_public_clean_asset(
+    task_id: int,
+    asset_index: int,
+    signature: str = "",
+):
+    _task, asset_url = completed_image_task_asset(task_id, asset_index)
+    expected_signature = clean_asset_signature(task_id, asset_index, asset_url)
+    if not signature or not secrets.compare_digest(signature, expected_signature):
+        raise HTTPException(404, "image asset not found")
+    return clean_image_asset_response(
+        task_id,
+        asset_index,
+        asset_url=asset_url,
+        cache_control="public, max-age=86400, immutable",
+    )
+
+
 @app.get("/v1/task/{task_id}")
-def gateway_task_detail(task_id: int, api_key_id: int = Depends(require_api_key)):
-    return gateway_task_detail_payload(task_id, api_key_id)
+def gateway_task_detail(
+    task_id: int,
+    request: Request,
+    api_key_id: int = Depends(require_api_key),
+):
+    return public_task_payload_for_request(
+        gateway_task_detail_payload(task_id, api_key_id),
+        request,
+    )
 
 
 @app.get("/v1/tasks/{task_id}")
-def gateway_task_detail_alias(task_id: int, api_key_id: int = Depends(require_api_key)):
-    return gateway_task_detail_payload(task_id, api_key_id)
+def gateway_task_detail_alias(
+    task_id: int,
+    request: Request,
+    api_key_id: int = Depends(require_api_key),
+):
+    return public_task_payload_for_request(
+        gateway_task_detail_payload(task_id, api_key_id),
+        request,
+    )
 
 
 @app.post("/v1/tasks/{task_id}/retry")
 def gateway_task_retry(task_id: int, request: Request, api_key_id: int = Depends(require_api_key)):
-    return retry_task_record(task_id, api_key_id, gateway_request_id(request))
+    return public_task_payload_for_request(
+        retry_task_record(task_id, api_key_id, gateway_request_id(request)),
+        request,
+    )
 
 
 @app.post("/v1/tasks/{task_id}/cancel")
-def gateway_task_cancel(task_id: int, api_key_id: int = Depends(require_api_key)):
-    return cancel_task_record(task_id, api_key_id)
+def gateway_task_cancel(
+    task_id: int,
+    request: Request,
+    api_key_id: int = Depends(require_api_key),
+):
+    return public_task_payload_for_request(
+        cancel_task_record(task_id, api_key_id),
+        request,
+    )
 
 
 @app.post("/v1/tasks/{task_id}/hydrate")
-def gateway_task_hydrate(task_id: int, api_key_id: int = Depends(require_api_key)):
-    return hydrate_task_record(task_id, api_key_id)
+def gateway_task_hydrate(
+    task_id: int,
+    request: Request,
+    api_key_id: int = Depends(require_api_key),
+):
+    return public_task_payload_for_request(
+        hydrate_task_record(task_id, api_key_id),
+        request,
+    )
 
 
 @app.on_event("startup")
@@ -9594,34 +9810,10 @@ def admin_task_detail(task_id: int, _=Depends(require_admin)):
 
 @app.get("/api/tasks/{task_id}/assets/{asset_index}/clean")
 def admin_task_clean_asset(task_id: int, asset_index: int, _=Depends(require_admin)):
-    task = gateway_task_detail_payload(task_id)["task"]
-    assets = task.get("assets") if isinstance(task.get("assets"), list) else []
-    if asset_index < 0 or asset_index >= len(assets):
-        raise HTTPException(404, "image asset not found")
-    if str(task.get("kind") or "").lower() != "image":
-        raise HTTPException(409, "watermark removal only supports image tasks")
-    if str(task.get("status") or "").lower() != "completed":
-        raise HTTPException(409, "image task is not completed")
-
-    asset_url = validate_clean_asset_url(str(assets[asset_index] or ""))
-    source = fetch_remote_image_asset(asset_url)
-    try:
-        cleaned, media_type, removed = watermark_free_image_bytes(
-            source,
-            force_bottom_strip=True,
-        )
-    except WatermarkImageError as exc:
-        raise HTTPException(exc.status_code, exc.message)
-    extension = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}[media_type]
-    return Response(
-        content=cleaned,
-        media_type=media_type,
-        headers={
-            "Content-Disposition": f'inline; filename="task-{task_id}-clean-{asset_index + 1}.{extension}"',
-            "Cache-Control": "private, max-age=3600",
-            "X-Watermark-Removed": "true" if removed else "false",
-            "X-Content-Type-Options": "nosniff",
-        },
+    return clean_image_asset_response(
+        task_id,
+        asset_index,
+        cache_control="private, max-age=3600",
     )
 
 
