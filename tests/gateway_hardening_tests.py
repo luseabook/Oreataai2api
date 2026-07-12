@@ -653,6 +653,15 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(trace[-1]["step"], "generation_validation")
         self.assertEqual(trace[-1]["status"], "risk_control")
 
+    def test_upstream_error_code_ignores_numeric_email_domain_and_reads_status_code(self):
+        error = RuntimeError(
+            "getpointdetail failed for user@100811.xyz: "
+            "getpointdetail failed: {'status': {'code': 200001, "
+            "'msg': 'user not login'}, 'sLogid': '3232201747'}"
+        )
+
+        self.assertEqual(server.upstream_error_code(error), "200001")
+
     def test_generate_enqueues_task_and_worker_completes_it(self):
         self.seed_account_with_capabilities()
         self.seed_api_key("async-key")

@@ -2136,8 +2136,25 @@ def upstream_error_code(error: Exception) -> str:
     upstream = getattr(error, "error", None)
     if isinstance(upstream, dict) and upstream.get("code") is not None:
         return str(upstream.get("code"))
-    match = re.search(r"\b\d{5,6}\b", str(error))
-    return match.group(0) if match else ""
+    message = str(error)
+    structured_match = re.search(
+        r"""(?ix)
+        (?:
+            ['"]?code['"]?
+            | status\s+code
+            | error\s+code
+        )
+        \s*[:=]?\s*['"]?(\d{5,6})
+        """,
+        message,
+    )
+    if structured_match:
+        return structured_match.group(1)
+    standalone_match = re.search(
+        r"(?<![@\w])(\d{5,6})(?![\w.])",
+        message,
+    )
+    return standalone_match.group(1) if standalone_match else ""
 
 
 def account_failure_message(error: Exception, code: str) -> str:
