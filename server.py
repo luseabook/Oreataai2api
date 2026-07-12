@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect, Depends
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -189,6 +190,7 @@ DEFAULT_CONFIG = {
         "max_sync_timeout_seconds": 120,
         "image_model_aliases": {},
         "video_model_aliases": {},
+        "cors_allowed_origins": ["https://canvas.best"],
         "asset_host_allowlist": ["cdn.oreateai.com"],
         "asset_insecure_tls_fallback_hosts": ["cdn.oreateai.com"],
     },
@@ -5071,7 +5073,64 @@ def recover_interrupted_registration_jobs() -> int:
     return count
 
 
+class OpenAIPathCORSMiddleware:
+    """Apply browser CORS only to the public /v1 API surface."""
+
+    def __init__(self, app: Any, **cors_options: Any):
+        self.app = app
+        self.cors_app = CORSMiddleware(app, **cors_options)
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") == "http" and str(scope.get("path") or "").startswith("/v1"):
+            await self.cors_app(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+def normalize_cors_allowed_origins(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    origins: List[str] = []
+    for raw_origin in value:
+        if not isinstance(raw_origin, str):
+            continue
+        candidate = raw_origin.strip()
+        parsed = urlparse(candidate)
+        try:
+            parsed_port = parsed.port
+        except ValueError:
+            continue
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            continue
+        host = parsed.hostname.lower()
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        normalized = f"{parsed.scheme.lower()}://{host}"
+        if parsed_port is not None:
+            normalized = f"{normalized}:{parsed_port}"
+        if normalized not in origins:
+            origins.append(normalized)
+    return origins
+
+
 app = FastAPI(title="OreateAI Gateway")
+app.add_middleware(
+    OpenAIPathCORSMiddleware,
+    allow_origins=normalize_cors_allowed_origins(openai_compat_cfg().get("cors_allowed_origins")),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id"],
+    expose_headers=["X-Request-Id"],
+    max_age=600,
+)
 
 
 class GatewayAPIError(Exception):
@@ -6439,6 +6498,7 @@ class OpenAIImageGenerationIn(BaseModel):
     size: Optional[str] = "auto"
     quality: Optional[str] = "auto"
     response_format: Optional[str] = "url"
+    output_format: Optional[str] = None
     user: Optional[str] = None
     ratio: Optional[str] = None
     resolution: Optional[str] = None
@@ -6707,9 +6767,10 @@ def gateway_openai_image_generation(
             param="n",
             code="unsupported_n",
         )
-    if str(body.response_format or "url").lower() != "url":
+    response_format = str(body.response_format or "url").lower()
+    if response_format not in {"url", "b64_json"}:
         raise OpenAICompatError(
-            "only response_format=url is supported",
+            "response_format must be url or b64_json",
             param="response_format",
             code="unsupported_response_format",
         )
@@ -6756,6 +6817,24 @@ def gateway_openai_image_generation(
         )
     task = content.get("task") if isinstance(content.get("task"), dict) else {}
     created = int(float(task.get("created_at") or time.time()))
+    if response_format == "b64_json":
+        try:
+            image_bytes = fetch_remote_image_asset(str(assets[0]))
+        except HTTPException as exc:
+            return openai_error_response(
+                exc.status_code,
+                str(exc.detail or "image asset download failed"),
+                code="image_asset_download_failed",
+            )
+        return {
+            "created": created,
+            "data": [
+                {
+                    "b64_json": base64.b64encode(image_bytes).decode("ascii"),
+                    "revised_prompt": body.prompt,
+                }
+            ],
+        }
     return {
         "created": created,
         "data": [
@@ -6939,7 +7018,8 @@ async def gateway_openai_video_generation(
             requested_size = str(body.size or "auto")
             multipart_references = [
                 item
-                for item in form.getlist("input_reference")
+                for field_name in ("input_reference", "input_reference[]")
+                for item in form.getlist(field_name)
                 if hasattr(item, "read") and hasattr(item, "filename")
             ]
             if multipart_references:

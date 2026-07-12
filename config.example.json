@@ -62,6 +62,9 @@
     "max_sync_timeout_seconds": 120,
     "image_model_aliases": {},
     "video_model_aliases": {},
+    "cors_allowed_origins": [
+      "https://canvas.best"
+    ],
     "asset_host_allowlist": [
       "cdn.oreateai.com"
     ]

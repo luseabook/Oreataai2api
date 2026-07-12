@@ -1,3 +1,4 @@
+import base64
 import json
 import tempfile
 import time
@@ -22,6 +23,22 @@ from gateway.openai_compat import (
 
 
 class OpenAICompatPrimitiveTests(unittest.TestCase):
+    def test_cors_origin_normalization_rejects_malformed_configuration(self):
+        self.assertEqual(
+            server.normalize_cors_allowed_origins(
+                [
+                    " https://canvas.best/ ",
+                    "https://canvas.best",
+                    "http://localhost:3000",
+                    "*",
+                    "https://trusted.example/path",
+                    123,
+                ]
+            ),
+            ["https://canvas.best", "http://localhost:3000"],
+        )
+        self.assertEqual(server.normalize_cors_allowed_origins("https://canvas.best"), [])
+
     def test_video_ids_are_reversible_and_reject_invalid_values(self):
         self.assertEqual(encode_video_id(42), "video_42")
         self.assertEqual(decode_video_id("video_42"), 42)
@@ -375,6 +392,45 @@ class OpenAICompatEndpointTests(unittest.TestCase):
         for item in payload["data"]:
             self.assertEqual(set(item), {"id", "object", "created", "owned_by"})
 
+    def test_canvas_origin_can_preflight_and_fetch_models(self):
+        preflight = self.client.options(
+            "/v1/models",
+            headers={
+                "Origin": "https://canvas.best",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization",
+            },
+        )
+
+        self.assertEqual(preflight.status_code, 200)
+        self.assertEqual(preflight.headers["access-control-allow-origin"], "https://canvas.best")
+        self.assertIn("GET", preflight.headers["access-control-allow-methods"])
+        self.assertIn("authorization", preflight.headers["access-control-allow-headers"].lower())
+
+        response = self.client.get(
+            "/v1/models",
+            headers={
+                "Authorization": "Bearer openai-model-key",
+                "Origin": "https://canvas.best",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["access-control-allow-origin"], "https://canvas.best")
+        self.assertTrue(response.json()["data"])
+
+    def test_unconfigured_origin_does_not_receive_cors_access(self):
+        response = self.client.get(
+            "/v1/models",
+            headers={
+                "Authorization": "Bearer openai-model-key",
+                "Origin": "https://untrusted.example",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("access-control-allow-origin", response.headers)
+
     def test_native_capabilities_are_filtered_by_same_api_key_scope(self):
         response = self.client.get(
             "/v1/capabilities",
@@ -427,6 +483,52 @@ class OpenAICompatEndpointTests(unittest.TestCase):
         self.assertEqual(task["ratio"], "1:1")
         self.assertEqual(task["resolution"], "1K")
         self.assertEqual(task["status"], "completed")
+
+    def test_image_generation_returns_base64_for_canvas_openai_requests(self):
+        source_image = b"\x89PNG\r\n\x1a\ncanvas-image"
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-image", "focusId": "focus-image"}),
+            patch.object(
+                server.CLIENT,
+                "stream_generation",
+                return_value={"events": [{"event": "end"}], "error": None, "status": "streamed"},
+            ),
+            patch.object(
+                server.CLIENT,
+                "hydrate_generation_result",
+                return_value={"raw": {}, "assets": ["https://cdn.oreateai.com/aiimage/result.png"]},
+            ),
+            patch.object(server, "fetch_remote_image_asset", return_value=source_image) as fetch_asset,
+        ):
+            response = self.client.post(
+                "/v1/images/generations",
+                headers={
+                    "Authorization": "Bearer openai-model-key",
+                    "Origin": "https://canvas.best",
+                },
+                json={
+                    "model": "gpt-image-1",
+                    "prompt": "a canvas integration",
+                    "size": "1024x1024",
+                    "n": 1,
+                    "response_format": "b64_json",
+                    "output_format": "png",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["access-control-allow-origin"], "https://canvas.best")
+        self.assertEqual(
+            response.json()["data"],
+            [
+                {
+                    "b64_json": base64.b64encode(source_image).decode("ascii"),
+                    "revised_prompt": "a canvas integration",
+                }
+            ],
+        )
+        fetch_asset.assert_called_once_with("https://cdn.oreateai.com/aiimage/result.png")
 
     def test_image_generation_rejects_unsupported_count_without_creating_task(self):
         response = self.client.post(
@@ -649,6 +751,58 @@ class OpenAICompatEndpointTests(unittest.TestCase):
                 ("uploads/ref-video.mp4", 1, "completed"),
             ],
         )
+
+    def test_video_generation_accepts_canvas_bracketed_input_reference_files(self):
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "gateway": {
+                    "scene_policies": {
+                        "reference": {
+                            "enabled": True,
+                            "experimental": False,
+                            "verification_status": "live_verified",
+                            "risk_level": "low",
+                        }
+                    }
+                }
+            },
+        )
+        uploaded = {
+            "fileName": "canvas-reference",
+            "fileExt": "png",
+            "originSize": 7,
+            "object": "uploads/canvas-reference.png",
+            "status": "completed",
+        }
+        try:
+            with (
+                patch.object(server.CLIENT, "session_from_account", return_value=object()),
+                patch.object(server.CLIENT, "upload_file_bytes", return_value=uploaded) as upload_file,
+            ):
+                response = self.client.post(
+                    "/v1/videos",
+                    headers={"Authorization": "Bearer openai-video-upload-key"},
+                    data={
+                        "model": "sora-2",
+                        "prompt": "canvas reference",
+                        "seconds": "5",
+                        "size": "1280x720",
+                    },
+                    files=[("input_reference[]", ("canvas-reference.png", b"pngdata", "image/png"))],
+                )
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(response.status_code, 200)
+        upload_file.assert_called_once()
+        conn = server.db_conn()
+        task = conn.execute("SELECT payload_json,scene_id FROM tasks ORDER BY id DESC LIMIT 1").fetchone()
+        conn.close()
+        saved = json.loads(task["payload_json"])
+        self.assertEqual(task["scene_id"], "reference")
+        self.assertEqual(saved["reference_images"][0]["object"], "uploads/canvas-reference.png")
 
     def test_video_generation_rejects_multipart_input_reference_when_uploads_forbidden(self):
         original_cfg = server.CFG
