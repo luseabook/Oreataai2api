@@ -3906,7 +3906,7 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("k.status", html)
         self.assertIn("k.status ?? (k.enabled ? 'enabled':'disabled')", html)
         self.assertIn("apiKeyStatusTagClass", html)
-        self.assertIn("escapeHtml(keyStatus)", html)
+        self.assertIn("escapeHtml(adminLabel('apiKeyStatus',keyStatus))", html)
         self.assertIn("escapeHtml(k.key_preview||'')", html)
         self.assertIn("留空=继承，0=不限", html)
 
@@ -4016,8 +4016,8 @@ if (!tbody.innerHTML.includes('&lt;img src=x onerror=alert(1)&gt;')) throw new E
 if (tbody.innerHTML.includes('class="tag evil')) throw new Error('untrusted status entered the class attribute');
 if (tbody.innerHTML.includes('evil" onclick=')) throw new Error('status text was not escaped');
 if (!tbody.innerHTML.includes('evil&quot; onclick=&quot;alert(1)')) throw new Error('escaped status text missing');
-if (!tbody.innerHTML.includes('class="tag tag-green">enabled</span>')) throw new Error('enabled fallback missing');
-if (!tbody.innerHTML.includes('class="tag tag-gray">disabled</span>')) throw new Error('disabled fallback missing');
+if (!tbody.innerHTML.includes('class="tag tag-green">启用</span>')) throw new Error('enabled fallback missing');
+if (!tbody.innerHTML.includes('class="tag tag-gray">停用</span>')) throw new Error('disabled fallback missing');
 if (!tbody.innerHTML.includes('value="0"')) throw new Error('zero limit was not rendered');
 if (!tbody.innerHTML.includes('value="17"')) throw new Error('positive limit was not rendered');
 const fields = {{

@@ -7865,8 +7865,8 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
 <div id="tab-tasks" class="section hidden">
   <h2>📦 任务列表</h2>
   <div class="list-filters">
-    <div><label>状态</label><select id="task-filter-status"><option value="">全部</option><option value="queued">queued</option><option value="running">running</option><option value="submitted">submitted</option><option value="hydrating">hydrating</option><option value="completed">completed</option><option value="failed">failed</option><option value="expired">expired</option><option value="cancelled">cancelled</option></select></div>
-    <div><label>类型</label><select id="task-filter-kind"><option value="">全部</option><option value="image">image</option><option value="video">video</option></select></div>
+    <div><label>状态</label><select id="task-filter-status"><option value="">全部</option><option value="queued">待处理</option><option value="running">生成中</option><option value="submitted">已提交</option><option value="hydrating">获取结果中</option><option value="completed">已完成</option><option value="failed">失败</option><option value="expired">已过期</option><option value="cancelled">已取消</option></select></div>
+    <div><label>类型</label><select id="task-filter-kind"><option value="">全部</option><option value="image">图片</option><option value="video">视频</option></select></div>
     <div><label>模型</label><input id="task-filter-model-name" placeholder="模型名"></div>
     <div><label>场景</label><input id="task-filter-scene-id" placeholder="scene_id"></div>
     <div><label>客户 ID</label><input id="task-filter-client-id" type="number" min="1" step="1"></div>
@@ -7920,7 +7920,7 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
     <div><button class="btn-primary" onclick="createApiKey()">创建 Key</button></div>
   </div>
   <div class="row" style="margin-bottom:16px">
-    <div class="col"><input id="ak-kinds" placeholder="允许类型: image,video"></div>
+    <div class="col"><input id="ak-kinds" placeholder="允许类型：图片(image)、视频(video)"></div>
     <div class="col"><input id="ak-models" placeholder="允许模型: 逗号分隔"></div>
     <div class="col"><input id="ak-scenes" placeholder="允许场景: text_or_image"></div>
   </div>
@@ -7952,8 +7952,8 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
   </div>
   <h2 style="margin-top:24px">📊 用量日志</h2>
   <div class="list-filters">
-    <div><label>类型</label><select id="usage-filter-kind"><option value="">全部</option><option value="image">image</option><option value="video">video</option></select></div>
-    <div><label>状态</label><select id="usage-filter-status"><option value="">全部</option><option value="queued">queued</option><option value="running">running</option><option value="submitted">submitted</option><option value="hydrating">hydrating</option><option value="completed">completed</option><option value="failed">failed</option><option value="expired">expired</option><option value="cancelled">cancelled</option></select></div>
+    <div><label>类型</label><select id="usage-filter-kind"><option value="">全部</option><option value="image">图片</option><option value="video">视频</option></select></div>
+    <div><label>状态</label><select id="usage-filter-status"><option value="">全部</option><option value="queued">待处理</option><option value="running">生成中</option><option value="submitted">已提交</option><option value="hydrating">获取结果中</option><option value="completed">已完成</option><option value="failed">失败</option><option value="expired">已过期</option><option value="cancelled">已取消</option></select></div>
     <div><label>模型</label><input id="usage-filter-model-name" placeholder="模型名"></div>
     <div><label>客户 ID</label><input id="usage-filter-client-id" type="number" min="1" step="1"></div>
     <div><label>API Key ID</label><input id="usage-filter-api-key-id" type="number" min="1" step="1"></div>
@@ -7981,8 +7981,8 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
   </div>
   <h2 style="margin-top:24px">上传素材</h2>
   <div class="list-filters">
-    <div><label>类型</label><select id="upload-filter-kind"><option value="">全部</option><option value="image">image</option><option value="video">video</option></select></div>
-    <div><label>状态</label><input id="upload-filter-status" placeholder="completed"></div>
+    <div><label>类型</label><select id="upload-filter-kind"><option value="">全部</option><option value="image">图片</option><option value="video">视频</option></select></div>
+    <div><label>状态</label><select id="upload-filter-status"><option value="">全部</option><option value="pending">待处理</option><option value="uploading">上传中</option><option value="completed">已完成</option><option value="failed">失败</option><option value="deleted">已删除</option></select></div>
     <div><label>API Key ID</label><input id="upload-filter-api-key-id" type="number" min="1" step="1"></div>
     <div><label>账号 ID</label><input id="upload-filter-account-id" type="number" min="1" step="1"></div>
     <div><label>开始日期</label><input id="upload-filter-date-from" type="date"></div>
@@ -8357,6 +8357,86 @@ function changeOperationalListPage(name,direction,loader){
 function escapeHtml(value){
   return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+const ADMIN_LABELS=Object.freeze({
+  taskStatus:Object.freeze({
+    queued:'待处理',
+    running:'生成中',
+    submitted:'已提交',
+    hydrating:'获取结果中',
+    completed:'已完成',
+    failed:'失败',
+    expired:'已过期',
+    cancelled:'已取消',
+  }),
+  taskPhase:Object.freeze({
+    generation:'生成',
+    hydration:'获取结果',
+  }),
+  accountStatus:Object.freeze({
+    verified:'已验证',
+    active:'可用',
+    new:'待验证',
+    invalid:'已失效',
+    disabled:'已停用',
+    expired:'已过期',
+    signup_failed:'注册失败',
+    confirm_failed:'验证失败',
+  }),
+  healthStatus:Object.freeze({
+    healthy:'健康',
+    cooling:'冷却中',
+    low_balance:'余额不足',
+    invalid:'不可用',
+    risk_control:'风控限制',
+    unknown:'未知',
+  }),
+  riskStatus:Object.freeze({
+    clean:'正常',
+    risk_control:'风控限制',
+    invalid:'不可用',
+  }),
+  apiKeyStatus:Object.freeze({
+    enabled:'启用',
+    disabled:'停用',
+    expired:'已过期',
+    deleted:'已删除',
+  }),
+  clientStatus:Object.freeze({
+    active:'启用',
+    inactive:'停用',
+    disabled:'停用',
+  }),
+  verificationStatus:Object.freeze({
+    live_verified:'在线验证',
+    unit_tested:'已测试',
+    unverified:'未验证',
+  }),
+  kind:Object.freeze({
+    image:'图片',
+    video:'视频',
+    audio:'音频',
+  }),
+  uploadStatus:Object.freeze({
+    pending:'待处理',
+    uploading:'上传中',
+    completed:'已完成',
+    failed:'失败',
+    deleted:'已删除',
+  }),
+  source:Object.freeze({
+    auto:'自动注册',
+    import:'手动导入',
+    imported:'手动导入',
+    manual:'手动导入',
+    demo:'演示数据',
+  }),
+});
+function adminLabel(category,value){
+  const original=String(value ?? '').trim();
+  if(!original) return '-';
+  const normalized=original.toLowerCase();
+  return ADMIN_LABELS[category]?.[normalized] || original;
+}
 function normalizedOptionValues(values){
   const out=[];
   (Array.isArray(values)?values:[]).forEach(v => {
@@ -8397,7 +8477,7 @@ function capabilityScenes(){
 }
 function policyBadge(item){
   const verification = item?.verification_status || 'unverified';
-  return `${verification}${item?.experimental ? ' · experimental' : ''}`;
+  return `${adminLabel('verificationStatus',verification)}${item?.experimental ? ' · 实验性' : ''}`;
 }
 function modelOptionLabel(model){
   const title = model.description ? `${model.name} - ${model.description}` : model.name;
@@ -8455,13 +8535,13 @@ function renderAccounts(){
     const em = a.email||'';
     const restPoint = a.rest_point ?? '-';
     const balanceUpdatedAt = a.balance_updated_at ? new Date((a.balance_updated_at||0)*1000).toLocaleString() : '-';
-    const healthMeta = `${a.risk_status||'clean'}${a.cooling ? ` · ${a.cooldown_remaining_seconds || 0}s` : ''}`;
+    const healthMeta = `${adminLabel('riskStatus',a.risk_status||'clean')}${a.cooling ? ` · 剩余 ${a.cooldown_remaining_seconds || 0} 秒` : ''}`;
     return `<tr>
       <td>${a.id}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(em)}<button class="copy-btn" data-copy-value="${escapeHtml(em)}" onclick="copyText(this.dataset.copyValue)">📋</button></td>
-      <td><span class="tag ${sc}">${escapeHtml(a.status||'-')}</span></td>
-      <td><span class="tag ${hc}">${escapeHtml(a.health_status || '-')}</span><div style="font-size:11px;color:#86868b">${escapeHtml(healthMeta)}</div></td>
-      <td>${escapeHtml(a.source||'-')}</td>
+      <td><span class="tag ${sc}">${escapeHtml(adminLabel('accountStatus',a.status))}</span></td>
+      <td><span class="tag ${hc}">${escapeHtml(adminLabel('healthStatus',a.health_status))}</span><div style="font-size:11px;color:#86868b">${escapeHtml(healthMeta)}</div></td>
+      <td>${escapeHtml(adminLabel('source',a.source))}</td>
       <td style="font-family:monospace;font-size:11px">${escapeHtml(a.ouid_preview||'')}</td>
       <td>${restPoint}</td>
       <td style="font-size:11px">${balanceUpdatedAt}</td>
@@ -8643,9 +8723,9 @@ function renderTasks(){
     const kindClass=t.kind==='image'?'tag-blue':'tag-green';
     return `<tr>
       <td>${t.id}</td>
-      <td><span class="tag ${kindClass}">${t.kind}</span></td>
+      <td><span class="tag ${kindClass}">${escapeHtml(adminLabel('kind',t.kind))}</span></td>
       <td>${t.account_id||'-'}</td>
-      <td><span class="tag ${statusClass}">${t.status}${t.cancel_requested_at ? ' · cancel' : ''}</span></td>
+      <td><span class="tag ${statusClass}">${escapeHtml(adminLabel('taskStatus',t.status))}${t.cancel_requested_at ? ' · 取消中' : ''}</span></td>
       <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${escapeHtml((t.prompt||'').substring(0,40))}</td>
       <td style="font-family:monospace;font-size:11px">${escapeHtml((t.chat_id||'').substring(0,12))}</td>
       <td style="font-size:11px">${new Date((t.created_at||0)*1000).toLocaleString()}</td>
@@ -8680,10 +8760,10 @@ function renderTaskPreview(task){
       <h3>基础信息</h3>
       <div class="task-preview-meta">
         <div><strong>ID</strong> ${task?.id || '-'}</div>
-        <div><strong>状态</strong> ${escapeHtml(task?.status || '-')}</div>
+        <div><strong>状态</strong> ${escapeHtml(adminLabel('taskStatus',task?.status))}</div>
         <div><strong>模型</strong> ${escapeHtml(task?.model_name || '-')}</div>
         <div><strong>场景</strong> ${escapeHtml(task?.scene_id || '-')}</div>
-        <div><strong>验证</strong> ${escapeHtml(scene?.verification_status || model?.verification_status || task?.verification_status || '-')}</div>
+        <div><strong>验证</strong> ${escapeHtml(adminLabel('verificationStatus',scene?.verification_status || model?.verification_status || task?.verification_status))}</div>
         <div><strong>实验性</strong> ${(scene?.experimental ?? model?.experimental ?? task?.experimental) ? '是' : '否'}</div>
         <div><strong>点数</strong> ${task?.estimated_point_cost ?? '-'}</div>
         <div><strong>实际</strong> ${task?.actual_point_cost ?? '-'}</div>
@@ -8766,14 +8846,14 @@ function renderApiKeys(){
     const kp=escapeHtml(k.key_preview||'');
     const keyStatus=String(k.status ?? (k.enabled ? 'enabled':'disabled')).toLowerCase();
     const statusClass=apiKeyStatusTagClass(keyStatus);
-    return `<tr><td>${k.id}</td><td style="font-family:monospace;font-size:11px">${kp}</td><td>${escapeHtml(k.name||'-')}</td><td>${escapeHtml(k.client_name||'-')}</td><td><span class="tag ${statusClass}">${escapeHtml(keyStatus)}</span></td><td><input id="ak-rate-${k.id}" data-field="rate_limit_per_minute" type="number" min="0" step="1" value="${apiKeyLimitInputValue(k.rate_limit_per_minute)}" style="width:84px"></td><td><input id="ak-req-${k.id}" data-field="daily_request_limit" type="number" min="0" step="1" value="${apiKeyLimitInputValue(k.daily_request_limit)}" style="width:84px"></td><td><input id="ak-point-${k.id}" data-field="daily_point_limit" type="number" min="0" step="1" value="${apiKeyLimitInputValue(k.daily_point_limit)}" style="width:84px"></td><td><input id="ak-kinds-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_kinds))}" style="width:120px"></td><td><input id="ak-models-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_models))}" style="width:160px"></td><td><input id="ak-scenes-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_scenes))}" style="width:130px"></td><td><input id="ak-resolutions-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_resolutions))}" style="width:110px"></td><td><input id="ak-durations-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_durations))}" style="width:90px"></td><td><input id="ak-uploads-${k.id}" type="checkbox" ${k.allow_uploads!==false ? 'checked' : ''}></td><td><input id="ak-experimental-${k.id}" type="checkbox" ${k.allow_experimental ? 'checked' : ''}></td><td style="font-size:11px">${new Date((k.created_at||0)*1000).toLocaleString()}</td><td style="font-size:11px">${k.last_used_at?new Date(k.last_used_at*1000).toLocaleString():'-'}</td><td><button class="btn-sm btn-secondary" onclick="updateApiKeyPolicy(${k.id})">保存</button> <button class="btn-sm btn-danger" onclick="deleteKey(${k.id})">删除</button></td></tr>`;
+    return `<tr><td>${k.id}</td><td style="font-family:monospace;font-size:11px">${kp}</td><td>${escapeHtml(k.name||'-')}</td><td>${escapeHtml(k.client_name||'-')}</td><td><span class="tag ${statusClass}">${escapeHtml(adminLabel('apiKeyStatus',keyStatus))}</span></td><td><input id="ak-rate-${k.id}" data-field="rate_limit_per_minute" type="number" min="0" step="1" value="${apiKeyLimitInputValue(k.rate_limit_per_minute)}" style="width:84px"></td><td><input id="ak-req-${k.id}" data-field="daily_request_limit" type="number" min="0" step="1" value="${apiKeyLimitInputValue(k.daily_request_limit)}" style="width:84px"></td><td><input id="ak-point-${k.id}" data-field="daily_point_limit" type="number" min="0" step="1" value="${apiKeyLimitInputValue(k.daily_point_limit)}" style="width:84px"></td><td><input id="ak-kinds-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_kinds))}" style="width:120px"></td><td><input id="ak-models-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_models))}" style="width:160px"></td><td><input id="ak-scenes-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_scenes))}" style="width:130px"></td><td><input id="ak-resolutions-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_resolutions))}" style="width:110px"></td><td><input id="ak-durations-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_durations))}" style="width:90px"></td><td><input id="ak-uploads-${k.id}" type="checkbox" ${k.allow_uploads!==false ? 'checked' : ''}></td><td><input id="ak-experimental-${k.id}" type="checkbox" ${k.allow_experimental ? 'checked' : ''}></td><td style="font-size:11px">${new Date((k.created_at||0)*1000).toLocaleString()}</td><td style="font-size:11px">${k.last_used_at?new Date(k.last_used_at*1000).toLocaleString():'-'}</td><td><button class="btn-sm btn-secondary" onclick="updateApiKeyPolicy(${k.id})">保存</button> <button class="btn-sm btn-danger" onclick="deleteKey(${k.id})">删除</button></td></tr>`;
   }).join('');
 }
 function renderClients(){
   const tbody=document.getElementById('clients-tbody');
   if(!tbody) return;
   tbody.innerHTML = (state.clients||[]).map(c => {
-    return `<tr><td>${c.id}</td><td>${escapeHtml(c.name||'-')}</td><td>${escapeHtml(c.contact||'-')}</td><td><span class="tag ${c.status==='active'?'tag-green':'tag-gray'}">${escapeHtml(c.status||'active')}</span></td><td style="font-size:11px">${new Date((c.created_at||0)*1000).toLocaleString()}</td></tr>`;
+    return `<tr><td>${c.id}</td><td>${escapeHtml(c.name||'-')}</td><td>${escapeHtml(c.contact||'-')}</td><td><span class="tag ${c.status==='active'?'tag-green':'tag-gray'}">${escapeHtml(adminLabel('clientStatus',c.status||'active'))}</span></td><td style="font-size:11px">${new Date((c.created_at||0)*1000).toLocaleString()}</td></tr>`;
   }).join('');
 }
 async function createClient(){
@@ -8886,7 +8966,7 @@ function renderUsage(){
     return;
   }
   tbody.innerHTML = usage.map(u => {
-    return `<tr><td>${u.id}</td><td><span class="tag ${u.kind==='image'?'tag-blue':'tag-green'}">${escapeHtml(u.kind||'-')}</span></td><td>${escapeHtml(u.account_email||u.account_id||'-')}</td><td>${escapeHtml(u.model_name||'-')}</td><td>${u.estimated_point_cost ?? '-'}</td><td>${escapeHtml(u.error_code||'-')}</td><td>${escapeHtml(u.status||'-')}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${escapeHtml((u.prompt||'').substring(0,40))}</td><td style="font-size:11px">${new Date((u.created_at||0)*1000).toLocaleString()}</td></tr>`;
+    return `<tr><td>${u.id}</td><td><span class="tag ${u.kind==='image'?'tag-blue':'tag-green'}">${escapeHtml(adminLabel('kind',u.kind))}</span></td><td>${escapeHtml(u.account_email||u.account_id||'-')}</td><td>${escapeHtml(u.model_name||'-')}</td><td>${u.estimated_point_cost ?? '-'}</td><td>${escapeHtml(u.error_code||'-')}</td><td>${escapeHtml(adminLabel('taskStatus',u.status))}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${escapeHtml((u.prompt||'').substring(0,40))}</td><td style="font-size:11px">${new Date((u.created_at||0)*1000).toLocaleString()}</td></tr>`;
   }).join('');
 }
 
@@ -8934,7 +9014,7 @@ function renderUploads(){
     const objectPath=String(item.object_path||'');
     const attachment=JSON.stringify(item.attachment||{});
     const kindClass=item.kind==='image'?'tag-blue':item.kind==='video'?'tag-green':'tag-gray';
-    return `<tr><td>${item.id}</td><td><span class="tag ${kindClass}">${escapeHtml(item.kind||'-')}</span></td><td>${escapeHtml(item.account_email||item.account_id||'-')}</td><td>${escapeHtml(item.api_key_name||item.api_key_id||'-')}</td><td>${escapeHtml(item.file_name||'-')}<div style="font-size:11px;color:#86868b">${escapeHtml(item.content_type||'')}</div></td><td style="font-family:monospace;font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(objectPath)}</td><td>${item.related_task_count ?? 0}</td><td>${escapeHtml(item.status||'-')}</td><td style="font-size:11px">${new Date((item.created_at||0)*1000).toLocaleString()}</td><td><button class="btn-sm btn-secondary" data-copy-value="${escapeHtml(objectPath)}" onclick="copyText(this.dataset.copyValue)">Object</button> <button class="btn-sm btn-secondary" data-copy-value="${escapeHtml(attachment)}" onclick="copyText(this.dataset.copyValue)">Attachment</button></td></tr>`;
+    return `<tr><td>${item.id}</td><td><span class="tag ${kindClass}">${escapeHtml(adminLabel('kind',item.kind))}</span></td><td>${escapeHtml(item.account_email||item.account_id||'-')}</td><td>${escapeHtml(item.api_key_name||item.api_key_id||'-')}</td><td>${escapeHtml(item.file_name||'-')}<div style="font-size:11px;color:#86868b">${escapeHtml(item.content_type||'')}</div></td><td style="font-family:monospace;font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(objectPath)}</td><td>${item.related_task_count ?? 0}</td><td>${escapeHtml(adminLabel('uploadStatus',item.status))}</td><td style="font-size:11px">${new Date((item.created_at||0)*1000).toLocaleString()}</td><td><button class="btn-sm btn-secondary" data-copy-value="${escapeHtml(objectPath)}" onclick="copyText(this.dataset.copyValue)">对象路径</button> <button class="btn-sm btn-secondary" data-copy-value="${escapeHtml(attachment)}" onclick="copyText(this.dataset.copyValue)">附件信息</button></td></tr>`;
   }).join('');
 }
 

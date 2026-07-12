@@ -841,6 +841,80 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertIn("s.pool?.maintain_target??5", html)
         self.assertIn("已保存但刷新失败", html)
 
+    def test_admin_html_localizes_operational_enums_without_changing_filter_values(self):
+        html = server.ADMIN_HTML
+
+        self.assertIn('<option value="queued">待处理</option>', html)
+        self.assertIn('<option value="running">生成中</option>', html)
+        self.assertIn('<option value="completed">已完成</option>', html)
+        self.assertIn('<option value="uploading">上传中</option>', html)
+        self.assertIn('<option value="deleted">已删除</option>', html)
+        self.assertIn('<option value="image">图片</option>', html)
+        self.assertIn('<option value="video">视频</option>', html)
+        self.assertIn("function adminLabel", html)
+        self.assertIn("adminLabel('taskStatus',t.status)", html)
+        self.assertIn("adminLabel('accountStatus',a.status)", html)
+        self.assertIn("adminLabel('healthStatus',a.health_status)", html)
+        self.assertIn("adminLabel('riskStatus',a.risk_status||'clean')", html)
+        self.assertIn("adminLabel('apiKeyStatus',keyStatus)", html)
+        self.assertIn("adminLabel('clientStatus',c.status||'active')", html)
+        self.assertIn("adminLabel('kind',u.kind)", html)
+        self.assertIn("adminLabel('uploadStatus',item.status)", html)
+
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to execute the admin localization helper test")
+        script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+        labels_start = script.index("const ADMIN_LABELS")
+        labels_end = script.index("function normalizedOptionValues(", labels_start)
+        localization_source = script[labels_start:labels_end].strip()
+        node_program = f"""
+{localization_source}
+const cases = [
+  ['taskStatus', 'queued', '待处理'],
+  ['taskStatus', 'running', '生成中'],
+  ['taskStatus', 'submitted', '已提交'],
+  ['taskStatus', 'hydrating', '获取结果中'],
+  ['taskStatus', 'completed', '已完成'],
+  ['taskStatus', 'failed', '失败'],
+  ['taskStatus', 'expired', '已过期'],
+  ['taskStatus', 'cancelled', '已取消'],
+  ['accountStatus', 'verified', '已验证'],
+  ['healthStatus', 'healthy', '健康'],
+  ['healthStatus', 'cooling', '冷却中'],
+  ['healthStatus', 'low_balance', '余额不足'],
+  ['riskStatus', 'clean', '正常'],
+  ['apiKeyStatus', 'enabled', '启用'],
+  ['clientStatus', 'active', '启用'],
+  ['kind', 'image', '图片'],
+  ['kind', 'video', '视频'],
+  ['uploadStatus', 'completed', '已完成'],
+  ['verificationStatus', 'live_verified', '在线验证'],
+];
+for (const [category, value, expected] of cases) {{
+  const actual = adminLabel(category, value);
+  if (actual !== expected) {{
+    throw new Error(`${{category}}.${{value}}: expected ${{expected}}, got ${{actual}}`);
+  }}
+}}
+if (adminLabel('taskStatus', 'future_status') !== 'future_status') {{
+  throw new Error('unknown enum values must remain visible for forward compatibility');
+}}
+if (adminLabel('taskStatus', '') !== '-') {{
+  throw new Error('blank enum values must render as a placeholder');
+}}
+"""
+        node_test_path = Path(self.tmp.name) / "admin_localization_helper_test.js"
+        node_test_path.write_text(node_program, encoding="utf-8")
+        completed = subprocess.run(
+            [node, str(node_test_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_admin_html_javascript_helpers_execute_in_node(self):
         node = shutil.which("node")
         self.assertIsNotNone(node, "Node.js is required to execute the admin JavaScript regression tests")
