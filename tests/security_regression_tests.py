@@ -1944,6 +1944,197 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         session_from_account.assert_not_called()
         fetch_point_detail.assert_not_called()
 
+    def test_refresh_account_session_replaces_cookies_and_revalidates_account(self):
+        account_id = self.seed_account()
+        conn = server.db_conn()
+        conn.execute(
+            """
+            UPDATE accounts
+            SET status='disabled',
+                source='manual',
+                last_error='200001: session expired'
+            WHERE id=?
+            """,
+            (account_id,),
+        )
+        conn.commit()
+        conn.close()
+        refreshed_session = server.OreateSession(
+            email="test@example.com",
+            password="password",
+            cookies={"OUID": "fresh-ouid", "ouss": "fresh-ouss"},
+        )
+
+        with (
+            patch.object(server.CLIENT, "login", return_value=refreshed_session) as login,
+            patch.object(server.CLIENT, "session_from_cookie_dict", return_value=object()),
+            patch.object(
+                server.CLIENT,
+                "fetch_image_models",
+                return_value=self.sample_image_info(),
+            ),
+            patch.object(server.CLIENT, "fetch_video_models", return_value={"data": []}),
+            patch.object(server.CLIENT, "fetch_video_scenes", return_value={"data": []}),
+            patch.object(
+                server,
+                "validate_registered_account",
+                return_value={"ok": True, "asset_count": 1},
+            ) as validate,
+        ):
+            result = server.refresh_account_session_and_validate(account_id)
+
+        self.assertTrue(result["ok"])
+        login.assert_called_once_with("user@example.com", "plain-password")
+        validate.assert_called_once_with(account_id)
+        conn = server.db_conn()
+        row = conn.execute(
+            "SELECT status,source,ouid,ouss FROM accounts WHERE id=?",
+            (account_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row["status"], "pending_validation")
+        self.assertEqual(row["source"], "manual")
+        self.assertEqual(server.decrypt_secret_value(row["ouid"]), "fresh-ouid")
+        self.assertEqual(server.decrypt_secret_value(row["ouss"]), "fresh-ouss")
+
+    def test_refresh_account_session_keeps_transient_login_failure_retriable(self):
+        account_id = self.seed_account()
+        conn = server.db_conn()
+        conn.execute(
+            """
+            UPDATE accounts
+            SET status='disabled',
+                last_error='200001: session expired'
+            WHERE id=?
+            """,
+            (account_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        with patch.object(
+            server.CLIENT,
+            "login",
+            side_effect=RuntimeError(
+                "emaillogin failed: {'status': {'code': 100003}}"
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "100003"):
+                server.refresh_account_session_and_validate(account_id)
+
+        conn = server.db_conn()
+        row = conn.execute(
+            "SELECT status,last_error FROM accounts WHERE id=?",
+            (account_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row["status"], "pending_validation")
+        self.assertIn("200001", row["last_error"])
+
+    def test_pool_maintenance_recovers_previously_isolated_expired_session(self):
+        account_id = self.seed_account()
+        conn = server.db_conn()
+        conn.execute(
+            """
+            UPDATE accounts
+            SET status='disabled',
+                last_error='200001: session expired',
+                model_info_json=?,
+                rest_point=?
+            WHERE id=?
+            """,
+            (json.dumps(self.sample_image_info()), 100, account_id),
+        )
+        conn.commit()
+        conn.close()
+        job = server.create_pool_maintenance_job(
+            clean_risk=True,
+            supplement=False,
+            target_healthy=1,
+            max_register=0,
+        )
+
+        def recover(expired_account_id):
+            self.assertEqual(expired_account_id, account_id)
+            conn = server.db_conn()
+            conn.execute(
+                """
+                UPDATE accounts
+                SET status='verified',
+                    last_error=NULL,
+                    cooldown_until=NULL
+                WHERE id=?
+                """,
+                (expired_account_id,),
+            )
+            conn.commit()
+            conn.close()
+            return {"ok": True, "asset_count": 1}
+
+        with patch.object(
+            server,
+            "refresh_account_session_and_validate",
+            side_effect=recover,
+        ) as refresh:
+            server.run_pool_maintenance_job(job["id"])
+
+        completed = server.get_pool_maintenance_job(job["id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["healthy_after"], 1)
+        self.assertEqual(completed["invalid_found"], 0)
+        self.assertEqual(completed["isolated_accounts"], 0)
+        self.assertEqual(completed["items"], [])
+        refresh.assert_called_once_with(account_id)
+
+    def test_pool_maintenance_refreshes_live_expired_session_before_isolating(self):
+        account_id = self.seed_account()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET model_info_json=?, rest_point=? WHERE id=?",
+            (json.dumps(self.sample_image_info()), 100, account_id),
+        )
+        conn.commit()
+        conn.close()
+        job = server.create_pool_maintenance_job(
+            clean_risk=True,
+            supplement=False,
+            target_healthy=1,
+            max_register=0,
+        )
+
+        def recover(expired_account_id):
+            conn = server.db_conn()
+            conn.execute(
+                "UPDATE accounts SET status='verified', last_error=NULL WHERE id=?",
+                (expired_account_id,),
+            )
+            conn.commit()
+            conn.close()
+            return {"ok": True, "asset_count": 1}
+
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(
+                server.CLIENT,
+                "fetch_account_point_detail",
+                side_effect=RuntimeError(
+                    "getpointdetail failed: {'status': {'code': 200001}}"
+                ),
+            ),
+            patch.object(
+                server,
+                "refresh_account_session_and_validate",
+                side_effect=recover,
+            ) as refresh,
+        ):
+            server.run_pool_maintenance_job(job["id"])
+
+        completed = server.get_pool_maintenance_job(job["id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["invalid_found"], 0)
+        self.assertEqual(completed["isolated_accounts"], 0)
+        refresh.assert_called_once_with(account_id)
+
     def test_pool_maintenance_job_api_returns_immediately_and_exposes_chinese_progress(self):
         with patch.object(server, "launch_pool_maintenance_job") as launch:
             created = self.client.post(

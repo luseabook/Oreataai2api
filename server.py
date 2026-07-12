@@ -5154,6 +5154,38 @@ def validate_registered_account(account_id: int) -> Dict[str, Any]:
     return result
 
 
+def refresh_account_session_and_validate(account_id: int) -> Dict[str, Any]:
+    account = account_row_by_id(account_id)
+    if account is None:
+        raise RuntimeError("account could not be loaded for session refresh")
+    password = decrypt_secret_value(account["password"], required=True)
+    now = time.time()
+    conn = db_conn()
+    conn.execute(
+        "UPDATE accounts SET status='pending_validation', updated_at=? WHERE id=?",
+        (now, account_id),
+    )
+    conn.commit()
+    conn.close()
+    refreshed_session = CLIENT.login(str(account["email"]), password)
+    session = CLIENT.session_from_cookie_dict(refreshed_session.cookies)
+    image_info = CLIENT.fetch_image_models(session)
+    video_info = {
+        "models": CLIENT.fetch_video_models(session),
+        "scenes": CLIENT.fetch_video_scenes(session),
+    }
+    save_account(
+        str(account["email"]),
+        password,
+        refreshed_session,
+        model_info=image_info,
+        video_info=video_info,
+        status="pending_validation",
+        source=str(account["source"] or "auto"),
+    )
+    return validate_registered_account(account_id)
+
+
 def save_and_validate_registered_account(
     email: str,
     password: str,
@@ -5739,6 +5771,32 @@ def maintenance_account_item(
     }
 
 
+def recoverable_expired_session_account(row: sqlite3.Row) -> bool:
+    if str(row["status"] or "") != "disabled":
+        return False
+    return upstream_error_code(RuntimeError(str(row["last_error"] or ""))) == "200001"
+
+
+def record_maintenance_account_failure(
+    account_id: int,
+    exc: Exception,
+) -> Tuple[str, str]:
+    code = upstream_error_code(exc)
+    mark_account_failure(account_id, exc)
+    refreshed = account_row_by_id(account_id)
+    if code == "212361" or (
+        refreshed is not None
+        and account_risk_status(refreshed) == "risk_control"
+    ):
+        return "risk_control", code
+    if code == "200001" or (
+        refreshed is not None
+        and str(refreshed["status"] or "") == "invalid"
+    ):
+        return "invalid", code
+    return "check_failed", code
+
+
 def run_pool_maintenance_job(job_id: int) -> None:
     job = get_pool_maintenance_job(job_id)
     if job["status"] not in {"queued", "running"}:
@@ -5781,7 +5839,8 @@ def run_pool_maintenance_job(job_id: int) -> None:
         action = ""
         code = ""
         status = str(row["status"] or "")
-        if status == "disabled":
+        recover_expired_session = recoverable_expired_session_account(row)
+        if status == "disabled" and not recover_expired_session:
             checked_accounts += 1
             update_pool_maintenance_job(
                 job_id,
@@ -5794,7 +5853,25 @@ def run_pool_maintenance_job(job_id: int) -> None:
             continue
 
         risk_status = account_risk_status(row)
-        if risk_status == "risk_control":
+        if recover_expired_session:
+            try:
+                update_pool_maintenance_job(
+                    job_id,
+                    current_step="refreshing_session",
+                )
+                refresh_account_session_and_validate(account_id)
+            except Exception as exc:
+                check_failures += 1
+                category, code = record_maintenance_account_failure(
+                    account_id,
+                    exc,
+                )
+                if category == "risk_control":
+                    risk_found += 1
+                elif category == "invalid":
+                    invalid_found += 1
+                action = "cooling" if category == "check_failed" else ""
+        elif risk_status == "risk_control":
             category = "risk_control"
             risk_found += 1
         elif status == "invalid":
@@ -5814,25 +5891,27 @@ def run_pool_maintenance_job(job_id: int) -> None:
                     update_account_balance_snapshot(account_id, detail)
                     probe_account_generation_health(row)
             except Exception as exc:
-                check_failures += 1
-                code = upstream_error_code(exc)
-                mark_account_failure(account_id, exc)
-                refreshed = account_row_by_id(account_id)
-                if code == "212361" or (
-                    refreshed is not None
-                    and account_risk_status(refreshed) == "risk_control"
-                ):
-                    category = "risk_control"
-                    risk_found += 1
-                elif code == "200001" or (
-                    refreshed is not None
-                    and str(refreshed["status"] or "") == "invalid"
-                ):
-                    category = "invalid"
-                    invalid_found += 1
-                else:
-                    category = "check_failed"
-                    action = "cooling"
+                if upstream_error_code(exc) == "200001":
+                    try:
+                        update_pool_maintenance_job(
+                            job_id,
+                            current_step="refreshing_session",
+                        )
+                        refresh_account_session_and_validate(account_id)
+                        exc = None
+                    except Exception as refresh_exc:
+                        exc = refresh_exc
+                if exc is not None:
+                    check_failures += 1
+                    category, code = record_maintenance_account_failure(
+                        account_id,
+                        exc,
+                    )
+                    if category == "risk_control":
+                        risk_found += 1
+                    elif category == "invalid":
+                        invalid_found += 1
+                    action = "cooling" if category == "check_failed" else ""
 
         if category in {"risk_control", "invalid"}:
             if clean_risk:
@@ -10663,6 +10742,7 @@ function maintenanceStepLabel(step){
     scanning:'正在扫描号池',
     checking_account:'正在检测账号健康状态',
     checking_generation:'正在验证真实生成能力',
+    refreshing_session:'正在刷新账号登录状态',
     supplementing:'正在补充健康账号',
     finalizing:'正在汇总检测结果',
     completed:'维护任务已完成',
