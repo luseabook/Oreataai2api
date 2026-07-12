@@ -4222,6 +4222,179 @@ function alert(message) {{ alerts.push(String(message)); }}
         )
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
+    def test_admin_html_paginates_operational_lists(self):
+        html = server.ADMIN_HTML
+        for element_id in (
+            "task-filter-status",
+            "task-filter-kind",
+            "task-filter-model-name",
+            "task-filter-scene-id",
+            "task-filter-client-id",
+            "task-filter-api-key-id",
+            "task-filter-account-id",
+            "task-filter-error-code",
+            "task-filter-date-from",
+            "task-filter-date-to",
+            "task-page-size",
+            "tasks-prev",
+            "tasks-next",
+            "tasks-list-status",
+            "usage-filter-kind",
+            "usage-filter-status",
+            "usage-filter-model-name",
+            "usage-filter-client-id",
+            "usage-filter-api-key-id",
+            "usage-filter-account-id",
+            "usage-filter-error-code",
+            "usage-filter-date-from",
+            "usage-filter-date-to",
+            "usage-page-size",
+            "usage-prev",
+            "usage-next",
+            "usage-list-status",
+            "upload-filter-kind",
+            "upload-filter-status",
+            "upload-filter-api-key-id",
+            "upload-filter-account-id",
+            "upload-filter-date-from",
+            "upload-filter-date-to",
+            "upload-page-size",
+            "uploads-prev",
+            "uploads-next",
+            "uploads-list-status",
+        ):
+            self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("new URLSearchParams()", html)
+        self.assertIn("response.has_more", html)
+        self.assertIn("response.total", html)
+        self.assertIn("state.lists.tasks.total", html)
+        self.assertNotIn("state.tasks.slice(0,50)", html)
+        self.assertNotIn("state.usage.slice(0,50)", html)
+        self.assertNotIn("(state.uploads||[]).slice(0,50)", html)
+
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to execute pagination helpers")
+        script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+
+        def source_between(start_marker, end_marker):
+            start = script.index(start_marker)
+            end = script.index(end_marker, start)
+            return script[start:end].strip()
+
+        helper_source = source_between("function createListPageState(", "function formatApiError(")
+        loader_source = source_between("function listFiltersFromInputs(", "function escapeHtml(")
+        node_program = f"""
+{helper_source}
+{loader_source}
+function escapeHtml(value) {{ return String(value ?? ''); }}
+const elements = new Map();
+const document = {{getElementById(id) {{
+  if (!elements.has(id)) {{
+    elements.set(id, {{
+      value:'',
+      textContent:'',
+      disabled:false,
+      classList:{{toggle() {{}}}},
+    }});
+  }}
+  return elements.get(id);
+}}}};
+var api;
+const page = createListPageState(25);
+page.offset = 50;
+page.filters = {{status:'failed', account_id:'7', empty:'', ignored:null}};
+const params = listQueryParams(page);
+const actualQuery = params.toString();
+for (const expected of ['limit=25', 'offset=50', 'status=failed', 'account_id=7']) {{
+  if (!actualQuery.includes(expected)) throw new Error(`missing query part ${{expected}}: ${{actualQuery}}`);
+}}
+if (actualQuery.includes('empty=') || actualQuery.includes('ignored=')) {{
+  throw new Error(`blank filters leaked into query: ${{actualQuery}}`);
+}}
+const items = applyListPage(page, {{
+  items:[{{id:1}}],
+  limit:25,
+  offset:50,
+  total:73,
+  has_more:false,
+}});
+if (items.length !== 1 || page.total !== 73 || page.offset !== 50 || page.hasMore !== false) {{
+  throw new Error(`response was not applied: ${{JSON.stringify(page)}}`);
+}}
+if (!listCanPrevious(page) || listCanNext(page)) throw new Error('pagination boundary mismatch');
+if (!listPageSummary(page).includes('第 3 / 3 页') || !listPageSummary(page).includes('共 73 条')) {{
+  throw new Error(`unexpected summary: ${{listPageSummary(page)}}`);
+}}
+page.offset = 0;
+page.total = 0;
+page.hasMore = false;
+if (listCanPrevious(page) || listCanNext(page)) throw new Error('empty page controls should be disabled');
+if (!listPageSummary(page).includes('共 0 条')) throw new Error(`empty summary mismatch: ${{listPageSummary(page)}}`);
+(async () => {{
+  const taskPage=state.lists.tasks;
+  taskPage.limit=25;
+  const pending=[];
+  api=(method,path) => new Promise(resolve => pending.push({{resolve,path}}));
+  const render=() => {{}};
+  const staleRequest=loadOperationalList('tasks','/api/tasks',render);
+  taskPage.filters={{status:'failed'}};
+  taskPage.offset=0;
+  const freshRequest=loadOperationalList('tasks','/api/tasks',render);
+  pending[1].resolve({{items:[{{id:2}}],limit:25,offset:0,total:1,has_more:false}});
+  await freshRequest;
+  pending[0].resolve({{items:[{{id:1}}],limit:25,offset:0,total:99,has_more:true}});
+  await staleRequest;
+  if (state.tasks.length !== 1 || state.tasks[0].id !== 2 || taskPage.total !== 1) {{
+    throw new Error(`stale response overwrote current page: ${{JSON.stringify({{items:state.tasks,page:taskPage}})}}`);
+  }}
+
+  taskPage.offset=50;
+  taskPage.filters={{}};
+  let correctionCalls=0;
+  api=async () => {{
+    correctionCalls += 1;
+    if (correctionCalls===1) return {{items:[],limit:25,offset:50,total:30,has_more:false}};
+    return {{items:[{{id:3}}],limit:25,offset:25,total:30,has_more:false}};
+  }};
+  await loadOperationalList('tasks','/api/tasks',render);
+  if (correctionCalls !== 2 || taskPage.offset !== 25 || state.tasks[0].id !== 3) {{
+    throw new Error(`out-of-range page was not corrected: ${{JSON.stringify({{correctionCalls,page:taskPage,items:state.tasks}})}}`);
+  }}
+
+  taskPage.offset=25;
+  let emptyCalls=0;
+  api=async () => {{
+    emptyCalls += 1;
+    return {{items:[],limit:25,offset:25,total:0,has_more:false}};
+  }};
+  await loadOperationalList('tasks','/api/tasks',render);
+  if (emptyCalls !== 1 || taskPage.offset !== 0 || state.tasks.length !== 0) {{
+    throw new Error(`empty out-of-range page was not normalized: ${{JSON.stringify({{emptyCalls,page:taskPage,items:state.tasks}})}}`);
+  }}
+
+  api=async () => {{ throw new Error('network boom'); }};
+  let rejected=false;
+  try {{ await loadOperationalList('tasks','/api/tasks',render); }} catch (_error) {{ rejected=true; }}
+  if (!rejected || taskPage.loading || taskPage.error !== 'network boom') {{
+    throw new Error(`error state mismatch: ${{JSON.stringify(taskPage)}}`);
+  }}
+}})().catch(error => {{
+  console.error(error);
+  process.exitCode=1;
+}});
+"""
+        node_test_path = Path(self.tmp.name) / "operational_list_pagination_test.js"
+        node_test_path.write_text(node_program, encoding="utf-8")
+        completed = subprocess.run(
+            [node, str(node_test_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_admin_html_contains_balance_refresh_controls(self):
         html = server.ADMIN_HTML
         self.assertIn("refreshAccountBalance", html)
@@ -4709,6 +4882,7 @@ function alert(message) {{ alerts.push(String(message)); }}
         payload = page.json()
         self.assertEqual(payload["limit"], 2)
         self.assertEqual(payload["offset"], 1)
+        self.assertEqual(payload["total"], 3)
         self.assertEqual(len(payload["items"]), 2)
         self.assertEqual([item["id"] for item in payload["items"]], list(reversed(task_ids))[1:3])
         self.assertFalse(payload["has_more"])
@@ -4716,9 +4890,16 @@ function alert(message) {{ alerts.push(String(message)); }}
         filtered = self.client.get("/api/tasks?status=failed&limit=10&offset=0", headers=self.admin_headers())
         self.assertEqual(filtered.status_code, 200)
         filtered_payload = filtered.json()
+        self.assertEqual(filtered_payload["total"], 1)
         self.assertEqual(len(filtered_payload["items"]), 1)
         self.assertEqual(filtered_payload["items"][0]["status"], "failed")
         self.assertEqual(filtered_payload["items"][0]["id"], task_ids[1])
+
+        beyond_filtered_page = self.client.get("/api/tasks?status=failed&limit=1&offset=1", headers=self.admin_headers())
+        self.assertEqual(beyond_filtered_page.status_code, 200)
+        self.assertEqual(beyond_filtered_page.json()["total"], 1)
+        self.assertEqual(beyond_filtered_page.json()["items"], [])
+        self.assertFalse(beyond_filtered_page.json()["has_more"])
 
     def test_admin_tasks_support_full_operational_filters(self):
         first_account_id = self.seed_account_with_capabilities("tasks-filter-a@example.com")
@@ -4774,6 +4955,7 @@ function alert(message) {{ alerts.push(String(message)); }}
 
         self.assertEqual(filtered.status_code, 200)
         payload = filtered.json()
+        self.assertEqual(payload["total"], 1)
         self.assertEqual(len(payload["items"]), 1)
         item = payload["items"][0]
         self.assertEqual(item["id"], target_id)
@@ -4847,6 +5029,7 @@ function alert(message) {{ alerts.push(String(message)); }}
         payload = page.json()
         self.assertEqual(payload["limit"], 2)
         self.assertEqual(payload["offset"], 1)
+        self.assertEqual(payload["total"], 3)
         self.assertEqual(len(payload["items"]), 2)
         self.assertTrue(payload["has_more"] is False)
         self.assertEqual([item["request_id"] for item in payload["items"]], ["req-2", "req-1"])
@@ -4857,6 +5040,7 @@ function alert(message) {{ alerts.push(String(message)); }}
         )
         self.assertEqual(filtered.status_code, 200)
         filtered_payload = filtered.json()
+        self.assertEqual(filtered_payload["total"], 1)
         self.assertEqual(len(filtered_payload["items"]), 1)
         self.assertEqual(filtered_payload["items"][0]["request_id"], "req-3")
         self.assertEqual(filtered_payload["items"][0]["account_email"], "usage-a@example.com")
@@ -4908,6 +5092,7 @@ function alert(message) {{ alerts.push(String(message)); }}
 
         self.assertEqual(filtered.status_code, 200)
         payload = filtered.json()
+        self.assertEqual(payload["total"], 1)
         self.assertEqual(len(payload["items"]), 1)
         item = payload["items"][0]
         self.assertEqual(item["request_id"], "usage-target")
@@ -4966,6 +5151,13 @@ function alert(message) {{ alerts.push(String(message)); }}
             scene_id="text_or_image",
         )
 
+        page = self.client.get("/api/admin/uploads?limit=1&offset=0", headers=self.admin_headers())
+        self.assertEqual(page.status_code, 200)
+        page_payload = page.json()
+        self.assertEqual(page_payload["total"], 2)
+        self.assertEqual(len(page_payload["items"]), 1)
+        self.assertTrue(page_payload["has_more"])
+
         filtered = self.client.get(
             "/api/admin/uploads"
             f"?api_key_id={api_key_id}&account_id={account_id}&kind=image&status=completed"
@@ -4975,6 +5167,7 @@ function alert(message) {{ alerts.push(String(message)); }}
 
         self.assertEqual(filtered.status_code, 200)
         payload = filtered.json()
+        self.assertEqual(payload["total"], 1)
         self.assertEqual(len(payload["items"]), 1)
         item = payload["items"][0]
         self.assertEqual(item["object_path"], "uploads/admin-upload.png")

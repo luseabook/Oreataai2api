@@ -5742,6 +5742,29 @@ def delete_api_key(key_id: int, _=Depends(require_admin)):
     return {"ok": True}
 
 
+def execute_paginated_admin_query(
+    count_sql: str,
+    select_sql: str,
+    params: List[Any],
+    limit: int,
+    offset: int,
+) -> Tuple[int, List[Any]]:
+    """Read a page and its filtered total from the same SQLite snapshot."""
+    conn = db_conn()
+    try:
+        conn.execute("BEGIN")
+        total = int(conn.execute(count_sql, tuple(params)).fetchone()[0])
+        rows = conn.execute(select_sql, tuple(params + [limit + 1, offset])).fetchall()
+        conn.commit()
+        return total, rows
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 @app.get("/api/admin/usage")
 def get_usage(
     limit: int = 200,
@@ -5796,27 +5819,32 @@ def get_usage(
     if error_code:
         where.append("u.error_code=?")
         params.append(error_code)
-    conn = db_conn()
-    rows = conn.execute(
+    where_sql = " AND ".join(where)
+    from_sql = """
+        FROM usage_log u
+        LEFT JOIN accounts a ON u.account_id=a.id
+        LEFT JOIN api_keys k ON u.api_key_id=k.id
+        LEFT JOIN clients c ON k.client_id=c.id
+    """
+    total, rows = execute_paginated_admin_query(
+        f"SELECT COUNT(*) {from_sql} WHERE {where_sql}",
         f"""
         SELECT
             u.*,
             a.email AS account_email,
             k.name AS api_key_name,
             c.name AS client_name
-        FROM usage_log u
-        LEFT JOIN accounts a ON u.account_id=a.id
-        LEFT JOIN api_keys k ON u.api_key_id=k.id
-        LEFT JOIN clients c ON k.client_id=c.id
-        WHERE {' AND '.join(where)}
+        {from_sql}
+        WHERE {where_sql}
         ORDER BY u.id DESC
         LIMIT ? OFFSET ?
         """,
-        tuple(params + [limit + 1, offset]),
-    ).fetchall()
-    conn.close()
+        params,
+        limit,
+        offset,
+    )
     items = [dict(r) for r in rows[:limit]]
-    return {"items": items, "limit": limit, "offset": offset, "has_more": len(rows) > limit}
+    return {"items": items, "limit": limit, "offset": offset, "total": total, "has_more": len(rows) > limit}
 
 
 def parse_report_date_boundary(value: Optional[str], end_of_day: bool = False) -> Optional[float]:
@@ -5870,8 +5898,15 @@ def list_admin_uploads(
         clause, kind_params = upload_kind_filter_clause(kind)
         where.append(clause)
         params.extend(kind_params)
-    conn = db_conn()
-    rows = conn.execute(
+    where_sql = " AND ".join(where)
+    from_sql = """
+        FROM uploaded_media um
+        LEFT JOIN accounts a ON um.account_id=a.id
+        LEFT JOIN api_keys k ON um.api_key_id=k.id
+        LEFT JOIN clients c ON k.client_id=c.id
+    """
+    total, rows = execute_paginated_admin_query(
+        f"SELECT COUNT(*) {from_sql} WHERE {where_sql}",
         f"""
         SELECT
             um.*,
@@ -5885,19 +5920,17 @@ def list_admin_uploads(
                   AND t.account_id=um.account_id
                   AND INSTR(COALESCE(t.payload_json, ''), um.object_path) > 0
             ) AS related_task_count
-        FROM uploaded_media um
-        LEFT JOIN accounts a ON um.account_id=a.id
-        LEFT JOIN api_keys k ON um.api_key_id=k.id
-        LEFT JOIN clients c ON k.client_id=c.id
-        WHERE {' AND '.join(where)}
+        {from_sql}
+        WHERE {where_sql}
         ORDER BY um.id DESC
         LIMIT ? OFFSET ?
         """,
-        tuple(params + [limit + 1, offset]),
-    ).fetchall()
-    conn.close()
+        params,
+        limit,
+        offset,
+    )
     items = [public_uploaded_media(row) for row in rows[:limit]]
-    return {"items": items, "limit": limit, "offset": offset, "has_more": len(rows) > limit}
+    return {"items": items, "limit": limit, "offset": offset, "total": total, "has_more": len(rows) > limit}
 
 
 @app.get("/api/admin/cost-report")
@@ -7576,27 +7609,32 @@ def list_tasks(
     if error_code:
         where.append("t.error_code=?")
         params.append(error_code)
-    conn = db_conn()
-    rows = conn.execute(
+    where_sql = " AND ".join(where)
+    from_sql = """
+        FROM tasks t
+        LEFT JOIN accounts a ON t.account_id=a.id
+        LEFT JOIN api_keys k ON t.api_key_id=k.id
+        LEFT JOIN clients c ON k.client_id=c.id
+    """
+    total, rows = execute_paginated_admin_query(
+        f"SELECT COUNT(*) {from_sql} WHERE {where_sql}",
         f"""
         SELECT
             t.*,
             a.email AS account_email,
             k.name AS api_key_name,
             c.name AS client_name
-        FROM tasks t
-        LEFT JOIN accounts a ON t.account_id=a.id
-        LEFT JOIN api_keys k ON t.api_key_id=k.id
-        LEFT JOIN clients c ON k.client_id=c.id
-        WHERE {' AND '.join(where)}
+        {from_sql}
+        WHERE {where_sql}
         ORDER BY t.id DESC
         LIMIT ? OFFSET ?
         """,
-        tuple(params + [limit + 1, offset]),
-    ).fetchall()
-    conn.close()
+        params,
+        limit,
+        offset,
+    )
     items = [task_row_to_public(r) for r in rows[:limit]]
-    return {"items": items, "limit": limit, "offset": offset, "has_more": len(rows) > limit}
+    return {"items": items, "limit": limit, "offset": offset, "total": total, "has_more": len(rows) > limit}
 
 
 @app.get("/api/tasks/{task_id}")
@@ -7718,6 +7756,12 @@ tr:hover td{background:#fafafa}
 .task-preview-assets{display:flex;flex-direction:column;gap:8px}
 .task-preview-media{max-width:100%;border-radius:10px;border:1px solid #e5e5e5;background:#000}
 .task-actions{display:flex;flex-wrap:wrap;gap:6px}
+.list-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}
+.list-filter-actions{display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:12px}
+.list-pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:12px;min-height:32px}
+.list-status{font-size:12px;color:#6e6e73;margin-right:auto}
+.list-status.error{color:#c62828}
+button:disabled{cursor:not-allowed;opacity:.5;transform:none}
 .hidden{display:none!important}
 @keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
 @keyframes slideDown{from{opacity:0;transform:translateY(-12px)}to{opacity:1;transform:translateY(0)}}
@@ -7820,12 +7864,34 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
 <!-- Tab: 任务 -->
 <div id="tab-tasks" class="section hidden">
   <h2>📦 任务列表</h2>
-  <button class="btn-secondary btn-sm" onclick="loadTasks()" style="margin-bottom:12px">刷新</button>
+  <div class="list-filters">
+    <div><label>状态</label><select id="task-filter-status"><option value="">全部</option><option value="queued">queued</option><option value="running">running</option><option value="submitted">submitted</option><option value="hydrating">hydrating</option><option value="completed">completed</option><option value="failed">failed</option><option value="expired">expired</option><option value="cancelled">cancelled</option></select></div>
+    <div><label>类型</label><select id="task-filter-kind"><option value="">全部</option><option value="image">image</option><option value="video">video</option></select></div>
+    <div><label>模型</label><input id="task-filter-model-name" placeholder="模型名"></div>
+    <div><label>场景</label><input id="task-filter-scene-id" placeholder="scene_id"></div>
+    <div><label>客户 ID</label><input id="task-filter-client-id" type="number" min="1" step="1"></div>
+    <div><label>API Key ID</label><input id="task-filter-api-key-id" type="number" min="1" step="1"></div>
+    <div><label>账号 ID</label><input id="task-filter-account-id" type="number" min="1" step="1"></div>
+    <div><label>错误码</label><input id="task-filter-error-code" placeholder="error_code"></div>
+    <div><label>开始日期</label><input id="task-filter-date-from" type="date"></div>
+    <div><label>结束日期</label><input id="task-filter-date-to" type="date"></div>
+    <div><label>每页</label><select id="task-page-size"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></div>
+  </div>
+  <div class="list-filter-actions">
+    <button class="btn-primary btn-sm" onclick="applyTaskFilters()">应用筛选</button>
+    <button class="btn-secondary btn-sm" onclick="resetTaskFilters()">重置</button>
+    <button class="btn-secondary btn-sm" onclick="void loadTasks().catch(()=>{})">刷新</button>
+  </div>
   <div class="table-wrap">
     <table>
       <thead><tr><th>ID</th><th>类型</th><th>账号</th><th>状态</th><th>提示词</th><th>chatId</th><th>时间</th><th>操作</th></tr></thead>
       <tbody id="tasks-tbody"></tbody>
     </table>
+  </div>
+  <div class="list-pagination">
+    <span id="tasks-list-status" class="list-status"></span>
+    <button id="tasks-prev" class="btn-secondary btn-sm" onclick="previousTaskPage()">上一页</button>
+    <button id="tasks-next" class="btn-secondary btn-sm" onclick="nextTaskPage()">下一页</button>
   </div>
   <div id="task-preview" class="section hidden" style="margin-top:16px">
     <h2>🔎 任务详情</h2>
@@ -7885,19 +7951,59 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
     </table>
   </div>
   <h2 style="margin-top:24px">📊 用量日志</h2>
+  <div class="list-filters">
+    <div><label>类型</label><select id="usage-filter-kind"><option value="">全部</option><option value="image">image</option><option value="video">video</option></select></div>
+    <div><label>状态</label><select id="usage-filter-status"><option value="">全部</option><option value="queued">queued</option><option value="running">running</option><option value="submitted">submitted</option><option value="hydrating">hydrating</option><option value="completed">completed</option><option value="failed">failed</option><option value="expired">expired</option><option value="cancelled">cancelled</option></select></div>
+    <div><label>模型</label><input id="usage-filter-model-name" placeholder="模型名"></div>
+    <div><label>客户 ID</label><input id="usage-filter-client-id" type="number" min="1" step="1"></div>
+    <div><label>API Key ID</label><input id="usage-filter-api-key-id" type="number" min="1" step="1"></div>
+    <div><label>账号 ID</label><input id="usage-filter-account-id" type="number" min="1" step="1"></div>
+    <div><label>错误码</label><input id="usage-filter-error-code" placeholder="error_code"></div>
+    <div><label>开始日期</label><input id="usage-filter-date-from" type="date"></div>
+    <div><label>结束日期</label><input id="usage-filter-date-to" type="date"></div>
+    <div><label>每页</label><select id="usage-page-size"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></div>
+  </div>
+  <div class="list-filter-actions">
+    <button class="btn-primary btn-sm" onclick="applyUsageFilters()">应用筛选</button>
+    <button class="btn-secondary btn-sm" onclick="resetUsageFilters()">重置</button>
+    <button class="btn-secondary btn-sm" onclick="void loadUsage().catch(()=>{})">刷新</button>
+  </div>
   <div class="table-wrap">
     <table>
       <thead><tr><th>ID</th><th>类型</th><th>账号</th><th>模型</th><th>点数</th><th>错误码</th><th>状态</th><th>提示词</th><th>时间</th></tr></thead>
       <tbody id="usage-tbody"></tbody>
     </table>
   </div>
+  <div class="list-pagination">
+    <span id="usage-list-status" class="list-status"></span>
+    <button id="usage-prev" class="btn-secondary btn-sm" onclick="previousUsagePage()">上一页</button>
+    <button id="usage-next" class="btn-secondary btn-sm" onclick="nextUsagePage()">下一页</button>
+  </div>
   <h2 style="margin-top:24px">上传素材</h2>
-  <button class="btn-secondary btn-sm" onclick="loadUploads()" style="margin-bottom:12px">刷新</button>
+  <div class="list-filters">
+    <div><label>类型</label><select id="upload-filter-kind"><option value="">全部</option><option value="image">image</option><option value="video">video</option></select></div>
+    <div><label>状态</label><input id="upload-filter-status" placeholder="completed"></div>
+    <div><label>API Key ID</label><input id="upload-filter-api-key-id" type="number" min="1" step="1"></div>
+    <div><label>账号 ID</label><input id="upload-filter-account-id" type="number" min="1" step="1"></div>
+    <div><label>开始日期</label><input id="upload-filter-date-from" type="date"></div>
+    <div><label>结束日期</label><input id="upload-filter-date-to" type="date"></div>
+    <div><label>每页</label><select id="upload-page-size"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></div>
+  </div>
+  <div class="list-filter-actions">
+    <button class="btn-primary btn-sm" onclick="applyUploadFilters()">应用筛选</button>
+    <button class="btn-secondary btn-sm" onclick="resetUploadFilters()">重置</button>
+    <button class="btn-secondary btn-sm" onclick="void loadUploads().catch(()=>{})">刷新</button>
+  </div>
   <div class="table-wrap">
     <table>
       <thead><tr><th>ID</th><th>类型</th><th>账号</th><th>Key</th><th>文件</th><th>Object</th><th>关联任务</th><th>状态</th><th>时间</th><th>操作</th></tr></thead>
       <tbody id="uploads-tbody"></tbody>
     </table>
+  </div>
+  <div class="list-pagination">
+    <span id="uploads-list-status" class="list-status"></span>
+    <button id="uploads-prev" class="btn-secondary btn-sm" onclick="previousUploadPage()">上一页</button>
+    <button id="uploads-next" class="btn-secondary btn-sm" onclick="nextUploadPage()">下一页</button>
   </div>
   <h2 style="margin-top:24px">💹 成本报表</h2>
   <div class="row" style="margin-bottom:16px">
@@ -8088,7 +8194,52 @@ async function init() {
 function copyExample() { copyText(document.getElementById('gw-example').textContent); }
 
 // === Accounts ===
-let state = {accounts:[],tasks:[],apikeys:[],clients:[],usage:[],uploads:[],costReport:[],auditLogs:[],settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}}};
+function createListPageState(limit=50){
+  const normalizedLimit=Number.isSafeInteger(Number(limit)) && Number(limit)>0 ? Number(limit) : 50;
+  return {limit:normalizedLimit,offset:0,total:0,hasMore:false,loading:false,error:'',filters:{},requestId:0};
+}
+function listQueryParams(page){
+  const params=new URLSearchParams();
+  params.set('limit',String(page.limit));
+  params.set('offset',String(page.offset));
+  Object.entries(page.filters||{}).forEach(([key,value]) => {
+    const text=String(value ?? '').trim();
+    if(text) params.set(key,text);
+  });
+  return params;
+}
+function applyListPage(page,response){
+  const limit=Number(response.limit);
+  const offset=Number(response.offset);
+  const total=Number(response.total);
+  if(Number.isSafeInteger(limit) && limit>0) page.limit=limit;
+  if(Number.isSafeInteger(offset) && offset>=0) page.offset=offset;
+  page.total=Number.isSafeInteger(total) && total>=0 ? total : 0;
+  page.hasMore=Boolean(response.has_more);
+  return Array.isArray(response.items) ? response.items : [];
+}
+function listCanPrevious(page){
+  return !page.loading && page.offset>0;
+}
+function listCanNext(page){
+  return !page.loading && Boolean(page.hasMore);
+}
+function listPageSummary(page){
+  if(page.loading) return '加载中…';
+  if(page.error) return `加载失败：${page.error}`;
+  const pages=page.total>0 ? Math.ceil(page.total/page.limit) : 0;
+  const current=page.total>0 ? Math.floor(page.offset/page.limit)+1 : 0;
+  return `第 ${current} / ${pages} 页 · 共 ${page.total} 条`;
+}
+let state = {
+  accounts:[],tasks:[],apikeys:[],clients:[],usage:[],uploads:[],costReport:[],auditLogs:[],
+  settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}},
+  lists:{
+    tasks:createListPageState(50),
+    usage:createListPageState(50),
+    uploads:createListPageState(50),
+  },
+};
 function formatApiError(payload, fallback='request failed'){
   let detail=payload;
   if(payload && typeof payload === 'object' && !Array.isArray(payload)){
@@ -8112,6 +8263,96 @@ async function api(m,u,b){
   if (r.status === 401) throw new Error(formatApiError(data, 'unauthorized'));
   if (!r.ok) throw new Error(formatApiError(data, 'request failed'));
   return data;
+}
+function listFiltersFromInputs(fields){
+  const filters={};
+  Object.entries(fields).forEach(([queryName,elementId]) => {
+    const value=document.getElementById(elementId)?.value;
+    if(String(value ?? '').trim()) filters[queryName]=String(value).trim();
+  });
+  return filters;
+}
+function listLimitFromInput(elementId,fallback){
+  const value=Number(document.getElementById(elementId)?.value);
+  return Number.isSafeInteger(value) && value>=1 && value<=200 ? value : fallback;
+}
+function clearListInputs(elementIds,pageSizeId){
+  elementIds.forEach(id => {
+    const element=document.getElementById(id);
+    if(element) element.value='';
+  });
+  const pageSize=document.getElementById(pageSizeId);
+  if(pageSize) pageSize.value='50';
+}
+function renderListControls(name){
+  const page=state.lists[name];
+  const prefix=name;
+  const status=document.getElementById(`${prefix}-list-status`);
+  const previous=document.getElementById(`${prefix}-prev`);
+  const next=document.getElementById(`${prefix}-next`);
+  if(status){
+    status.textContent=listPageSummary(page);
+    status.classList.toggle('error',Boolean(page.error));
+  }
+  if(previous) previous.disabled=!listCanPrevious(page);
+  if(next) next.disabled=!listCanNext(page);
+}
+function renderListTableState(tbody,page,columnCount){
+  if(page.loading){
+    tbody.innerHTML=`<tr><td colspan="${columnCount}" style="text-align:center;color:#86868b">加载中…</td></tr>`;
+    return true;
+  }
+  if(page.error){
+    tbody.innerHTML=`<tr><td colspan="${columnCount}" style="text-align:center;color:#c62828">加载失败：${escapeHtml(page.error)}</td></tr>`;
+    return true;
+  }
+  return false;
+}
+async function loadOperationalList(name,path,render,afterLoad=null){
+  const page=state.lists[name];
+  const requestId=++page.requestId;
+  page.loading=true;
+  page.error='';
+  render();
+  renderListControls(name);
+  try{
+    const response=await api('GET',`${path}?${listQueryParams(page).toString()}`);
+    if(requestId!==page.requestId) return null;
+    const items=applyListPage(page,response);
+    if(page.total===0 && page.offset>0){
+      page.offset=0;
+    }
+    if(page.total>0 && page.offset>=page.total){
+      page.offset=Math.floor((page.total-1)/page.limit)*page.limit;
+      page.loading=false;
+      return loadOperationalList(name,path,render,afterLoad);
+    }
+    state[name]=items;
+    page.loading=false;
+    render();
+    renderListControls(name);
+    if(afterLoad) afterLoad();
+    return items;
+  }catch(error){
+    if(requestId!==page.requestId) return null;
+    page.loading=false;
+    page.error=error?.message || String(error);
+    render();
+    renderListControls(name);
+    throw error;
+  }
+}
+function changeOperationalListPage(name,direction,loader){
+  const page=state.lists[name];
+  if(page.loading) return;
+  if(direction<0 && listCanPrevious(page)){
+    page.offset=Math.max(0,page.offset-page.limit);
+  }else if(direction>0 && listCanNext(page)){
+    page.offset+=page.limit;
+  }else{
+    return;
+  }
+  void loader().catch(()=>{});
 }
 function escapeHtml(value){
   return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -8334,7 +8575,41 @@ async function gatewayGenerate(){
 }
 
 // === Tasks ===
-async function loadTasks(){const r=await api('GET','/api/tasks');state.tasks=r.items||[];renderTasks();updateStats();}
+async function loadTasks(){
+  return loadOperationalList('tasks','/api/tasks',renderTasks,updateStats);
+}
+function applyTaskFilters(){
+  const page=state.lists.tasks;
+  page.filters=listFiltersFromInputs({
+    status:'task-filter-status',
+    kind:'task-filter-kind',
+    model_name:'task-filter-model-name',
+    scene_id:'task-filter-scene-id',
+    client_id:'task-filter-client-id',
+    api_key_id:'task-filter-api-key-id',
+    account_id:'task-filter-account-id',
+    error_code:'task-filter-error-code',
+    date_from:'task-filter-date-from',
+    date_to:'task-filter-date-to',
+  });
+  page.limit=listLimitFromInput('task-page-size',page.limit);
+  page.offset=0;
+  void loadTasks().catch(()=>{});
+}
+function resetTaskFilters(){
+  clearListInputs([
+    'task-filter-status','task-filter-kind','task-filter-model-name','task-filter-scene-id',
+    'task-filter-client-id','task-filter-api-key-id','task-filter-account-id',
+    'task-filter-error-code','task-filter-date-from','task-filter-date-to',
+  ],'task-page-size');
+  const page=state.lists.tasks;
+  page.filters={};
+  page.limit=50;
+  page.offset=0;
+  void loadTasks().catch(()=>{});
+}
+function previousTaskPage(){changeOperationalListPage('tasks',-1,loadTasks);}
+function nextTaskPage(){changeOperationalListPage('tasks',1,loadTasks);}
 function taskCanRetry(status){
   return ['failed','expired'].includes(String(status ?? '').toLowerCase());
 }
@@ -8355,7 +8630,15 @@ function taskActionButtons(task){
   return buttons.join('');
 }
 function renderTasks(){
-  document.getElementById('tasks-tbody').innerHTML = state.tasks.slice(0,50).map(t => {
+  const tbody=document.getElementById('tasks-tbody');
+  const page=state.lists?.tasks || {loading:false,error:''};
+  if(typeof renderListTableState==='function' && renderListTableState(tbody,page,8)) return;
+  const tasks=Array.isArray(state.tasks) ? state.tasks : [];
+  if(!tasks.length){
+    tbody.innerHTML='<tr><td colspan="8" style="text-align:center;color:#86868b">暂无任务</td></tr>';
+    return;
+  }
+  tbody.innerHTML = tasks.map(t => {
     const statusClass=t.status==='completed'?'tag-green':t.status==='failed'?'tag-red':t.status==='cancelled'?'tag-gray':t.status==='submitted'?'tag-blue':'tag-gray';
     const kindClass=t.kind==='image'?'tag-blue':'tag-green';
     return `<tr>
@@ -8559,18 +8842,95 @@ async function updateApiKeyPolicy(id){
 async function deleteKey(id){if(!confirm('确认删除此 API Key？')) return; await api('DELETE','/api/admin/apikeys/'+id);await loadApiKeys();}
 
 // === Usage ===
-async function loadUsage(){const r=await api('GET','/api/admin/usage');state.usage=r.items||[];renderUsage();}
+async function loadUsage(){
+  return loadOperationalList('usage','/api/admin/usage',renderUsage);
+}
+function applyUsageFilters(){
+  const page=state.lists.usage;
+  page.filters=listFiltersFromInputs({
+    kind:'usage-filter-kind',
+    status:'usage-filter-status',
+    model_name:'usage-filter-model-name',
+    client_id:'usage-filter-client-id',
+    api_key_id:'usage-filter-api-key-id',
+    account_id:'usage-filter-account-id',
+    error_code:'usage-filter-error-code',
+    date_from:'usage-filter-date-from',
+    date_to:'usage-filter-date-to',
+  });
+  page.limit=listLimitFromInput('usage-page-size',page.limit);
+  page.offset=0;
+  void loadUsage().catch(()=>{});
+}
+function resetUsageFilters(){
+  clearListInputs([
+    'usage-filter-kind','usage-filter-status','usage-filter-model-name','usage-filter-client-id',
+    'usage-filter-api-key-id','usage-filter-account-id','usage-filter-error-code',
+    'usage-filter-date-from','usage-filter-date-to',
+  ],'usage-page-size');
+  const page=state.lists.usage;
+  page.filters={};
+  page.limit=50;
+  page.offset=0;
+  void loadUsage().catch(()=>{});
+}
+function previousUsagePage(){changeOperationalListPage('usage',-1,loadUsage);}
+function nextUsagePage(){changeOperationalListPage('usage',1,loadUsage);}
 function renderUsage(){
-  document.getElementById('usage-tbody').innerHTML = state.usage.slice(0,50).map(u => {
+  const tbody=document.getElementById('usage-tbody');
+  const page=state.lists?.usage || {loading:false,error:''};
+  if(renderListTableState(tbody,page,9)) return;
+  const usage=Array.isArray(state.usage) ? state.usage : [];
+  if(!usage.length){
+    tbody.innerHTML='<tr><td colspan="9" style="text-align:center;color:#86868b">暂无用量记录</td></tr>';
+    return;
+  }
+  tbody.innerHTML = usage.map(u => {
     return `<tr><td>${u.id}</td><td><span class="tag ${u.kind==='image'?'tag-blue':'tag-green'}">${escapeHtml(u.kind||'-')}</span></td><td>${escapeHtml(u.account_email||u.account_id||'-')}</td><td>${escapeHtml(u.model_name||'-')}</td><td>${u.estimated_point_cost ?? '-'}</td><td>${escapeHtml(u.error_code||'-')}</td><td>${escapeHtml(u.status||'-')}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${escapeHtml((u.prompt||'').substring(0,40))}</td><td style="font-size:11px">${new Date((u.created_at||0)*1000).toLocaleString()}</td></tr>`;
   }).join('');
 }
 
-async function loadUploads(){const r=await api('GET','/api/admin/uploads');state.uploads=r.items||[];renderUploads();}
+async function loadUploads(){
+  return loadOperationalList('uploads','/api/admin/uploads',renderUploads);
+}
+function applyUploadFilters(){
+  const page=state.lists.uploads;
+  page.filters=listFiltersFromInputs({
+    kind:'upload-filter-kind',
+    status:'upload-filter-status',
+    api_key_id:'upload-filter-api-key-id',
+    account_id:'upload-filter-account-id',
+    date_from:'upload-filter-date-from',
+    date_to:'upload-filter-date-to',
+  });
+  page.limit=listLimitFromInput('upload-page-size',page.limit);
+  page.offset=0;
+  void loadUploads().catch(()=>{});
+}
+function resetUploadFilters(){
+  clearListInputs([
+    'upload-filter-kind','upload-filter-status','upload-filter-api-key-id',
+    'upload-filter-account-id','upload-filter-date-from','upload-filter-date-to',
+  ],'upload-page-size');
+  const page=state.lists.uploads;
+  page.filters={};
+  page.limit=50;
+  page.offset=0;
+  void loadUploads().catch(()=>{});
+}
+function previousUploadPage(){changeOperationalListPage('uploads',-1,loadUploads);}
+function nextUploadPage(){changeOperationalListPage('uploads',1,loadUploads);}
 function renderUploads(){
   const tbody=document.getElementById('uploads-tbody');
   if(!tbody) return;
-  tbody.innerHTML = (state.uploads||[]).slice(0,50).map(item => {
+  const page=state.lists?.uploads || {loading:false,error:''};
+  if(renderListTableState(tbody,page,10)) return;
+  const uploads=Array.isArray(state.uploads) ? state.uploads : [];
+  if(!uploads.length){
+    tbody.innerHTML='<tr><td colspan="10" style="text-align:center;color:#86868b">暂无上传素材</td></tr>';
+    return;
+  }
+  tbody.innerHTML = uploads.map(item => {
     const objectPath=String(item.object_path||'');
     const attachment=JSON.stringify(item.attachment||{});
     const kindClass=item.kind==='image'?'tag-blue':item.kind==='video'?'tag-green':'tag-gray';
@@ -8698,7 +9058,7 @@ function updateStats(){
   const a=state.accounts||[];
   document.getElementById('st-total').textContent=a.length;
   document.getElementById('st-verified').textContent=a.filter(x=>x.status==='verified').length;
-  document.getElementById('st-tasks').textContent=(state.tasks||[]).length;
+  document.getElementById('st-tasks').textContent=state.lists.tasks.total;
   document.getElementById('st-apikeys').textContent=(state.apikeys||[]).length;
 }
 init();
