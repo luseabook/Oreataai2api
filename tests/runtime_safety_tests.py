@@ -282,6 +282,7 @@ class ServerLifecycleTests(unittest.TestCase):
                 patch.object(server, "init_db", side_effect=fail_after_observing_lock),
                 patch.object(server, "save_config") as save_config,
                 patch.object(server, "recover_stale_running_tasks") as recover_tasks,
+                patch.object(server, "recover_interrupted_registration_jobs") as recover_registration_jobs,
                 patch.object(server, "ensure_task_worker_started") as start_worker,
                 patch.dict(os.environ, {}, clear=True),
             ):
@@ -294,6 +295,7 @@ class ServerLifecycleTests(unittest.TestCase):
                 self.assertIsNone(server.APPLICATION_WORKER_LOCK)
                 save_config.assert_not_called()
                 recover_tasks.assert_not_called()
+                recover_registration_jobs.assert_not_called()
                 start_worker.assert_not_called()
 
                 with SingleWorkerLock(worker_lock_path(database_path, {})):
@@ -324,6 +326,7 @@ class ServerLifecycleTests(unittest.TestCase):
                 patch.object(server, "init_db") as init_db,
                 patch.object(server, "save_config") as save_config,
                 patch.object(server, "recover_stale_running_tasks") as recover_tasks,
+                patch.object(server, "recover_interrupted_registration_jobs") as recover_registration_jobs,
                 patch.object(server, "ensure_task_worker_started") as start_worker,
                 patch.dict(os.environ, {}, clear=True),
             ):
@@ -333,6 +336,7 @@ class ServerLifecycleTests(unittest.TestCase):
                 init_db.assert_not_called()
                 save_config.assert_not_called()
                 recover_tasks.assert_not_called()
+                recover_registration_jobs.assert_not_called()
                 start_worker.assert_not_called()
                 self.assertFalse(server.APP_LIFECYCLE_STARTED)
                 self.assertIsNone(server.APPLICATION_WORKER_LOCK)
@@ -364,6 +368,7 @@ class ServerLifecycleTests(unittest.TestCase):
                 patch.object(server, "init_db") as init_db,
                 patch.object(server, "save_config") as save_config,
                 patch.object(server, "recover_stale_running_tasks") as recover_tasks,
+                patch.object(server, "recover_interrupted_registration_jobs") as recover_registration_jobs,
                 patch.object(server, "ensure_task_worker_started") as start_worker,
                 patch.dict(os.environ, {}, clear=True),
             ):
@@ -377,7 +382,8 @@ class ServerLifecycleTests(unittest.TestCase):
                     self.assertTrue(first_lock.is_held)
                     init_db.assert_called_once_with()
                     save_config.assert_called_once_with(server.CFG)
-                    recover_tasks.assert_called_once_with()
+                    recover_tasks.assert_called_once_with(stale_after_seconds=0.0)
+                    recover_registration_jobs.assert_called_once_with()
                     start_worker.assert_called_once_with()
                 finally:
                     lock = server.APPLICATION_WORKER_LOCK

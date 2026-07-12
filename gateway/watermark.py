@@ -139,7 +139,11 @@ def detect_oreate_watermark_bbox(image: Image.Image) -> Optional[Tuple[int, int,
     return min(candidates, key=lambda item: item[0])[1]
 
 
-def watermark_free_image_bytes(payload: bytes) -> Tuple[bytes, str, bool]:
+def watermark_free_image_bytes(
+    payload: bytes,
+    *,
+    force_bottom_strip: bool = False,
+) -> Tuple[bytes, str, bool]:
     try:
         with Image.open(io.BytesIO(payload)) as source:
             image_format = str(source.format or "")
@@ -151,7 +155,14 @@ def watermark_free_image_bytes(payload: bytes) -> Tuple[bytes, str, bool]:
             image = ImageOps.exif_transpose(source)
             watermark_bbox = detect_oreate_watermark_bbox(image)
             if watermark_bbox is None:
-                return payload, media_type, False
+                if not force_bottom_strip:
+                    return payload, media_type, False
+                watermark_bbox = (
+                    round(image.width * 0.8),
+                    round(image.height * 0.955),
+                    image.width,
+                    image.height,
+                )
 
             width, height = image.size
             crop_bottom = watermark_bbox[1] - max(4, round(height * 0.01))

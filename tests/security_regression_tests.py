@@ -376,11 +376,14 @@ class SecurityRegressionTests(unittest.TestCase):
             ("get", "/api/admin/backup", None),
             ("post", "/api/admin/restore", {"confirm": "true"}),
             ("get", "/api/accounts", None),
+            ("get", "/api/accounts/1/credentials", None),
             ("get", "/api/mail/test", None),
             ("get", "/api/models/capabilities", None),
             ("post", "/api/models/refresh", None),
             ("post", "/api/register/one", None),
             ("post", "/api/register/batch", {"count": 1}),
+            ("post", "/api/register/jobs", {"count": 1}),
+            ("get", "/api/register/jobs/1", None),
             ("post", "/api/accounts/import", {"email": "a@b.test", "password": "x"}),
             ("post", "/api/media/generate", {"kind": "image", "prompt": "x"}),
             ("get", "/api/tasks", None),
@@ -897,6 +900,27 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertEqual(clean_media_type, "image/png")
         self.assertEqual(untouched, clean_payload.getvalue())
 
+    def test_watermark_removal_can_force_the_small_upstream_bottom_strip(self):
+        image = Image.new("RGB", (1080, 1920), (70, 50, 100))
+        draw = ImageDraw.Draw(image)
+        font = ImageFont.load_default(size=22)
+        draw.text((920, 1850), "Oreate AI", fill=(245, 245, 245), font=font)
+        payload = io.BytesIO()
+        image.save(payload, format="PNG")
+
+        processed, media_type, removed = server.watermark_free_image_bytes(
+            payload.getvalue(),
+            force_bottom_strip=True,
+        )
+
+        self.assertTrue(removed)
+        self.assertEqual(media_type, "image/png")
+        with Image.open(io.BytesIO(processed)) as result:
+            self.assertEqual(result.size, (1080, 1920))
+            bottom_right = result.crop((900, 1810, 1080, 1920))
+            extrema = bottom_right.convert("L").getextrema()
+            self.assertLess(extrema[1] - extrema[0], 20)
+
     def test_admin_clean_asset_requires_login_and_rejects_untrusted_hosts(self):
         trusted_task_id = self.seed_completed_image_task("https://cdn.oreateai.com/static/result/test.jpg")
         untrusted_task_id = self.seed_completed_image_task("https://example.com/result/test.jpg")
@@ -927,20 +951,58 @@ class SecurityRegressionTests(unittest.TestCase):
         get.assert_called_once()
         redirect.close.assert_called_once()
 
-    def test_clean_asset_download_uses_system_trust_when_requests_ca_bundle_rejects_cdn(self):
+    def test_clean_asset_download_uses_targeted_insecure_fallback_when_cdn_chain_is_incomplete(self):
         expected = self.synthetic_watermarked_image_bytes()
-        with patch.object(server.requests, "get", side_effect=server.requests.exceptions.SSLError):
-            with patch.object(
-                server,
-                "fetch_remote_image_asset_with_system_trust",
-                return_value=expected,
-            ) as fallback:
-                result = server.fetch_remote_image_asset(
-                    "https://cdn.oreateai.com/static/result/test.jpg"
-                )
+        fallback_response = MagicMock()
+        fallback_response.status_code = 200
+        fallback_response.headers = {
+            "content-length": str(len(expected)),
+            "content-type": "image/jpeg",
+        }
+        fallback_response.url = "https://cdn.oreateai.com/static/result/test.jpg"
+        fallback_response.iter_content.return_value = [expected]
+        fallback_response.raise_for_status.return_value = None
+
+        with patch.object(
+            server.requests,
+            "get",
+            side_effect=[server.requests.exceptions.SSLError(), fallback_response],
+        ) as get:
+            result = server.fetch_remote_image_asset(
+                "https://cdn.oreateai.com/static/result/test.jpg"
+            )
 
         self.assertEqual(result, expected)
-        fallback.assert_called_once_with("https://cdn.oreateai.com/static/result/test.jpg")
+        self.assertEqual(get.call_count, 2)
+        self.assertTrue(get.call_args_list[0].kwargs["verify"])
+        self.assertFalse(get.call_args_list[1].kwargs["verify"])
+
+    def test_clean_asset_download_does_not_disable_tls_for_unconfigured_hosts(self):
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "openai_compat": {
+                    "asset_host_allowlist": ["assets.example.test"],
+                    "asset_insecure_tls_fallback_hosts": [],
+                }
+            },
+        )
+        try:
+            with patch.object(
+                server.requests,
+                "get",
+                side_effect=server.requests.exceptions.SSLError(),
+            ) as get:
+                with self.assertRaises(server.HTTPException) as raised:
+                    server.fetch_remote_image_asset(
+                        "https://assets.example.test/static/result/test.jpg"
+                    )
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(get.call_count, 1)
 
     def test_admin_clean_asset_returns_processed_image_and_chinese_filename(self):
         task_id = self.seed_completed_image_task("https://cdn.oreateai.com/static/result/test.jpg")
@@ -1204,7 +1266,7 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertNotEqual(payload["mail"]["api_key"], "AC-secret-key")
 
     def test_accounts_response_does_not_expose_credentials_or_session_cookies(self):
-        self.seed_account()
+        account_id = self.seed_account()
         response = self.client.get("/api/accounts", headers=self.admin_headers())
 
         self.assertEqual(response.status_code, 200)
@@ -1215,6 +1277,26 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertNotIn("video_info_json", account)
         self.assertNotIn("point_balance_json", account)
         self.assertEqual(account["email"], "user@example.com")
+
+        credentials = self.client.get(
+            f"/api/accounts/{account_id}/credentials",
+            headers=self.admin_headers(),
+        )
+        self.assertEqual(credentials.status_code, 200)
+        self.assertEqual(
+            credentials.json(),
+            {
+                "id": account_id,
+                "email": "user@example.com",
+                "password": "plain-password",
+            },
+        )
+
+        missing = self.client.get(
+            "/api/accounts/999999/credentials",
+            headers=self.admin_headers(),
+        )
+        self.assertEqual(missing.status_code, 404)
 
     def test_gateway_task_detail_is_scoped_to_own_api_key(self):
         account_id = self.seed_account()
@@ -1482,6 +1564,81 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
             self.assertNotIn(secret, body_text)
         self.assertIn(server.SECRET_PLACEHOLDER, body_text)
 
+    def test_registration_job_persists_progress_and_redacts_results(self):
+        job = server.create_registration_job(2)
+        calls = {"count": 0}
+
+        def fake_register(count, progress=None):
+            calls["count"] += 1
+            email = f"user{calls['count']}@example.com"
+            if progress:
+                progress("create_mailbox", email)
+                progress("signup_attempt", email)
+            return [
+                {
+                    "ok": calls["count"] == 1,
+                    "status": "verified" if calls["count"] == 1 else "signup_failed",
+                    "account_id": calls["count"] if calls["count"] == 1 else None,
+                    "email": email,
+                    "password": "Aa1@secret123",
+                }
+            ]
+
+        with patch.object(server, "auto_register_accounts", side_effect=fake_register):
+            server.run_registration_job(job["id"])
+
+        completed = server.get_registration_job(job["id"])
+        self.assertEqual(completed["status"], "completed_with_errors")
+        self.assertEqual(completed["total"], 2)
+        self.assertEqual(completed["completed"], 2)
+        self.assertEqual(completed["succeeded"], 1)
+        self.assertEqual(completed["failed"], 1)
+        self.assertEqual(len(completed["items"]), 2)
+        self.assertNotIn("password", json.dumps(completed["items"], ensure_ascii=False))
+        self.assertEqual(completed["current_step"], "completed")
+
+    def test_registration_job_api_returns_immediately_and_exposes_progress(self):
+        with patch.object(server, "launch_registration_job") as launch:
+            created = self.client.post(
+                "/api/register/jobs",
+                headers=self.admin_headers(),
+                json={"count": 3},
+            )
+
+        self.assertEqual(created.status_code, 202)
+        job = created.json()["job"]
+        self.assertEqual(job["status"], "queued")
+        self.assertEqual(job["total"], 3)
+        launch.assert_called_once_with(job["id"])
+
+        detail = self.client.get(
+            f"/api/register/jobs/{job['id']}",
+            headers=self.admin_headers(),
+        )
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["job"]["id"], job["id"])
+
+    def test_registration_worker_marks_unexpected_failure_terminal(self):
+        job = server.create_registration_job(1)
+        with patch.object(
+            server,
+            "run_registration_job",
+            side_effect=RuntimeError("unexpected registration worker failure"),
+        ):
+            server.launch_registration_job(job["id"])
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                with server.REGISTRATION_THREADS_LOCK:
+                    running = job["id"] in server.REGISTRATION_THREADS
+                if not running:
+                    break
+                time.sleep(0.01)
+
+        failed = server.get_registration_job(job["id"])
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["current_step"], "failed")
+        self.assertIn("unexpected registration worker failure", failed["error_message"])
+
     def test_admin_html_sends_bearer_token_for_api_calls(self):
         html = server.ADMIN_HTML
         self.assertIn("localStorage", html)
@@ -1500,6 +1657,14 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertIn("cancelTask", html)
         self.assertIn("hydrateTask", html)
         self.assertIn("task-preview", html)
+        self.assertIn("API 调用文档", html)
+        self.assertIn('id="tab-docs"', html)
+        self.assertIn('id="registration-progress"', html)
+        self.assertIn("/api/register/jobs", html)
+        self.assertIn("/credentials", html)
+        self.assertIn("查看密码", html)
+        self.assertIn("复制密码", html)
+        self.assertIn("连接暂时中断，正在重试", html)
         self.assertNotIn("s-admin-pwd", html)
 
     def test_admin_html_escapes_untrusted_usage_account_and_client_values(self):

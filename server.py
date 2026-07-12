@@ -11,10 +11,9 @@ import shutil
 import tempfile
 import threading
 import time
+import warnings
 import zipfile
-from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, Request as UrlRequest, build_opener
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -32,6 +31,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic_core import PydanticCustomError
+from urllib3.exceptions import InsecureRequestWarning
 
 from banti_token_generator import generate_banti_artifacts, generate_jt_token
 from gateway.openai_compat import (
@@ -82,6 +82,8 @@ MAX_LIST_LIMIT = 200
 MAX_LIST_OFFSET = 10000
 UNSAFE_ADMIN_PASSWORDS = {"", "admin123", "CHANGE_ME", "changeme", "password"}
 MAX_CLEAN_ASSET_BYTES = 30 * 1024 * 1024
+REGISTRATION_THREADS_LOCK = threading.Lock()
+REGISTRATION_THREADS: Dict[int, threading.Thread] = {}
 
 DEFAULT_CONFIG = {
     "database": {
@@ -188,6 +190,7 @@ DEFAULT_CONFIG = {
         "image_model_aliases": {},
         "video_model_aliases": {},
         "asset_host_allowlist": ["cdn.oreateai.com"],
+        "asset_insecure_tls_fallback_hosts": ["cdn.oreateai.com"],
     },
 }
 
@@ -2425,6 +2428,29 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS registration_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status TEXT NOT NULL DEFAULT 'queued',
+            total INTEGER NOT NULL,
+            completed INTEGER NOT NULL DEFAULT 0,
+            succeeded INTEGER NOT NULL DEFAULT 0,
+            failed INTEGER NOT NULL DEFAULT 0,
+            current_index INTEGER NOT NULL DEFAULT 0,
+            current_step TEXT NOT NULL DEFAULT 'queued',
+            current_email TEXT NOT NULL DEFAULT '',
+            items_json TEXT NOT NULL DEFAULT '[]',
+            error_message TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            finished_at REAL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_registration_jobs_status ON registration_jobs(status, id)"
+    )
     add_column_if_missing(conn, "api_keys", "rate_limit_per_minute", "INTEGER")
     add_column_if_missing(conn, "api_keys", "daily_request_limit", "INTEGER")
     add_column_if_missing(conn, "api_keys", "daily_point_limit", "INTEGER")
@@ -2618,7 +2644,7 @@ class MediaTaskIn(BaseModel):
 
 
 class AutoRegisterIn(BaseModel):
-    count: int = 1
+    count: int = Field(default=1, ge=1, le=50)
 
 
 class MaintainIn(BaseModel):
@@ -3479,6 +3505,19 @@ def clean_asset_host_allowlist() -> set[str]:
     }
 
 
+def clean_asset_insecure_tls_fallback_hosts() -> set[str]:
+    configured = openai_compat_cfg().get(
+        "asset_insecure_tls_fallback_hosts",
+        ["cdn.oreateai.com"],
+    )
+    allowed = clean_asset_host_allowlist()
+    return {
+        str(host).strip().lower()
+        for host in configured
+        if str(host).strip().lower() in allowed
+    }
+
+
 def validate_clean_asset_url(asset_url: str) -> str:
     url = str(asset_url or "").strip()
     parsed = urlparse(url)
@@ -3493,65 +3532,7 @@ def validate_clean_asset_url(asset_url: str) -> str:
     return url
 
 
-class _NoAssetRedirectHandler(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def fetch_remote_image_asset_with_system_trust(asset_url: str) -> bytes:
-    """Download through urllib so Windows' system certificate store is honored."""
-    current_url = validate_clean_asset_url(asset_url)
-    opener = build_opener(_NoAssetRedirectHandler())
-    for redirect_count in range(4):
-        response = None
-        try:
-            request = UrlRequest(current_url, headers={"User-Agent": "OreateAI-Gateway/1.0"})
-            try:
-                response = opener.open(request, timeout=30)
-            except HTTPError as exc:
-                if exc.code not in {301, 302, 303, 307, 308}:
-                    raise
-                response = exc
-
-            status_code = int(getattr(response, "status", None) or response.getcode())
-            if status_code in {301, 302, 303, 307, 308}:
-                location = str(response.headers.get("location") or "").strip()
-                if not location or redirect_count == 3:
-                    raise HTTPException(502, "image asset redirect is invalid")
-                current_url = validate_clean_asset_url(urljoin(current_url, location))
-                continue
-
-            final_url = str(getattr(response, "url", None) or response.geturl() or current_url)
-            validate_clean_asset_url(final_url)
-            try:
-                declared_length = int(response.headers.get("content-length") or 0)
-            except (TypeError, ValueError):
-                declared_length = 0
-            if declared_length > MAX_CLEAN_ASSET_BYTES:
-                raise HTTPException(413, "image asset is too large")
-
-            payload = bytearray()
-            while True:
-                chunk = response.read(min(1024 * 1024, MAX_CLEAN_ASSET_BYTES + 1 - len(payload)))
-                if not chunk:
-                    break
-                payload.extend(chunk)
-                if len(payload) > MAX_CLEAN_ASSET_BYTES:
-                    raise HTTPException(413, "image asset is too large")
-            if not payload:
-                raise HTTPException(502, "image asset is empty")
-            return bytes(payload)
-        except HTTPException:
-            raise
-        except (HTTPError, URLError, OSError):
-            raise HTTPException(502, "image asset download failed")
-        finally:
-            if response is not None:
-                response.close()
-    raise HTTPException(502, "image asset download failed")
-
-
-def fetch_remote_image_asset(asset_url: str) -> bytes:
+def fetch_remote_image_asset_with_requests(asset_url: str, *, verify_tls: bool) -> bytes:
     current_url = validate_clean_asset_url(asset_url)
     response = None
     try:
@@ -3560,7 +3541,7 @@ def fetch_remote_image_asset(asset_url: str) -> bytes:
                 current_url,
                 stream=True,
                 timeout=(5, 30),
-                verify=tls_verify_enabled(),
+                verify=verify_tls,
                 allow_redirects=False,
             )
             if response.status_code not in {301, 302, 303, 307, 308}:
@@ -3594,12 +3575,35 @@ def fetch_remote_image_asset(asset_url: str) -> bytes:
     except HTTPException:
         raise
     except requests.exceptions.SSLError:
-        return fetch_remote_image_asset_with_system_trust(asset_url)
+        raise
     except requests.RequestException:
         raise HTTPException(502, "image asset download failed")
     finally:
         if response is not None:
             response.close()
+
+
+def fetch_remote_image_asset(asset_url: str) -> bytes:
+    validated_url = validate_clean_asset_url(asset_url)
+    verify_tls = tls_verify_enabled()
+    try:
+        return fetch_remote_image_asset_with_requests(
+            validated_url,
+            verify_tls=verify_tls,
+        )
+    except requests.exceptions.SSLError:
+        hostname = str(urlparse(validated_url).hostname or "").lower()
+        if not verify_tls or hostname not in clean_asset_insecure_tls_fallback_hosts():
+            raise HTTPException(502, "image asset download failed")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", InsecureRequestWarning)
+            try:
+                return fetch_remote_image_asset_with_requests(
+                    validated_url,
+                    verify_tls=False,
+                )
+            except requests.exceptions.SSLError:
+                raise HTTPException(502, "image asset download failed")
 
 
 def update_task_record(task_id: int, **fields: Any) -> None:
@@ -4752,15 +4756,24 @@ def submit_generation_for_account(
     }
 
 
-def auto_register_accounts(count: int = 1) -> List[Dict[str, Any]]:
+def auto_register_accounts(
+    count: int = 1,
+    progress: Optional[Callable[[str, str], None]] = None,
+) -> List[Dict[str, Any]]:
+    def report(step: str, email: str = "") -> None:
+        if progress is not None:
+            progress(step, email)
+
     results = []
     for _ in range(max(1, count)):
+        report("create_mailbox")
         mailbox = MAIL.create_mailbox()
         email = mailbox["address"]
         token = mailbox["token"]
         password = "Aa1@" + secrets.token_hex(6)[:8]
         trace = []
         trace.append({"step": "create_mailbox", "email": email, "domain": mailbox.get("domain"), "mailbox_id": mailbox.get("mailbox_id")})
+        report("signup_attempt", email)
         signup = CLIENT.signup_attempt(email, password)
         body = signup.get("response", {})
         status_code = signup.get("status_code")
@@ -4777,6 +4790,7 @@ def auto_register_accounts(count: int = 1) -> List[Dict[str, Any]]:
             register_status = body.get("data", {}).get("registerStatus") or body.get("registerStatus")
             ticket_id = signup["ticket"]["ticketID"]
             trace.append({"step": "signup_flags", "sendEmailCount": send_email_count, "confirmEmailStatus": confirm_status, "registerStatus": register_status, "ticketID": ticket_id})
+            report("email_verification", email)
             if register_status == 2:
                 try:
                     verification = CLIENT.check_email_verified(email, ticket_id)
@@ -4787,6 +4801,7 @@ def auto_register_accounts(count: int = 1) -> List[Dict[str, Any]]:
                         verification["confirm"] = confirm
                         trace.append({"step": "emailregisterconfirm", "response": confirm})
                         if confirm.get("status_code") == 200 and confirm.get("response", {}).get("status", {}).get("code") == 0:
+                            report("login_and_save", email)
                             session = CLIENT.login(email, password)
                             sess = CLIENT.session_from_cookie_dict(session.cookies)
                             img = CLIENT.fetch_image_models(sess)
@@ -4838,6 +4853,7 @@ def auto_register_accounts(count: int = 1) -> List[Dict[str, Any]]:
                             verification["confirm"] = confirm
                             trace.append({"step": "emailregisterconfirm", "response": confirm})
                             if confirm.get("status_code") == 200 and confirm.get("response", {}).get("status", {}).get("code") == 0:
+                                report("login_and_save", email)
                                 session = CLIENT.login(email, password)
                                 sess = CLIENT.session_from_cookie_dict(session.cookies)
                                 img = CLIENT.fetch_image_models(sess)
@@ -4872,7 +4888,188 @@ def auto_register_accounts(count: int = 1) -> List[Dict[str, Any]]:
             "trace": trace,
             "mailbox": {"address": email, "token": token},
         })
+        report("completed", email)
     return results
+
+
+def registration_job_payload(row: sqlite3.Row) -> Dict[str, Any]:
+    item = dict(row)
+    try:
+        results = json.loads(item.pop("items_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        results = []
+    item["items"] = results if isinstance(results, list) else []
+    return item
+
+
+def create_registration_job(count: int) -> Dict[str, Any]:
+    total = int(count)
+    if total < 1 or total > 50:
+        raise HTTPException(422, "registration count must be between 1 and 50")
+    now = time.time()
+    conn = db_conn()
+    cursor = conn.execute(
+        """
+        INSERT INTO registration_jobs(
+            status,total,completed,succeeded,failed,current_index,current_step,
+            current_email,items_json,error_message,created_at,updated_at
+        )
+        VALUES('queued',?,0,0,0,0,'queued','','[]','',?,?)
+        """,
+        (total, now, now),
+    )
+    job_id = int(cursor.lastrowid)
+    conn.commit()
+    row = conn.execute("SELECT * FROM registration_jobs WHERE id=?", (job_id,)).fetchone()
+    conn.close()
+    return registration_job_payload(row)
+
+
+def get_registration_job(job_id: int) -> Dict[str, Any]:
+    conn = db_conn()
+    row = conn.execute("SELECT * FROM registration_jobs WHERE id=?", (job_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "registration job not found")
+    return registration_job_payload(row)
+
+
+def update_registration_job(job_id: int, **fields: Any) -> None:
+    if not fields:
+        return
+    payload = dict(fields)
+    if "items" in payload:
+        payload["items_json"] = json.dumps(payload.pop("items"), ensure_ascii=False)
+    payload["updated_at"] = time.time()
+    assignments = ", ".join(f"{key}=?" for key in payload)
+    conn = db_conn()
+    conn.execute(
+        f"UPDATE registration_jobs SET {assignments} WHERE id=?",
+        [*payload.values(), job_id],
+    )
+    conn.commit()
+    conn.close()
+
+
+def run_registration_job(job_id: int) -> None:
+    job = get_registration_job(job_id)
+    if job["status"] not in {"queued", "running"}:
+        return
+    total = int(job["total"])
+    results = list(job.get("items") or [])
+    succeeded = int(job.get("succeeded") or 0)
+    failed = int(job.get("failed") or 0)
+    completed = int(job.get("completed") or 0)
+    update_registration_job(
+        job_id,
+        status="running",
+        current_step="starting",
+        error_message="",
+    )
+
+    for index in range(completed, total):
+        current_email = ""
+
+        def progress(step: str, email: str = "") -> None:
+            nonlocal current_email
+            if email:
+                current_email = email
+            update_registration_job(
+                job_id,
+                current_index=index + 1,
+                current_step=step,
+                current_email=current_email,
+            )
+
+        try:
+            registered = auto_register_accounts(1, progress=progress)
+            if not registered:
+                raise RuntimeError("registration returned no result")
+            result = public_registration_result(registered[0])
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "status": "registration_error",
+                "email": current_email,
+                "error": str(exc),
+            }
+        results.append(result)
+        if result.get("ok") or result.get("status") == "verified":
+            succeeded += 1
+        else:
+            failed += 1
+        completed = index + 1
+        update_registration_job(
+            job_id,
+            completed=completed,
+            succeeded=succeeded,
+            failed=failed,
+            current_index=completed,
+            current_step="completed",
+            current_email=str(result.get("email") or current_email),
+            items=results,
+        )
+
+    final_status = "completed" if failed == 0 else "completed_with_errors"
+    update_registration_job(
+        job_id,
+        status=final_status,
+        current_step="completed",
+        finished_at=time.time(),
+        items=results,
+    )
+
+
+def launch_registration_job(job_id: int) -> None:
+    with REGISTRATION_THREADS_LOCK:
+        existing = REGISTRATION_THREADS.get(job_id)
+        if existing is not None and existing.is_alive():
+            return
+
+        def runner() -> None:
+            try:
+                run_registration_job(job_id)
+            except Exception as exc:
+                update_registration_job(
+                    job_id,
+                    status="failed",
+                    current_step="failed",
+                    error_message=str(exc)[:1000],
+                    finished_at=time.time(),
+                )
+            finally:
+                with REGISTRATION_THREADS_LOCK:
+                    REGISTRATION_THREADS.pop(job_id, None)
+
+        thread = threading.Thread(
+            target=runner,
+            name=f"registration-job-{job_id}",
+            daemon=True,
+        )
+        REGISTRATION_THREADS[job_id] = thread
+        thread.start()
+
+
+def recover_interrupted_registration_jobs() -> int:
+    now = time.time()
+    conn = db_conn()
+    cursor = conn.execute(
+        """
+        UPDATE registration_jobs
+        SET status='failed',
+            current_step='interrupted',
+            error_message='服务重启，注册任务已中断，请重新提交',
+            finished_at=?,
+            updated_at=?
+        WHERE status IN ('queued','running')
+        """,
+        (now, now),
+    )
+    conn.commit()
+    count = int(cursor.rowcount or 0)
+    conn.close()
+    return count
+
 
 app = FastAPI(title="OreateAI Gateway")
 
@@ -7501,7 +7698,8 @@ def on_startup():
         init_db()
         if not CONFIG_PATH.exists():
             save_config(CFG)
-        recover_stale_running_tasks()
+        recover_stale_running_tasks(stale_after_seconds=0.0)
+        recover_interrupted_registration_jobs()
         ensure_task_worker_started()
     except BaseException:
         APP_LIFECYCLE_STARTED = False
@@ -7660,6 +7858,23 @@ def api_accounts(_=Depends(require_admin)):
     return {"items": [public_account(row) for row in list_accounts()]}
 
 
+@app.get("/api/accounts/{account_id}/credentials")
+def account_credentials(account_id: int, _=Depends(require_admin)):
+    conn = db_conn()
+    row = conn.execute(
+        "SELECT id,email,password FROM accounts WHERE id=?",
+        (account_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "account not found")
+    return {
+        "id": int(row["id"]),
+        "email": str(row["email"] or ""),
+        "password": decrypt_secret_value(row["password"]),
+    }
+
+
 @app.post("/api/accounts/{account_id}/refresh-balance")
 def refresh_account_balance(account_id: int, _=Depends(require_admin)):
     conn = db_conn()
@@ -7699,6 +7914,18 @@ def register_one(_=Depends(require_admin)):
 @app.post("/api/register/batch")
 def register_batch(body: AutoRegisterIn, _=Depends(require_admin)):
     return {"items": [public_registration_result(item) for item in auto_register_accounts(body.count)]}
+
+
+@app.post("/api/register/jobs", status_code=202)
+def create_registration_job_endpoint(body: AutoRegisterIn, _=Depends(require_admin)):
+    job = create_registration_job(body.count)
+    launch_registration_job(job["id"])
+    return {"ok": True, "job": job}
+
+
+@app.get("/api/register/jobs/{job_id}")
+def registration_job_detail(job_id: int, _=Depends(require_admin)):
+    return {"job": get_registration_job(job_id)}
 
 
 @app.post("/api/accounts/import")
@@ -7858,7 +8085,10 @@ def admin_task_clean_asset(task_id: int, asset_index: int, _=Depends(require_adm
     asset_url = validate_clean_asset_url(str(assets[asset_index] or ""))
     source = fetch_remote_image_asset(asset_url)
     try:
-        cleaned, media_type, removed = watermark_free_image_bytes(source)
+        cleaned, media_type, removed = watermark_free_image_bytes(
+            source,
+            force_bottom_strip=True,
+        )
     except WatermarkImageError as exc:
         raise HTTPException(exc.status_code, exc.message)
     extension = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}[media_type]
@@ -8047,6 +8277,25 @@ tr:hover td{background:#fafafa}
 .secret-card{background:#f5f5f7;border:1px solid #e5e5e5;border-radius:12px;padding:14px;margin-top:12px}
 .secret-card code{display:block;word-break:break-all;font-size:12px;line-height:1.6;margin-bottom:10px}
 .operations-stack{display:flex;flex-direction:column;gap:24px}
+.registration-progress{border:1px solid #e5e5e5;background:#fafafa;border-radius:12px;padding:14px;margin:0 0 16px}
+.registration-progress-head{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:13px;font-weight:600}
+.registration-track{height:8px;background:#e8e8ed;border-radius:999px;overflow:hidden;margin:10px 0}
+.registration-fill{height:100%;background:#1d1d1f;border-radius:999px;transition:width .3s}
+.registration-meta{font-size:12px;color:#6e6e73;line-height:1.7}
+.registration-results{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.password-cell{min-width:190px}
+.password-value{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;word-break:break-all}
+.password-actions{display:flex;gap:5px;margin-top:6px}
+.docs-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+.docs-card{border:1px solid #e5e5e5;border-radius:12px;padding:16px;background:#fafafa}
+.docs-card h3{font-size:14px;margin-bottom:8px}
+.docs-card p,.docs-card li{font-size:12px;color:#5f5f64;line-height:1.75}
+.docs-card ul{padding-left:18px}
+.docs-code-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:12px}
+.docs-code-head strong{font-size:12px}
+.docs-card pre{max-height:none;white-space:pre-wrap;word-break:break-word;margin-top:6px;background:#fff}
+.docs-flow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0}
+.docs-flow span{font-size:12px;background:#f0f0f0;border-radius:999px;padding:6px 10px}
 @keyframes drawerIn{from{transform:translateX(24px);opacity:.4}to{transform:translateX(0);opacity:1}}
 @media(max-width:760px){
   .container{padding:16px}
@@ -8082,6 +8331,7 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
   <a onclick="switchTab('generate')">生成</a>
   <a onclick="switchTab('tasks')">任务</a>
   <a onclick="switchTab('apikeys')">API Keys</a>
+  <a onclick="switchTab('docs')">API 文档</a>
   <a onclick="switchTab('settings')">设置</a>
   <span style="flex:1"></span>
   <span style="font-size:12px;color:#86868b" id="status-text">就绪</span>
@@ -8101,12 +8351,13 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
 <div id="tab-pool" class="section">
   <h2>📋 号池管理</h2>
   <div class="row" style="margin-bottom:16px">
-    <div class="col"><label>注册数量</label><input id="reg_count" value="1"></div>
-    <div><button class="btn-primary" onclick="registerOne()">注册 1 个</button></div>
-    <div><button class="btn-primary" onclick="registerBatch()">批量注册</button></div>
+    <div class="col"><label>注册数量</label><input id="reg_count" type="number" min="1" max="50" step="1" value="1"></div>
+    <div><button id="reg-one" class="btn-primary" onclick="registerOne()">注册 1 个</button></div>
+    <div><button id="reg-batch" class="btn-primary" onclick="registerBatch()">批量注册</button></div>
     <div><button class="btn-secondary" onclick="maintainPool()">补号</button></div>
     <div><button class="btn-secondary" onclick="toggleImport()">导入账号</button></div>
   </div>
+  <div id="registration-progress" class="registration-progress hidden"></div>
   <div id="import-area" class="hidden" style="margin-bottom:12px">
     <div class="row">
       <div class="col"><input id="imp-email" placeholder="邮箱"></div>
@@ -8118,7 +8369,7 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
   <div class="table-wrap">
     <table>
       <thead><tr>
-        <th>ID</th><th>邮箱</th><th>状态</th><th>健康</th><th>来源</th><th>OUID</th><th>余额</th><th>更新时间</th><th>创建时间</th><th>操作</th>
+        <th>ID</th><th>邮箱</th><th>密码</th><th>状态</th><th>健康</th><th>来源</th><th>OUID</th><th>余额</th><th>更新时间</th><th>创建时间</th><th>操作</th>
       </tr></thead>
       <tbody id="accounts-tbody"></tbody>
     </table>
@@ -8352,6 +8603,58 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
   </aside>
 </div>
 
+<!-- Tab: API 调用文档 -->
+<div id="tab-docs" class="section hidden">
+  <h2>📘 API 调用文档</h2>
+  <div class="endpoint-box">
+    <div class="url">服务地址：<span id="api-doc-base">当前站点</span></div>
+    <div class="desc">所有请求使用 Authorization: Bearer &lt;API Key&gt;。API Key 可在“API Keys”页面创建和复制。</div>
+  </div>
+  <div class="docs-flow">
+    <span>1. 提交生成</span><strong>→</strong><span>2. 获得 task_id</span><strong>→</strong><span>3. 轮询任务</span><strong>→</strong><span>4. 读取 assets</span>
+  </div>
+  <div class="docs-grid">
+    <div class="docs-card">
+      <h3>统一生成接口</h3>
+      <p><code>POST /v1/generate</code> 同时支持图片和视频。接口立即返回任务 ID，不需要让调用端长时间保持连接。</p>
+      <div class="docs-code-head"><strong>图片生成（curl）</strong><button class="copy-btn" onclick="copyDocCode('api-doc-image-curl')">复制</button></div>
+      <pre><code id="api-doc-image-curl"></code></pre>
+      <div class="docs-code-head"><strong>视频生成（curl）</strong><button class="copy-btn" onclick="copyDocCode('api-doc-video-curl')">复制</button></div>
+      <pre><code id="api-doc-video-curl"></code></pre>
+    </div>
+    <div class="docs-card">
+      <h3>查询任务结果</h3>
+      <p>图片通常较快，视频可能需要数分钟。请每 2～5 秒查询一次，直到状态为“已完成”“失败”“已取消”或“已过期”。</p>
+      <div class="docs-code-head"><strong>轮询任务（curl）</strong><button class="copy-btn" onclick="copyDocCode('api-doc-task-curl')">复制</button></div>
+      <pre><code id="api-doc-task-curl"></code></pre>
+      <ul>
+        <li><code>queued/running/submitted/hydrating</code>：仍在处理</li>
+        <li><code>completed</code>：从 <code>task.assets</code> 读取结果地址</li>
+        <li><code>failed/expired</code>：查看 <code>error_code</code> 与 <code>error_message</code></li>
+      </ul>
+    </div>
+    <div class="docs-card">
+      <h3>Python 完整示例</h3>
+      <p>示例包含提交、容忍视频长耗时、轮询和异常处理。</p>
+      <div class="docs-code-head"><strong>Python</strong><button class="copy-btn" onclick="copyDocCode('api-doc-python')">复制</button></div>
+      <pre><code id="api-doc-python"></code></pre>
+    </div>
+    <div class="docs-card">
+      <h3>可用接口</h3>
+      <ul>
+        <li><code>GET /v1/models</code>：模型列表</li>
+        <li><code>GET /v1/capabilities</code>：模型、比例、分辨率、时长与场景能力</li>
+        <li><code>POST /v1/images/generations</code>：OpenAI 风格图片接口</li>
+        <li><code>POST /v1/videos</code>：视频接口</li>
+        <li><code>POST /v1/uploads</code>：上传参考图片或视频</li>
+        <li><code>POST /v1/tasks/{task_id}/retry</code>：重试失败任务</li>
+        <li><code>POST /v1/tasks/{task_id}/cancel</code>：取消任务</li>
+      </ul>
+      <p style="margin-top:10px">返回 401 表示 Key 无效；403 表示 Key 权限不足；429 表示额度或频率受限；5xx 表示服务或上游暂时不可用。</p>
+    </div>
+  </div>
+</div>
+
 <!-- Tab: 设置 -->
 <div id="tab-settings" class="section hidden">
   <h2>⚙️ 系统设置</h2>
@@ -8513,7 +8816,7 @@ async function restoreBackup(){
   showLogin('恢复完成，请重新登录');
 }
 function switchTab(name) {
-  document.querySelectorAll('#tab-pool,#tab-generate,#tab-tasks,#tab-apikeys,#tab-settings').forEach(el => {
+  document.querySelectorAll('#tab-pool,#tab-generate,#tab-tasks,#tab-apikeys,#tab-docs,#tab-settings').forEach(el => {
     el.classList.toggle('hidden', el.id !== 'tab-'+name);
   });
 }
@@ -8539,8 +8842,74 @@ async function init() {
   document.getElementById('gw-url').textContent = location.origin + '/v1/generate';
   document.getElementById('gw-example').textContent =
     `curl -H "Authorization: Bearer <key>" -H "Content-Type: application/json" -d '{"kind":"image","prompt":"hello"}' ${location.origin}/v1/generate`;
+  populateApiDocs();
 }
 function copyExample() { copyText(document.getElementById('gw-example').textContent); }
+function copyDocCode(id) { copyText(document.getElementById(id)?.textContent || ''); }
+function populateApiDocs(){
+  const origin=location.origin;
+  const base=document.getElementById('api-doc-base');
+  if(base) base.textContent=origin;
+  const imageCurl=`curl -X POST "${origin}/v1/generate" \\
+  -H "Authorization: Bearer <API_KEY>" \\
+  -H "Content-Type: application/json" \\
+  -d '{"kind":"image","prompt":"一只在窗边晒太阳的橘猫","model_name":"Google Nano Banana 2","ratio":"1:1","resolution":"1K"}'`;
+  const videoCurl=`curl -X POST "${origin}/v1/generate" \\
+  -H "Authorization: Bearer <API_KEY>" \\
+  -H "Content-Type: application/json" \\
+  -d '{"kind":"video","prompt":"猫狗在雨夜霓虹街头追逐","model_name":"Seedance 2.0 Mini","ratio":"16:9","resolution":"720","duration":5,"scene_id":"text_or_image"}'`;
+  const taskCurl=`curl "${origin}/v1/tasks/<TASK_ID>" \\
+  -H "Authorization: Bearer <API_KEY>"`;
+  const python=`import time
+import requests
+
+BASE_URL = "${origin}"
+API_KEY = "<API_KEY>"
+headers = {"Authorization": f"Bearer {API_KEY}"}
+
+response = requests.post(
+    f"{BASE_URL}/v1/generate",
+    headers=headers,
+    json={
+        "kind": "video",
+        "prompt": "猫狗在雨夜霓虹街头追逐",
+        "ratio": "16:9",
+        "resolution": "720",
+        "duration": 5,
+        "scene_id": "text_or_image",
+    },
+    timeout=30,
+)
+response.raise_for_status()
+task_id = response.json()["task_id"]
+
+deadline = time.time() + 15 * 60
+while time.time() < deadline:
+    result = requests.get(
+        f"{BASE_URL}/v1/tasks/{task_id}",
+        headers=headers,
+        timeout=30,
+    )
+    result.raise_for_status()
+    task = result.json()["task"]
+    if task["status"] == "completed":
+        print(task["assets"])
+        break
+    if task["status"] in {"failed", "cancelled", "expired"}:
+        raise RuntimeError(task.get("error_message") or task["status"])
+    time.sleep(3)
+else:
+    print("任务仍在处理中，请稍后继续查询", task_id)`;
+  [
+    ['api-doc-image-curl',imageCurl],
+    ['api-doc-video-curl',videoCurl],
+    ['api-doc-task-curl',taskCurl],
+    ['api-doc-python',python],
+  ].forEach(([id,value]) => {
+    const element=document.getElementById(id);
+    if(element) element.textContent=value;
+  });
+}
 
 // === Accounts ===
 function createListPageState(limit=50){
@@ -8582,6 +8951,7 @@ function listPageSummary(page){
 }
 let state = {
   accounts:[],tasks:[],apikeys:[],clients:[],usage:[],uploads:[],costReport:[],auditLogs:[],
+  accountCredentials:{},revealedAccountPasswords:{},registrationJob:null,
   settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}},
   lists:{
     tasks:createListPageState(50),
@@ -8607,10 +8977,15 @@ function formatApiError(payload, fallback='request failed'){
 async function api(m,u,b){
   const o={method:m,headers:authHeaders()};
   if(b) o.body=JSON.stringify(b);
-  const r = await fetch(BASE+u,o);
+  let r;
+  try{
+    r=await fetch(BASE+u,o);
+  }catch(_error){
+    throw new Error('网络连接失败');
+  }
   const data = await r.json().catch(()=>({}));
-  if (r.status === 401) throw new Error(formatApiError(data, 'unauthorized'));
-  if (!r.ok) throw new Error(formatApiError(data, 'request failed'));
+  if (r.status === 401) throw new Error(formatApiError(data, '登录已失效'));
+  if (!r.ok) throw new Error(formatApiError(data, '请求失败'));
   return data;
 }
 function listFiltersFromInputs(fields){
@@ -8885,9 +9260,16 @@ function renderAccounts(){
     const restPoint = a.rest_point ?? '-';
     const balanceUpdatedAt = a.balance_updated_at ? new Date((a.balance_updated_at||0)*1000).toLocaleString() : '-';
     const healthMeta = `${adminLabel('riskStatus',a.risk_status||'clean')}${a.cooling ? ` · 剩余 ${a.cooldown_remaining_seconds || 0} 秒` : ''}`;
+    const credential=state.accountCredentials[a.id];
+    const passwordVisible=Boolean(state.revealedAccountPasswords[a.id]);
+    const passwordText=!a.has_password?'未保存':passwordVisible?(credential?.password||'读取中…'):'••••••••';
     return `<tr>
       <td>${a.id}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(em)}<button class="copy-btn" data-copy-value="${escapeHtml(em)}" onclick="copyText(this.dataset.copyValue)">📋</button></td>
+      <td class="password-cell">
+        <div class="password-value">${escapeHtml(passwordText)}</div>
+        ${a.has_password?`<div class="password-actions"><button class="copy-btn" onclick="toggleAccountPassword(${a.id})">${passwordVisible?'隐藏密码':'查看密码'}</button><button class="copy-btn" onclick="copyAccountPassword(${a.id})">复制密码</button></div>`:''}
+      </td>
       <td><span class="tag ${sc}">${escapeHtml(adminLabel('accountStatus',a.status))}</span></td>
       <td><span class="tag ${hc}">${escapeHtml(adminLabel('healthStatus',a.health_status))}</span><div style="font-size:11px;color:#86868b">${escapeHtml(healthMeta)}</div></td>
       <td>${escapeHtml(adminLabel('source',a.source))}</td>
@@ -8900,8 +9282,133 @@ function renderAccounts(){
   }).join('');
   document.getElementById('pool-count').textContent = state.accounts.filter(a=>a.status==='verified').length;
 }
-async function registerOne(){document.getElementById('status-text').textContent='注册中...';const r=await api('POST','/api/register/one');await loadAccounts();document.getElementById('status-text').textContent='完成';alert(JSON.stringify(r));}
-async function registerBatch(){document.getElementById('status-text').textContent='批量注册中...';const n=Number(document.getElementById('reg_count').value||1);const r=await api('POST','/api/register/batch',{count:n});await loadAccounts();document.getElementById('status-text').textContent='完成';const ok=(r.items||[]).filter(i=>i.status==='verified').length;alert(`成功: ${ok}/${n}`);}
+async function loadAccountCredentials(accountId){
+  if(state.accountCredentials[accountId]) return state.accountCredentials[accountId];
+  const credentials=await api('GET',`/api/accounts/${accountId}/credentials`);
+  state.accountCredentials[accountId]=credentials;
+  return credentials;
+}
+async function toggleAccountPassword(accountId){
+  try{
+    if(!state.accountCredentials[accountId]) await loadAccountCredentials(accountId);
+    state.revealedAccountPasswords[accountId]=!state.revealedAccountPasswords[accountId];
+    renderAccounts();
+  }catch(error){
+    alert(`读取密码失败：${error?.message || String(error)}`);
+  }
+}
+async function copyAccountPassword(accountId){
+  try{
+    const credentials=await loadAccountCredentials(accountId);
+    await copyText(credentials.password || '');
+  }catch(error){
+    alert(`复制密码失败：${error?.message || String(error)}`);
+  }
+}
+function registrationStepLabel(step){
+  return ({
+    queued:'等待开始',
+    starting:'正在启动',
+    create_mailbox:'正在创建邮箱',
+    signup_attempt:'正在提交注册',
+    email_verification:'正在等待邮箱验证',
+    login_and_save:'正在登录并保存账号',
+    completed:'当前账号处理完成',
+    interrupted:'任务已中断',
+  })[String(step||'').toLowerCase()] || String(step||'处理中');
+}
+function registrationStatusLabel(status){
+  return ({
+    queued:'等待中',
+    running:'注册中',
+    completed:'已完成',
+    completed_with_errors:'部分成功',
+    failed:'失败',
+  })[String(status||'').toLowerCase()] || String(status||'');
+}
+function renderRegistrationProgress(job,connectionMessage=''){
+  const panel=document.getElementById('registration-progress');
+  if(!panel || !job) return;
+  const total=Math.max(1,Number(job.total)||1);
+  const completed=Math.max(0,Number(job.completed)||0);
+  const percent=Math.min(100,Math.round(completed/total*100));
+  const items=Array.isArray(job.items)?job.items:[];
+  const itemTags=items.map(item=>{
+    const ok=item?.ok || item?.status==='verified';
+    return `<span class="tag ${ok?'tag-green':'tag-red'}">${escapeHtml(item?.email||`第 ${items.indexOf(item)+1} 个`)} · ${ok?'成功':'失败'}</span>`;
+  }).join('');
+  panel.classList.remove('hidden');
+  panel.innerHTML=`
+    <div class="registration-progress-head">
+      <span>注册任务 #${escapeHtml(job.id||'-')} · ${escapeHtml(registrationStatusLabel(job.status))}</span>
+      <span>${completed} / ${total}</span>
+    </div>
+    <div class="registration-track"><div class="registration-fill" style="width:${percent}%"></div></div>
+    <div class="registration-meta">
+      当前步骤：${escapeHtml(registrationStepLabel(job.current_step))}
+      ${job.current_email?` · 当前邮箱：${escapeHtml(job.current_email)}`:''}
+      <br>成功 ${Number(job.succeeded)||0} 个 · 失败 ${Number(job.failed)||0} 个
+      ${connectionMessage?`<br>${escapeHtml(connectionMessage)}`:''}
+      ${job.error_message?`<br><span style="color:#c62828">${escapeHtml(job.error_message)}</span>`:''}
+    </div>
+    ${itemTags?`<div class="registration-results">${itemTags}</div>`:''}`;
+}
+function setRegistrationButtonsDisabled(disabled){
+  ['reg-one','reg-batch'].forEach(id=>{
+    const button=document.getElementById(id);
+    if(button) button.disabled=disabled;
+  });
+}
+async function pollRegistrationJob(jobId){
+  const terminal=new Set(['completed','completed_with_errors','failed']);
+  while(true){
+    await new Promise(resolve=>setTimeout(resolve,1000));
+    let response;
+    try{
+      response=await api('GET',`/api/register/jobs/${jobId}`);
+    }catch(error){
+      renderRegistrationProgress(state.registrationJob,'连接暂时中断，正在重试注册进度…');
+      continue;
+    }
+    const job=response.job;
+    state.registrationJob=job;
+    renderRegistrationProgress(job);
+    if(terminal.has(String(job.status||'').toLowerCase())){
+      setRegistrationButtonsDisabled(false);
+      await loadAccounts();
+      document.getElementById('status-text').textContent=`注册完成 — 成功 ${job.succeeded||0}，失败 ${job.failed||0}`;
+      alert(job.failed?`注册完成：成功 ${job.succeeded||0} 个，失败 ${job.failed||0} 个`:`注册成功：${job.succeeded||0} 个账号`);
+      return job;
+    }
+  }
+}
+async function startRegistration(count){
+  if(state.registrationJob && ['queued','running'].includes(String(state.registrationJob.status||'').toLowerCase())){
+    alert('已有注册任务正在执行');
+    return null;
+  }
+  const total=Number(count);
+  if(!Number.isSafeInteger(total) || total<1 || total>50){
+    alert('注册数量必须是 1～50 的整数');
+    return null;
+  }
+  setRegistrationButtonsDisabled(true);
+  document.getElementById('status-text').textContent='正在创建注册任务…';
+  try{
+    const response=await api('POST','/api/register/jobs',{count:total});
+    state.registrationJob=response.job;
+    renderRegistrationProgress(response.job);
+    document.getElementById('status-text').textContent='账号注册中…';
+    return await pollRegistrationJob(response.job.id);
+  }catch(error){
+    setRegistrationButtonsDisabled(false);
+    document.getElementById('status-text').textContent='注册任务创建失败';
+    alert(`注册失败：${error?.message || String(error)}`);
+    return null;
+  }
+}
+async function registerOne(){return startRegistration(1);}
+async function registerBatch(){return startRegistration(Number(document.getElementById('reg_count').value||1));}
 async function maintainPool(){const r=await api('POST','/api/pool/maintain',{force_register:true,max_register:Number(document.getElementById('reg_count').value||1)});await loadAccounts();alert(JSON.stringify(r.created));}
 function toggleImport(){document.getElementById('import-area').classList.toggle('hidden');}
 async function doImport(){const r=await api('POST','/api/accounts/import',{email:document.getElementById('imp-email').value,password:document.getElementById('imp-pwd').value});await loadAccounts();alert(r.ok?'✅ 导入成功':'❌ 失败');}
@@ -9017,8 +9524,9 @@ function renderGenerateResult(task,message=''){
     </div>`;
   void loadCleanTaskImages(panel);
 }
-async function waitForGeneratedTask(taskId,{initialTask=null,timeoutMs=120000,pollIntervalMs=1000}={}){
+async function waitForGeneratedTask(taskId,{initialTask=null,timeoutMs=120000,pollIntervalMs=1000,maxNetworkFailures=8}={}){
   let task=initialTask;
+  let networkFailures=0;
   const deadline=Date.now()+Math.max(0,timeoutMs);
   while(true){
     if(task){
@@ -9027,8 +9535,16 @@ async function waitForGeneratedTask(taskId,{initialTask=null,timeoutMs=120000,po
     }
     if(Date.now()>=deadline) return task;
     await new Promise(resolve=>setTimeout(resolve,pollIntervalMs));
-    const response=await api('GET',`/api/tasks/${taskId}`);
-    task=response.task;
+    try{
+      const response=await api('GET',`/api/tasks/${taskId}`);
+      task=response.task;
+      networkFailures=0;
+    }catch(error){
+      networkFailures+=1;
+      const retryMessage=`连接暂时中断，正在重试（${networkFailures}/${maxNetworkFailures}）…`;
+      renderGenerateResult(task,retryMessage);
+      if(networkFailures>=maxNetworkFailures) return task;
+    }
   }
 }
 async function gatewayGenerate(){
@@ -9062,7 +9578,12 @@ async function gatewayGenerate(){
       payload,
       assets:[],
     };
-    const task=await waitForGeneratedTask(r.task_id,{initialTask});
+    const isVideo=payload.kind==='video';
+    const task=await waitForGeneratedTask(r.task_id,{
+      initialTask,
+      timeoutMs:isVideo?15*60*1000:3*60*1000,
+      pollIntervalMs:isVideo?2000:1000,
+    });
     if(task){
       const terminal=GENERATION_TERMINAL_STATUSES.has(String(task.status || '').toLowerCase());
       if(!terminal) renderGenerateResult(task,'任务仍在处理中，可前往“任务”页继续查看。');
@@ -9070,7 +9591,7 @@ async function gatewayGenerate(){
     await loadTasks();
     return task;
   }catch(error){
-    renderGenerateResult(null,`生成失败：${error?.message || String(error)}`);
+    renderGenerateResult(null,`提交生成失败：${error?.message || String(error)}`);
     return null;
   }finally{
     submitButton.disabled=false;
