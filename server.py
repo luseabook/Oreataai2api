@@ -3878,7 +3878,7 @@ def cancel_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "t
     try:
         conn.execute("BEGIN IMMEDIATE")
         current = conn.execute(
-            "SELECT status,api_key_id,attempt_count FROM tasks WHERE id=?",
+            "SELECT status,api_key_id FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
         if not current:
@@ -3889,7 +3889,6 @@ def cancel_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "t
             SELECT id,attempt_no
             FROM task_attempts
             WHERE id=? AND task_id=? AND status='running'
-              AND attempt_no=?
               AND id=(
                   SELECT id FROM task_attempts
                   WHERE task_id=?
@@ -3897,7 +3896,7 @@ def cancel_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "t
                   LIMIT 1
               )
             """,
-            (attempt_id, task_id, current["attempt_count"], task_id),
+            (attempt_id, task_id, task_id),
         ).fetchone()
         if not current_attempt:
             conn.rollback()
@@ -3910,7 +3909,7 @@ def cancel_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "t
                 SET status='cancelled', error_code='TASK_CANCELLED', error_message=?,
                     cancel_requested_at=COALESCE(cancel_requested_at, ?),
                     finished_at=?, next_attempt_at=NULL, updated_at=?
-                WHERE id=? AND status=? AND attempt_count=?
+                WHERE id=? AND status=?
                 """,
                 (
                     message,
@@ -3919,7 +3918,6 @@ def cancel_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "t
                     now,
                     task_id,
                     expected_status,
-                    current_attempt["attempt_no"],
                 ),
             )
             if result.rowcount != 1:
@@ -7090,7 +7088,7 @@ def cancel_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[s
     try:
         conn.execute("BEGIN IMMEDIATE")
         current = conn.execute(
-            "SELECT status,api_key_id,attempt_count FROM tasks WHERE id=?",
+            "SELECT status,api_key_id FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
         if not current:
@@ -7124,15 +7122,11 @@ def cancel_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[s
             """
             SELECT id,attempt_no
             FROM task_attempts
-            WHERE task_id=? AND status='running' AND attempt_no=?
-              AND id=(
-                  SELECT id FROM task_attempts
-                  WHERE task_id=?
-                  ORDER BY attempt_no DESC,id DESC
-                  LIMIT 1
-              )
+            WHERE task_id=? AND status='running'
+            ORDER BY attempt_no DESC,id DESC
+            LIMIT 1
             """,
-            (task_id, current["attempt_count"], task_id),
+            (task_id,),
         ).fetchone()
         result = conn.execute(
             f"""

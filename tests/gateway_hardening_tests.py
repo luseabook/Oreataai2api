@@ -347,6 +347,47 @@ class GatewayHardeningTests(unittest.TestCase):
         )
         return task_id
 
+    def seed_running_task_after_claim_create_gap(self, api_key):
+        self.seed_account_with_capabilities()
+        api_key_id = self.seed_api_key(api_key)
+        created = self.client.post(
+            "/v1/generate",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=self.valid_image_request(),
+        )
+        self.assertEqual(created.status_code, 202)
+        task_id = created.json()["task_id"]
+
+        abandoned_claim = server.claim_next_task()
+        self.assertEqual(abandoned_claim["id"], task_id)
+        server.update_task_record(task_id, updated_at=900.0)
+        self.assertEqual(
+            server.recover_stale_running_tasks(now=1000.0, stale_after_seconds=60.0),
+            1,
+        )
+        retried = self.client.post(
+            f"/v1/tasks/{task_id}/retry",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        self.assertEqual(retried.status_code, 200)
+
+        current_task = server.claim_next_task()
+        self.assertEqual(current_task["id"], task_id)
+        attempt_id = server.create_task_attempt(current_task, "generation")
+        conn = server.db_conn()
+        task_attempt_count = conn.execute(
+            "SELECT attempt_count FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()["attempt_count"]
+        attempt_no = conn.execute(
+            "SELECT attempt_no FROM task_attempts WHERE id=?",
+            (attempt_id,),
+        ).fetchone()["attempt_no"]
+        conn.close()
+        self.assertEqual(task_attempt_count, 2)
+        self.assertEqual(attempt_no, 1)
+        return api_key_id, task_id, current_task, attempt_id
+
     def test_v1_errors_use_stable_envelope(self):
         response = self.client.get("/v1/capabilities")
 
@@ -1277,6 +1318,40 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(after_attempt_b, before_attempt_b)
         self.assertEqual(after_usage, before_usage)
 
+    def test_worker_cancel_handles_claim_create_gap_attempt_number_mismatch(self):
+        api_key_id, task_id, task, attempt_id = self.seed_running_task_after_claim_create_gap(
+            "worker-cancel-gap-key"
+        )
+
+        server.cancel_task_attempt(task, attempt_id, "worker cancelled after claim gap")
+
+        conn = server.db_conn()
+        task_row = conn.execute(
+            "SELECT status,error_code FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        attempt_row = conn.execute(
+            "SELECT status,error_code FROM task_attempts WHERE id=?",
+            (attempt_id,),
+        ).fetchone()
+        usage_row = conn.execute(
+            """
+            SELECT status,error_code,status_code
+            FROM usage_log
+            WHERE task_id=? AND api_key_id=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (task_id, api_key_id),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(task_row["status"], "cancelled")
+        self.assertEqual(task_row["error_code"], "TASK_CANCELLED")
+        self.assertEqual(attempt_row["status"], "cancelled")
+        self.assertEqual(attempt_row["error_code"], "TASK_CANCELLED")
+        self.assertEqual(usage_row["status"], "cancelled")
+        self.assertEqual(usage_row["error_code"], "TASK_CANCELLED")
+        self.assertEqual(usage_row["status_code"], 499)
+
     def test_late_finalize_preserves_attempt_expired_by_worker_recovery(self):
         task_id = self.seed_task(status="running", kind="image", started_at=800.0)
         task = dict(server.fetch_task_row(task_id))
@@ -1378,6 +1453,49 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(attempt_row["error_code"], "TASK_CANCELLED")
         self.assertEqual(json.loads(attempt_row["assets_json"]), [])
         self.assertIsNotNone(attempt_row["finished_at"])
+        self.assertEqual(usage_row["status"], "cancelled")
+        self.assertEqual(usage_row["error_code"], "TASK_CANCELLED")
+        self.assertEqual(usage_row["status_code"], 499)
+
+    def test_api_cancel_finishes_latest_running_attempt_after_claim_create_gap(self):
+        api_key_id, task_id, _task, attempt_id = self.seed_running_task_after_claim_create_gap(
+            "api-cancel-gap-key"
+        )
+
+        cancelled = self.client.post(
+            f"/v1/tasks/{task_id}/cancel",
+            headers={"Authorization": "Bearer api-cancel-gap-key"},
+        )
+
+        self.assertEqual(cancelled.status_code, 200)
+        conn = server.db_conn()
+        task_row = conn.execute(
+            "SELECT status,error_code FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        attempt_row = conn.execute(
+            "SELECT status,error_code FROM task_attempts WHERE id=?",
+            (attempt_id,),
+        ).fetchone()
+        running_attempts = conn.execute(
+            "SELECT COUNT(*) FROM task_attempts WHERE task_id=? AND status='running'",
+            (task_id,),
+        ).fetchone()[0]
+        usage_row = conn.execute(
+            """
+            SELECT status,error_code,status_code
+            FROM usage_log
+            WHERE task_id=? AND api_key_id=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (task_id, api_key_id),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(task_row["status"], "cancelled")
+        self.assertEqual(task_row["error_code"], "TASK_CANCELLED")
+        self.assertEqual(attempt_row["status"], "cancelled")
+        self.assertEqual(attempt_row["error_code"], "TASK_CANCELLED")
+        self.assertEqual(running_attempts, 0)
         self.assertEqual(usage_row["status"], "cancelled")
         self.assertEqual(usage_row["error_code"], "TASK_CANCELLED")
         self.assertEqual(usage_row["status_code"], 499)
