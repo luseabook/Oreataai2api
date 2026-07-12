@@ -8178,15 +8178,23 @@ function optionalNonNegativeIntegerValue(rawValue,label='限额'){
   if(!Number.isSafeInteger(value)) throw new Error(`${label}超出安全整数范围`);
   return value;
 }
+function apiKeyLimitInputValue(rawValue){
+  try{
+    const value=optionalNonNegativeIntegerValue(rawValue);
+    return value===null ? '' : String(value);
+  }catch(_error){
+    return '';
+  }
+}
 function apiKeyStatusTagClass(status){
   return ({enabled:'tag-green',disabled:'tag-gray',expired:'tag-red',deleted:'tag-gray'})[status] || 'tag-gray';
 }
 function renderApiKeys(){
   document.getElementById('apikeys-tbody').innerHTML = state.apikeys.map(k => {
-    const kp=k.key_preview||'';
-    const keyStatus=String(k.status??'disabled').toLowerCase();
+    const kp=escapeHtml(k.key_preview||'');
+    const keyStatus=String(k.status ?? (k.enabled ? 'enabled':'disabled')).toLowerCase();
     const statusClass=apiKeyStatusTagClass(keyStatus);
-    return `<tr><td>${k.id}</td><td style="font-family:monospace;font-size:11px">${kp}</td><td>${escapeHtml(k.name||'-')}</td><td>${escapeHtml(k.client_name||'-')}</td><td><span class="tag ${statusClass}">${escapeHtml(keyStatus)}</span></td><td><input id="ak-rate-${k.id}" data-field="rate_limit_per_minute" type="number" min="0" step="1" value="${k.rate_limit_per_minute??''}" style="width:84px"></td><td><input id="ak-req-${k.id}" data-field="daily_request_limit" type="number" min="0" step="1" value="${k.daily_request_limit??''}" style="width:84px"></td><td><input id="ak-point-${k.id}" data-field="daily_point_limit" type="number" min="0" step="1" value="${k.daily_point_limit??''}" style="width:84px"></td><td><input id="ak-kinds-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_kinds))}" style="width:120px"></td><td><input id="ak-models-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_models))}" style="width:160px"></td><td><input id="ak-scenes-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_scenes))}" style="width:130px"></td><td><input id="ak-resolutions-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_resolutions))}" style="width:110px"></td><td><input id="ak-durations-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_durations))}" style="width:90px"></td><td><input id="ak-uploads-${k.id}" type="checkbox" ${k.allow_uploads!==false ? 'checked' : ''}></td><td><input id="ak-experimental-${k.id}" type="checkbox" ${k.allow_experimental ? 'checked' : ''}></td><td style="font-size:11px">${new Date((k.created_at||0)*1000).toLocaleString()}</td><td style="font-size:11px">${k.last_used_at?new Date(k.last_used_at*1000).toLocaleString():'-'}</td><td><button class="btn-sm btn-secondary" onclick="updateApiKeyPolicy(${k.id})">保存</button> <button class="btn-sm btn-danger" onclick="deleteKey(${k.id})">删除</button></td></tr>`;
+    return `<tr><td>${k.id}</td><td style="font-family:monospace;font-size:11px">${kp}</td><td>${escapeHtml(k.name||'-')}</td><td>${escapeHtml(k.client_name||'-')}</td><td><span class="tag ${statusClass}">${escapeHtml(keyStatus)}</span></td><td><input id="ak-rate-${k.id}" data-field="rate_limit_per_minute" type="number" min="0" step="1" value="${apiKeyLimitInputValue(k.rate_limit_per_minute)}" style="width:84px"></td><td><input id="ak-req-${k.id}" data-field="daily_request_limit" type="number" min="0" step="1" value="${apiKeyLimitInputValue(k.daily_request_limit)}" style="width:84px"></td><td><input id="ak-point-${k.id}" data-field="daily_point_limit" type="number" min="0" step="1" value="${apiKeyLimitInputValue(k.daily_point_limit)}" style="width:84px"></td><td><input id="ak-kinds-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_kinds))}" style="width:120px"></td><td><input id="ak-models-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_models))}" style="width:160px"></td><td><input id="ak-scenes-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_scenes))}" style="width:130px"></td><td><input id="ak-resolutions-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_resolutions))}" style="width:110px"></td><td><input id="ak-durations-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_durations))}" style="width:90px"></td><td><input id="ak-uploads-${k.id}" type="checkbox" ${k.allow_uploads!==false ? 'checked' : ''}></td><td><input id="ak-experimental-${k.id}" type="checkbox" ${k.allow_experimental ? 'checked' : ''}></td><td style="font-size:11px">${new Date((k.created_at||0)*1000).toLocaleString()}</td><td style="font-size:11px">${k.last_used_at?new Date(k.last_used_at*1000).toLocaleString():'-'}</td><td><button class="btn-sm btn-secondary" onclick="updateApiKeyPolicy(${k.id})">保存</button> <button class="btn-sm btn-danger" onclick="deleteKey(${k.id})">删除</button></td></tr>`;
   }).join('');
 }
 function renderClients(){

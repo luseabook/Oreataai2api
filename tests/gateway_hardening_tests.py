@@ -3168,16 +3168,20 @@ class GatewayHardeningTests(unittest.TestCase):
     def test_admin_html_preserves_api_key_limit_semantics(self):
         html = server.ADMIN_HTML
         self.assertIn("function optionalNonNegativeIntegerValue", html)
-        self.assertIn("k.rate_limit_per_minute??''", html)
-        self.assertIn("k.daily_request_limit??''", html)
-        self.assertIn("k.daily_point_limit??''", html)
+        self.assertIn("String(rawValue ?? '')", html)
         self.assertNotIn("k.rate_limit_per_minute||''", html)
         self.assertIn("rate_limit_per_minute:optionalNonNegativeIntegerValue(", html)
         self.assertIn("daily_request_limit:optionalNonNegativeIntegerValue(", html)
         self.assertIn("daily_point_limit:optionalNonNegativeIntegerValue(", html)
+        self.assertIn("function apiKeyLimitInputValue", html)
+        self.assertIn('value="${apiKeyLimitInputValue(k.rate_limit_per_minute)}"', html)
+        self.assertIn('value="${apiKeyLimitInputValue(k.daily_request_limit)}"', html)
+        self.assertIn('value="${apiKeyLimitInputValue(k.daily_point_limit)}"', html)
         self.assertIn("k.status", html)
+        self.assertIn("k.status ?? (k.enabled ? 'enabled':'disabled')", html)
         self.assertIn("apiKeyStatusTagClass", html)
         self.assertIn("escapeHtml(keyStatus)", html)
+        self.assertIn("escapeHtml(k.key_preview||'')", html)
         self.assertIn("留空=继承，0=不限", html)
 
         node = shutil.which("node")
@@ -3198,10 +3202,15 @@ class GatewayHardeningTests(unittest.TestCase):
             self.fail(f"{marker} function was not complete")
 
         helper_source = extract_function("function optionalNonNegativeIntegerValue(")
+        input_value_source = extract_function("function apiKeyLimitInputValue(")
         status_source = extract_function("function apiKeyStatusTagClass(")
+        escape_source = extract_function("function escapeHtml(")
+        scope_source = extract_function("function scopeCsv(")
+        render_source = extract_function("function renderApiKeys(")
         update_source = extract_function("async function updateApiKeyPolicy(")
         node_program = f"""
 {helper_source}
+{input_value_source}
 {status_source}
 const validCases = [
   ['', null],
@@ -3242,6 +3251,37 @@ for (const [status, expectedClass] of Object.entries({{
     throw new Error(`${{status}}: expected ${{expectedClass}}, got ${{actualClass}}`);
   }}
 }}
+{escape_source}
+{scope_source}
+const tbody = {{innerHTML: ''}};
+const state = {{apikeys: [
+  {{
+    id: 1,
+    key_preview: '"><img src=x onerror=alert(1)>',
+    name: 'malicious',
+    client_name: 'client',
+    status: 'evil" onclick="alert(1)',
+    rate_limit_per_minute: '" onfocus="alert(1)',
+    daily_request_limit: 0,
+    daily_point_limit: 17,
+  }},
+  {{id: 2, enabled: true, key_preview: 'enabled-key'}},
+  {{id: 3, enabled: false, key_preview: 'disabled-key'}},
+]}};
+const renderDocument = {{getElementById: id => {{
+  if (id !== 'apikeys-tbody') throw new Error(`unexpected render element ${{id}}`);
+  return tbody;
+}}}};
+{render_source.replace("document.getElementById", "renderDocument.getElementById")}
+renderApiKeys();
+if (tbody.innerHTML.includes('onfocus=')) throw new Error('malicious limit escaped the value attribute');
+if (tbody.innerHTML.includes('<img')) throw new Error('key preview was not escaped');
+if (!tbody.innerHTML.includes('&lt;img src=x onerror=alert(1)&gt;')) throw new Error('escaped key preview missing');
+if (tbody.innerHTML.includes('class="tag evil')) throw new Error('untrusted status entered the class attribute');
+if (tbody.innerHTML.includes('evil" onclick=')) throw new Error('status text was not escaped');
+if (!tbody.innerHTML.includes('evil&quot; onclick=&quot;alert(1)')) throw new Error('escaped status text missing');
+if (!tbody.innerHTML.includes('class="tag tag-green">enabled</span>')) throw new Error('enabled fallback missing');
+if (!tbody.innerHTML.includes('class="tag tag-gray">disabled</span>')) throw new Error('disabled fallback missing');
 const fields = {{
   'ak-rate-9': {{value: ''}},
   'ak-req-9': {{value: '0'}},
