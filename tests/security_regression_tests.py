@@ -1737,6 +1737,11 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         with (
             patch.object(server.CLIENT, "session_from_account", return_value=object()),
             patch.object(server.CLIENT, "fetch_account_point_detail", return_value={"restPoint": 100}),
+            patch.object(
+                server,
+                "probe_account_generation_health",
+                return_value={"ok": True, "asset_count": 1},
+            ),
             patch.object(server, "auto_register_accounts", side_effect=fake_register),
         ):
             server.run_pool_maintenance_job(job["id"])
@@ -1798,6 +1803,54 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         row = conn.execute("SELECT id,status,last_error FROM accounts WHERE id=?", (account_id,)).fetchone()
         conn.close()
         self.assertEqual(row["id"], account_id)
+        self.assertEqual(row["status"], "disabled")
+        self.assertIn("212361", row["last_error"])
+
+    def test_pool_maintenance_isolates_generation_risk_when_balance_check_succeeds(self):
+        account_id = self.seed_account()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET model_info_json=?, rest_point=? WHERE id=?",
+            (json.dumps(self.sample_image_info()), 100, account_id),
+        )
+        conn.commit()
+        conn.close()
+        job = server.create_pool_maintenance_job(
+            clean_risk=True,
+            supplement=False,
+            target_healthy=1,
+            max_register=0,
+        )
+
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(
+                server.CLIENT,
+                "fetch_account_point_detail",
+                return_value={"restPoint": 100},
+            ),
+            patch.object(
+                server,
+                "submit_generation_for_account",
+                side_effect=server.UpstreamGenerationError(
+                    {"code": "212361", "message": "spam user"}
+                ),
+            ) as submit_probe,
+        ):
+            server.run_pool_maintenance_job(job["id"])
+
+        completed = server.get_pool_maintenance_job(job["id"])
+        self.assertEqual(completed["status"], "completed_with_errors")
+        self.assertEqual(completed["risk_found"], 1)
+        self.assertEqual(completed["isolated_accounts"], 1)
+        submit_probe.assert_called_once()
+
+        conn = server.db_conn()
+        row = conn.execute(
+            "SELECT status,last_error FROM accounts WHERE id=?",
+            (account_id,),
+        ).fetchone()
+        conn.close()
         self.assertEqual(row["status"], "disabled")
         self.assertIn("212361", row["last_error"])
 

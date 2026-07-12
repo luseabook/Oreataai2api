@@ -599,15 +599,59 @@ class GatewayHardeningTests(unittest.TestCase):
                 patch.object(server.CLIENT, "fetch_image_models", return_value={}),
                 patch.object(server.CLIENT, "fetch_video_models", return_value=[]),
                 patch.object(server.CLIENT, "fetch_video_scenes", return_value=[]),
-                patch.object(server, "save_account", return_value=1),
+                patch.object(server, "save_account", return_value=1) as save_account,
+                patch.object(
+                    server,
+                    "validate_registered_account",
+                    return_value={"ok": True, "asset_count": 1},
+                ),
             ):
                 result = server.auto_register_accounts(1)
         finally:
             server.CFG = original_cfg
 
         self.assertEqual(result[0]["status"], "verified")
+        self.assertEqual(save_account.call_args.kwargs["status"], "pending_validation")
         self.assertTrue(visit_link.called)
         self.assertTrue(visit_link.call_args.kwargs["verify"])
+
+    def test_registered_account_is_not_activated_when_generation_validation_is_risk_controlled(self):
+        session = server.OreateSession(
+            email="risk@example.com",
+            password="password",
+            cookies={"OUID": "ouid", "ouss": "ouss"},
+        )
+        trace = []
+        risk_error = server.UpstreamGenerationError(
+            {"code": "212361", "message": "spam user"}
+        )
+
+        with (
+            patch.object(server, "save_account", return_value=7) as save_account,
+            patch.object(
+                server,
+                "validate_registered_account",
+                side_effect=risk_error,
+            ),
+            patch.object(server, "mark_account_failure") as mark_failure,
+            patch.object(server, "isolate_account_from_pool") as isolate,
+        ):
+            account_id, status = server.save_and_validate_registered_account(
+                "risk@example.com",
+                "password",
+                session,
+                self.sample_image_info(),
+                self.sample_video_info(),
+                trace,
+            )
+
+        self.assertEqual(account_id, 7)
+        self.assertEqual(status, "risk_control")
+        self.assertEqual(save_account.call_args.kwargs["status"], "pending_validation")
+        mark_failure.assert_called_once_with(7, risk_error)
+        isolate.assert_called_once()
+        self.assertEqual(trace[-1]["step"], "generation_validation")
+        self.assertEqual(trace[-1]["status"], "risk_control")
 
     def test_generate_enqueues_task_and_worker_completes_it(self):
         self.seed_account_with_capabilities()
@@ -3628,6 +3672,27 @@ class GatewayHardeningTests(unittest.TestCase):
         selected_account_ids = [first.json()["account_id"], second.json()["account_id"]]
         self.assertEqual(set(selected_account_ids), {first_account_id, second_account_id})
         self.assertNotEqual(selected_account_ids[0], selected_account_ids[1])
+
+    def test_scheduler_prefers_previously_successful_account_over_untested_account(self):
+        proven_account_id = self.seed_account_with_capabilities("proven@example.com")
+        untested_account_id = self.seed_account_with_capabilities("untested@example.com")
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET last_used_at=?, updated_at=? WHERE id=?",
+            (now - 60, now - 60, proven_account_id),
+        )
+        conn.execute(
+            "UPDATE accounts SET last_used_at=NULL, updated_at=? WHERE id=?",
+            (now, untested_account_id),
+        )
+        conn.commit()
+        conn.close()
+
+        candidates = server.candidate_accounts_for_generation("image")
+
+        self.assertEqual(candidates[0]["id"], proven_account_id)
+        self.assertEqual({row["id"] for row in candidates}, {proven_account_id, untested_account_id})
 
     def test_scheduler_skips_verified_account_without_session_credentials(self):
         now = time.time()

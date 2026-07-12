@@ -136,6 +136,7 @@ DEFAULT_CONFIG = {
         "maintain_target": 5,
         "valid_threshold_pct": 1.0,
         "maintain_check_interval": 300,
+        "generation_probe_prompt": "账号健康检测：请生成白色背景上的一个蓝色圆点",
     },
     "gateway": {
         "default_rate_limit_per_minute": 60,
@@ -2062,6 +2063,7 @@ def candidate_accounts_for_generation(
             WHERE t.account_id=a.id
               AND t.status IN ('queued', 'running', 'submitted', 'hydrating')
         ) ASC,
+        CASE WHEN a.last_used_at IS NULL THEN 1 ELSE 0 END ASC,
         COALESCE(a.failure_count, 0) ASC,
         COALESCE(a.last_used_at, 0) ASC,
         a.updated_at DESC,
@@ -5039,6 +5041,163 @@ def submit_generation_for_account(
     }
 
 
+def generation_probe_options(account: sqlite3.Row) -> Dict[str, Any]:
+    caps = capabilities_from_account(account)
+    models = [
+        model
+        for model in caps.get("image", {}).get("models") or []
+        if bool(model.get("enabled", True))
+    ]
+    if not models:
+        raise GatewayAPIError(
+            503,
+            "ACCOUNT_PROBE_UNSUPPORTED",
+            "account has no enabled image model for generation health validation",
+        )
+
+    candidates: List[Tuple[float, int, int, Dict[str, Any]]] = []
+    for model_index, model in enumerate(models):
+        resolutions = list(model.get("resolutions") or [])
+        ratios = list(model.get("ratios") or [])
+        if not resolutions or not ratios:
+            continue
+        preferred_ratio = "1:1" if "1:1" in ratios else ratios[0]
+        for resolution_index, resolution in enumerate(resolutions):
+            options = {
+                "model_name": str(model.get("name") or ""),
+                "ratio": preferred_ratio,
+                "resolution": resolution,
+            }
+            point_cost = estimate_point_cost("image", options, caps)
+            sort_cost = float(point_cost) if point_cost is not None else math.inf
+            candidates.append(
+                (sort_cost, model_index, resolution_index, options)
+            )
+
+    if not candidates:
+        raise GatewayAPIError(
+            503,
+            "ACCOUNT_PROBE_UNSUPPORTED",
+            "account image capabilities do not contain a usable ratio and resolution",
+        )
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    options = candidates[0][3]
+    validate_generation_options("image", options, caps)
+    return options
+
+
+def probe_account_generation_health(account: sqlite3.Row) -> Dict[str, Any]:
+    options = generation_probe_options(account)
+    prompt = str(
+        CFG.get("pool", {}).get("generation_probe_prompt")
+        or DEFAULT_CONFIG["pool"]["generation_probe_prompt"]
+    ).strip()
+    result = submit_generation_for_account(
+        account,
+        "image",
+        prompt,
+        options,
+    )
+    assets = result.get("assets") or []
+    if not assets:
+        raise RuntimeError("generation health probe completed without an image asset")
+    mark_account_success(int(account["id"]))
+    return {
+        "ok": True,
+        "model_name": options["model_name"],
+        "ratio": options["ratio"],
+        "resolution": options["resolution"],
+        "asset_count": len(assets),
+    }
+
+
+def validate_registered_account(account_id: int) -> Dict[str, Any]:
+    account = account_row_by_id(account_id)
+    if account is None:
+        raise RuntimeError("registered account could not be loaded for validation")
+    session = CLIENT.session_from_account(account)
+    detail = CLIENT.fetch_account_point_detail(session, account)
+    update_account_balance_snapshot(account_id, detail)
+    result = probe_account_generation_health(account)
+    now = time.time()
+    conn = db_conn()
+    conn.execute(
+        """
+        UPDATE accounts
+        SET status='verified',
+            cooldown_until=NULL,
+            last_error=NULL,
+            updated_at=?
+        WHERE id=?
+        """,
+        (now, account_id),
+    )
+    conn.commit()
+    conn.close()
+    return result
+
+
+def save_and_validate_registered_account(
+    email: str,
+    password: str,
+    session: OreateSession,
+    image_info: Dict[str, Any],
+    video_info: Dict[str, Any],
+    trace: List[Dict[str, Any]],
+) -> Tuple[int, str]:
+    account_id = save_account(
+        email,
+        password,
+        session,
+        model_info=image_info,
+        video_info=video_info,
+        status="pending_validation",
+        source="auto",
+    )
+    trace.append(
+        {
+            "step": "login_and_save",
+            "account_id": account_id,
+            "status": "pending_validation",
+        }
+    )
+    try:
+        validation = validate_registered_account(account_id)
+    except Exception as exc:
+        code = upstream_error_code(exc)
+        mark_account_failure(account_id, exc)
+        if code in {"200001", "212361"}:
+            isolate_account_from_pool(
+                account_id,
+                f"注册后真实生成检测失败：{account_failure_message(exc, code)}",
+            )
+        status = (
+            "risk_control"
+            if code == "212361"
+            else "invalid"
+            if code == "200001"
+            else "validation_failed"
+        )
+        trace.append(
+            {
+                "step": "generation_validation",
+                "status": status,
+                "error_code": code,
+                "error": account_failure_message(exc, code),
+            }
+        )
+        return account_id, status
+
+    trace.append(
+        {
+            "step": "generation_validation",
+            "status": "verified",
+            "result": validation,
+        }
+    )
+    return account_id, "verified"
+
+
 def auto_register_accounts(
     count: int = 1,
     progress: Optional[Callable[[str, str], None]] = None,
@@ -5092,9 +5251,15 @@ def auto_register_accounts(
                                 "models": CLIENT.fetch_video_models(sess),
                                 "scenes": CLIENT.fetch_video_scenes(sess),
                             }
-                            account_id = save_account(email, password, session, model_info=img, video_info=vid, status="verified", source="auto")
-                            final_status = "verified"
-                            trace.append({"step": "login_and_save", "account_id": account_id})
+                            report("generation_validation", email)
+                            account_id, final_status = save_and_validate_registered_account(
+                                email,
+                                password,
+                                session,
+                                img,
+                                vid,
+                                trace,
+                            )
                         else:
                             final_status = "confirm_failed"
                     else:
@@ -5144,9 +5309,15 @@ def auto_register_accounts(
                                     "models": CLIENT.fetch_video_models(sess),
                                     "scenes": CLIENT.fetch_video_scenes(sess),
                                 }
-                                account_id = save_account(email, password, session, model_info=img, video_info=vid, status="verified", source="auto")
-                                final_status = "verified"
-                                trace.append({"step": "login_and_save", "account_id": account_id})
+                                report("generation_validation", email)
+                                account_id, final_status = save_and_validate_registered_account(
+                                    email,
+                                    password,
+                                    session,
+                                    img,
+                                    vid,
+                                    trace,
+                                )
                             else:
                                 final_status = "confirm_failed"
                         else:
@@ -5617,6 +5788,11 @@ def run_pool_maintenance_job(job_id: int) -> None:
                 session = CLIENT.session_from_account(row)
                 detail = CLIENT.fetch_account_point_detail(session, row)
                 update_account_balance_snapshot(account_id, detail)
+                update_pool_maintenance_job(
+                    job_id,
+                    current_step="checking_generation",
+                )
+                probe_account_generation_health(row)
             except Exception as exc:
                 check_failures += 1
                 code = upstream_error_code(exc)
@@ -10144,6 +10320,7 @@ const ADMIN_LABELS=Object.freeze({
     verified:'已验证',
     active:'可用',
     new:'待验证',
+    pending_validation:'真实生成验证中',
     invalid:'已失效',
     disabled:'已停用',
     expired:'已过期',
@@ -10359,6 +10536,7 @@ function registrationStepLabel(step){
     signup_attempt:'正在提交注册',
     email_verification:'正在等待邮箱验证',
     login_and_save:'正在登录并保存账号',
+    generation_validation:'正在验证真实生成能力',
     completed:'当前账号处理完成',
     interrupted:'任务已中断',
   })[String(step||'').toLowerCase()] || String(step||'处理中');
@@ -10464,6 +10642,7 @@ function maintenanceStepLabel(step){
     queued:'等待开始',
     scanning:'正在扫描号池',
     checking_account:'正在检测账号健康状态',
+    checking_generation:'正在验证真实生成能力',
     supplementing:'正在补充健康账号',
     finalizing:'正在汇总检测结果',
     completed:'维护任务已完成',
@@ -10563,7 +10742,7 @@ async function maintainPool(){
     alert('已有号池维护任务正在执行');
     return null;
   }
-  if(!confirm('将批量检测全部账号，风险和失效账号会被隔离，并按健康账号缺口自动补号。是否继续？')) return null;
+  if(!confirm('将批量检测全部账号，并为每个候选账号发起一次低成本图片生成验证；风险和失效账号会被隔离，再按健康账号缺口自动补号。检测会消耗少量积分，是否继续？')) return null;
   const configuredTarget=Number(state.settings?.pool?.maintain_target);
   const target=Number.isSafeInteger(configuredTarget)&&configuredTarget>0?configuredTarget:5;
   const requestedMax=Number(document.getElementById('reg_count').value||1);

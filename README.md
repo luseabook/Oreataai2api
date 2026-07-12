@@ -328,7 +328,7 @@ Content-Type: multipart/form-data
 ## 当前缺口
 - 自动注册：待补 `/passport/api/emailsignupin` + YYDS 收信 + `/passport/api/emailregisterconfirm`
 - 上传类视频高级场景回归：文本转视频和上传图生视频 `text_or_image` 已用真实账号验证成功；`reference`、`frame_based`、`motion` 仍需要单独低成本实测
-- 号池维护：基础结构已搭好，自动补号逻辑待实现
+- 号池维护：支持批量积分检查、低成本真实图片生成探针、风险/失效账号隔离和健康账号自动补充；新注册账号通过真实生成验证后才会进入可调度号池
 - 网关结果：已支持同步解析 SSE 和历史消息资源 URL，后续可补异步任务轮询、失败任务重试/取消
 
 ## 下一步
