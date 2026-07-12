@@ -3188,26 +3188,19 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIsNotNone(node, "Node.js is required to execute the API key limit helper test")
         script = html.split("<script>", 1)[1].split("</script>", 1)[0]
 
-        def extract_function(marker):
-            start = script.index(marker)
-            brace_start = script.index("{", start)
-            depth = 0
-            for index in range(brace_start, len(script)):
-                if script[index] == "{":
-                    depth += 1
-                elif script[index] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        return script[start : index + 1]
-            self.fail(f"{marker} function was not complete")
+        def source_between(start_marker, end_marker):
+            start = script.index(start_marker)
+            end = script.index(end_marker, start)
+            return script[start:end].strip()
 
-        helper_source = extract_function("function optionalNonNegativeIntegerValue(")
-        input_value_source = extract_function("function apiKeyLimitInputValue(")
-        status_source = extract_function("function apiKeyStatusTagClass(")
-        escape_source = extract_function("function escapeHtml(")
-        scope_source = extract_function("function scopeCsv(")
-        render_source = extract_function("function renderApiKeys(")
-        update_source = extract_function("async function updateApiKeyPolicy(")
+        escape_source = source_between("function escapeHtml(", "function normalizedOptionValues(")
+        scope_source = source_between("function scopeCsv(", "function optionalNonNegativeIntegerValue(")
+        helper_source = source_between("function optionalNonNegativeIntegerValue(", "function apiKeyLimitInputValue(")
+        input_value_source = source_between("function apiKeyLimitInputValue(", "function apiKeyStatusTagClass(")
+        status_source = source_between("function apiKeyStatusTagClass(", "function renderApiKeys(")
+        render_source = source_between("function renderApiKeys(", "function renderClients(")
+        update_source = source_between("async function updateApiKeyPolicy(", "async function deleteKey(")
+        self.assertNotIn("await loadClients();", update_source)
         node_program = f"""
 {helper_source}
 {input_value_source}
@@ -3238,6 +3231,23 @@ for (const input of ['-1', '1.5', 'abc', '1e3', '9007199254740992']) {{
     rejected = true;
   }}
   if (!rejected) throw new Error(`invalid input ${{JSON.stringify(input)}} was accepted`);
+}}
+for (const [input, expected] of [
+  [null, ''],
+  ['', ''],
+  ['0', '0'],
+  [0, '0'],
+  ['17', '17'],
+  [17, '17'],
+  ['-1', ''],
+  ['1.5', ''],
+  ['not-a-number', ''],
+  ['9007199254740992', ''],
+]) {{
+  const actual = apiKeyLimitInputValue(input);
+  if (actual !== expected) {{
+    throw new Error(`render value ${{JSON.stringify(input)}}: expected ${{JSON.stringify(expected)}}, got ${{JSON.stringify(actual)}}`);
+  }}
 }}
 for (const [status, expectedClass] of Object.entries({{
   enabled: 'tag-green',
@@ -3282,6 +3292,8 @@ if (tbody.innerHTML.includes('evil" onclick=')) throw new Error('status text was
 if (!tbody.innerHTML.includes('evil&quot; onclick=&quot;alert(1)')) throw new Error('escaped status text missing');
 if (!tbody.innerHTML.includes('class="tag tag-green">enabled</span>')) throw new Error('enabled fallback missing');
 if (!tbody.innerHTML.includes('class="tag tag-gray">disabled</span>')) throw new Error('disabled fallback missing');
+if (!tbody.innerHTML.includes('value="0"')) throw new Error('zero limit was not rendered');
+if (!tbody.innerHTML.includes('value="17"')) throw new Error('positive limit was not rendered');
 const fields = {{
   'ak-rate-9': {{value: ''}},
   'ak-req-9': {{value: '0'}},
@@ -3296,17 +3308,20 @@ const fields = {{
 }};
 const document = {{getElementById: id => fields[id]}};
 let capturedBody = undefined;
+let patchCalls = 0;
 async function api(method, path, body) {{
   if (method !== 'PATCH' || path !== '/api/admin/apikeys/9') throw new Error('unexpected API call');
+  patchCalls += 1;
   capturedBody = body;
   return {{ok: true}};
 }}
-async function loadClients() {{}}
 async function loadApiKeys() {{}}
-function alert(message) {{ throw new Error(`unexpected alert: ${{message}}`); }}
+const alerts = [];
+function alert(message) {{ alerts.push(message); }}
 {update_source}
 (async () => {{
   await updateApiKeyPolicy(9);
+  if (alerts.length) throw new Error(`unexpected alert: ${{alerts.join(' | ')}}`);
   const expected = {{rate_limit_per_minute: null, daily_request_limit: 0, daily_point_limit: 17}};
   for (const [field, value] of Object.entries(expected)) {{
     if (capturedBody?.[field] !== value) {{
@@ -3315,6 +3330,15 @@ function alert(message) {{ throw new Error(`unexpected alert: ${{message}}`); }}
     if (value !== null && typeof capturedBody[field] !== 'number') {{
       throw new Error(`${{field}} was not sent as a number`);
     }}
+  }}
+  loadApiKeys = async () => {{ throw new Error('refresh boom'); }};
+  await updateApiKeyPolicy(9);
+  if (patchCalls !== 2) throw new Error(`expected two successful PATCH calls, got ${{patchCalls}}`);
+  if (alerts.length !== 1 || !alerts[0].includes('已保存但刷新失败')) {{
+    throw new Error(`refresh failure alert was misleading: ${{alerts.join(' | ')}}`);
+  }}
+  if (alerts[0].includes('保存失败：')) {{
+    throw new Error(`refresh failure was reported as save failure: ${{alerts[0]}}`);
   }}
 }})().catch(error => {{
   console.error(error);

@@ -8257,10 +8257,14 @@ async function updateApiKeyPolicy(id){
       allow_experimental:document.getElementById('ak-experimental-'+id).checked,
     };
     await api('PATCH','/api/admin/apikeys/'+id,body);
-    await loadClients();
-    await loadApiKeys();
   }catch(error){
     alert('❌ 保存失败：'+(error?.message || String(error)));
+    return;
+  }
+  try{
+    await loadApiKeys();
+  }catch(error){
+    alert('⚠️ 已保存但刷新失败：'+(error?.message || String(error)));
   }
 }
 async function deleteKey(id){if(!confirm('确认删除此 API Key？')) return; await api('DELETE','/api/admin/apikeys/'+id);await loadApiKeys();}
