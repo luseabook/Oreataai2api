@@ -4445,8 +4445,15 @@ def run_hydration_attempt(task: sqlite3.Row, attempt_id: int) -> Dict[str, Any]:
     conn.close()
     if not account_row:
         raise HTTPException(503, "no verified account available")
-    balance_before = capture_account_balance_snapshot(account_row)
-    if balance_before:
+    # An asynchronous task can spend points after the submit request returns but
+    # before a later hydration pass observes the completed asset. Keep the
+    # snapshot captured by the generation phase as the billing baseline instead
+    # of replacing it with the already-deducted balance on every hydration poll.
+    persisted_balance_before = balance_snapshot_from_row(task, "balance_before")
+    balance_before = persisted_balance_before
+    if balance_before is None:
+        balance_before = capture_account_balance_snapshot(account_row)
+    if balance_before and persisted_balance_before is None:
         update_task_record(
             task["id"],
             **balance_snapshot_fields(balance_before, "balance_before"),

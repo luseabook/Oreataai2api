@@ -1064,6 +1064,82 @@ class GatewayHardeningTests(unittest.TestCase):
             self.assertEqual(task["status"], "completed")
             self.assertEqual(task["assets"], ["https://cdn.oreateai.com/aivideo/videodownload/1899992928.mp4"])
 
+    def test_async_hydration_preserves_initial_balance_for_actual_cost(self):
+        self.seed_account_with_capabilities()
+        key_id = self.seed_api_key("hydrate-cost-key")
+        point_snapshots = [
+            {"data": {"daily": 49, "bonus": 100, "restPoint": 149}},
+            {"data": {"daily": 49, "bonus": 100, "restPoint": 149}},
+            {"data": {"daily": 29, "bonus": 100, "restPoint": 129}},
+            {"data": {"daily": 29, "bonus": 100, "restPoint": 129}},
+        ]
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "fetch_account_point_detail", side_effect=point_snapshots),
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-hydrate-cost", "focusId": "focus-hydrate-cost"}),
+            patch.object(server.CLIENT, "stream_generation", return_value={"events": [{"event": "ping"}], "error": None, "status": "submitted"}),
+            patch.object(server.CLIENT, "hydrate_generation_result_until_assets", side_effect=[
+                {"raw": {}, "assets": [], "status": "submitted", "attempts": 1},
+                {
+                    "raw": {"status": {"code": 0}},
+                    "assets": ["https://cdn.oreateai.com/aivideo/videodownload/hydrate-cost.mp4"],
+                    "status": "completed",
+                    "attempts": 1,
+                },
+            ]),
+        ):
+            created = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer hydrate-cost-key"},
+                json=self.valid_video_request(),
+            )
+            self.assertEqual(created.status_code, 202)
+            task_id = created.json()["task_id"]
+
+            self.process_task_queue(limit=1)
+            submitted = self.client.get(
+                f"/v1/tasks/{task_id}",
+                headers={"Authorization": "Bearer hydrate-cost-key"},
+            ).json()["task"]
+            self.assertEqual(submitted["status"], "submitted")
+            self.assertEqual(submitted["balance_before_rest_point"], 149)
+
+            hydrated = self.client.post(
+                f"/v1/tasks/{task_id}/hydrate",
+                headers={"Authorization": "Bearer hydrate-cost-key"},
+            )
+            self.assertEqual(hydrated.status_code, 200)
+            self.process_task_queue(limit=1)
+
+        conn = server.db_conn()
+        task_row = conn.execute(
+            """
+            SELECT status, actual_point_cost,
+                   balance_before_rest_point, balance_after_rest_point
+            FROM tasks
+            WHERE id=?
+            """,
+            (task_id,),
+        ).fetchone()
+        usage_row = conn.execute(
+            """
+            SELECT status, actual_point_cost
+            FROM usage_log
+            WHERE task_id=? AND api_key_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (task_id, key_id),
+        ).fetchone()
+        conn.close()
+
+        self.assertEqual(task_row["status"], "completed")
+        self.assertEqual(task_row["balance_before_rest_point"], 149)
+        self.assertEqual(task_row["balance_after_rest_point"], 129)
+        self.assertEqual(task_row["actual_point_cost"], 20)
+        self.assertEqual(usage_row["status"], "completed")
+        self.assertEqual(usage_row["actual_point_cost"], 20)
+
     def test_cancelled_running_task_does_not_write_completed_result_after_worker_returns(self):
         self.seed_account_with_capabilities()
         self.seed_api_key("cancel-midflight-key")
