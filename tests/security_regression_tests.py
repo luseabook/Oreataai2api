@@ -10,10 +10,11 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import zipfile
 
 from fastapi.testclient import TestClient
+from PIL import Image, ImageDraw, ImageFont
 
 import server
 
@@ -851,6 +852,146 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertIn("await waitForGeneratedTask(r.task_id", html)
         self.assertIn("adminLabel('taskStatus',task?.status)", html)
         self.assertIn("生成结果", html)
+
+    def synthetic_watermarked_image_bytes(self):
+        image = Image.new("RGB", (360, 640), (74, 52, 96))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, 359, 560), fill=(105, 78, 130))
+        font = ImageFont.load_default(size=24)
+        draw.text((232, 588), "Oreate AI", fill=(245, 245, 245), font=font)
+        payload = io.BytesIO()
+        image.save(payload, format="JPEG", quality=95)
+        return payload.getvalue()
+
+    def seed_completed_image_task(self, asset):
+        conn = server.db_conn()
+        row = conn.execute("SELECT id FROM accounts ORDER BY id LIMIT 1").fetchone()
+        conn.close()
+        account_id = row["id"] if row else self.seed_account()
+        return server.save_task(
+            account_id,
+            "image",
+            "测试图片",
+            {"kind": "image", "prompt": "测试图片"},
+            {"status": "completed", "assets": [asset]},
+            status="completed",
+            finished_at=time.time(),
+        )
+
+    def test_watermark_removal_preserves_dimensions_and_skips_clean_images(self):
+        source = self.synthetic_watermarked_image_bytes()
+
+        processed, media_type, removed = server.watermark_free_image_bytes(source)
+
+        self.assertTrue(removed)
+        self.assertEqual(media_type, "image/jpeg")
+        with Image.open(io.BytesIO(processed)) as result:
+            self.assertEqual(result.size, (360, 640))
+
+        clean_image = Image.new("RGB", (360, 640), (30, 60, 90))
+        clean_payload = io.BytesIO()
+        clean_image.save(clean_payload, format="PNG")
+        untouched, clean_media_type, clean_removed = server.watermark_free_image_bytes(clean_payload.getvalue())
+
+        self.assertFalse(clean_removed)
+        self.assertEqual(clean_media_type, "image/png")
+        self.assertEqual(untouched, clean_payload.getvalue())
+
+    def test_admin_clean_asset_requires_login_and_rejects_untrusted_hosts(self):
+        trusted_task_id = self.seed_completed_image_task("https://cdn.oreateai.com/static/result/test.jpg")
+        untrusted_task_id = self.seed_completed_image_task("https://example.com/result/test.jpg")
+
+        unauthenticated = self.client.get(f"/api/tasks/{trusted_task_id}/assets/0/clean")
+        with patch.object(server, "fetch_remote_image_asset") as fetch:
+            untrusted = self.client.get(
+                f"/api/tasks/{untrusted_task_id}/assets/0/clean",
+                headers=self.admin_headers(),
+            )
+
+        self.assertEqual(unauthenticated.status_code, 401)
+        self.assertEqual(untrusted.status_code, 502)
+        fetch.assert_not_called()
+
+    def test_clean_asset_download_rejects_redirects_outside_the_allowlist(self):
+        redirect = MagicMock()
+        redirect.status_code = 302
+        redirect.headers = {"location": "http://127.0.0.1/private"}
+        redirect.url = "https://cdn.oreateai.com/static/result/test.jpg"
+
+        with patch.object(server.requests, "get", return_value=redirect) as get:
+            with self.assertRaises(server.HTTPException) as raised:
+                server.fetch_remote_image_asset("https://cdn.oreateai.com/static/result/test.jpg")
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(raised.exception.detail, "image asset is unavailable")
+        get.assert_called_once()
+        redirect.close.assert_called_once()
+
+    def test_clean_asset_download_uses_system_trust_when_requests_ca_bundle_rejects_cdn(self):
+        expected = self.synthetic_watermarked_image_bytes()
+        with patch.object(server.requests, "get", side_effect=server.requests.exceptions.SSLError):
+            with patch.object(
+                server,
+                "fetch_remote_image_asset_with_system_trust",
+                return_value=expected,
+            ) as fallback:
+                result = server.fetch_remote_image_asset(
+                    "https://cdn.oreateai.com/static/result/test.jpg"
+                )
+
+        self.assertEqual(result, expected)
+        fallback.assert_called_once_with("https://cdn.oreateai.com/static/result/test.jpg")
+
+    def test_admin_clean_asset_returns_processed_image_and_chinese_filename(self):
+        task_id = self.seed_completed_image_task("https://cdn.oreateai.com/static/result/test.jpg")
+
+        with patch.object(
+            server,
+            "fetch_remote_image_asset",
+            return_value=self.synthetic_watermarked_image_bytes(),
+        ):
+            response = self.client.get(
+                f"/api/tasks/{task_id}/assets/0/clean",
+                headers=self.admin_headers(),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "image/jpeg")
+        self.assertEqual(response.headers["x-watermark-removed"], "true")
+        self.assertIn("task-", response.headers["content-disposition"])
+        with Image.open(io.BytesIO(response.content)) as result:
+            self.assertEqual(result.size, (360, 640))
+
+    def test_admin_clean_asset_rejects_video_tasks_and_invalid_asset_indexes(self):
+        account_id = self.seed_account()
+        task_id = server.save_task(
+            account_id,
+            "video",
+            "测试视频",
+            {"kind": "video", "prompt": "测试视频"},
+            {"status": "completed", "assets": ["https://cdn.oreateai.com/video/result.mp4"]},
+            status="completed",
+            finished_at=time.time(),
+        )
+        headers = self.admin_headers()
+
+        video_response = self.client.get(f"/api/tasks/{task_id}/assets/0/clean", headers=headers)
+        index_response = self.client.get(f"/api/tasks/{task_id}/assets/1/clean", headers=headers)
+
+        self.assertEqual(video_response.status_code, 409)
+        self.assertEqual(index_response.status_code, 404)
+
+    def test_admin_html_loads_and_downloads_authenticated_watermark_free_previews(self):
+        html = server.ADMIN_HTML
+
+        self.assertIn("async function loadCleanTaskImages(", html)
+        self.assertIn("function imageBlobDataUrl(", html)
+        self.assertIn("await image.decode()", html)
+        self.assertIn("async function downloadCleanTaskAsset(", html)
+        self.assertIn("/assets/${assetIndex}/clean", html)
+        self.assertIn("正在生成无水印预览", html)
+        self.assertIn("下载无水印", html)
+        self.assertIn("打开上游原图", html)
 
     def test_admin_html_localizes_operational_enums_without_changing_filter_values(self):
         html = server.ADMIN_HTML

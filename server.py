@@ -12,7 +12,9 @@ import tempfile
 import threading
 import time
 import zipfile
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote, urljoin, urlparse
+from urllib.request import HTTPRedirectHandler, Request as UrlRequest, build_opener
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,7 +28,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect, Depends
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic_core import PydanticCustomError
@@ -50,6 +52,7 @@ from gateway.runtime import (
     validate_single_worker_configuration,
     worker_lock_path,
 )
+from gateway.watermark import WatermarkImageError, watermark_free_image_bytes
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -78,6 +81,7 @@ TASK_LIST_STATUSES = {"queued", "running", "submitted", "hydrating", "completed"
 MAX_LIST_LIMIT = 200
 MAX_LIST_OFFSET = 10000
 UNSAFE_ADMIN_PASSWORDS = {"", "admin123", "CHANGE_ME", "changeme", "password"}
+MAX_CLEAN_ASSET_BYTES = 30 * 1024 * 1024
 
 DEFAULT_CONFIG = {
     "database": {
@@ -3465,6 +3469,137 @@ def task_detail_for_row(row: sqlite3.Row) -> Dict[str, Any]:
     task = task_row_to_public(row)
     task["attempts"] = task_attempts_for_task(task["id"])
     return task
+
+
+def clean_asset_host_allowlist() -> set[str]:
+    return {
+        str(host).strip().lower()
+        for host in openai_compat_cfg().get("asset_host_allowlist", ["cdn.oreateai.com"])
+        if str(host).strip()
+    }
+
+
+def validate_clean_asset_url(asset_url: str) -> str:
+    url = str(asset_url or "").strip()
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.hostname.lower() not in clean_asset_host_allowlist()
+    ):
+        raise HTTPException(502, "image asset is unavailable")
+    return url
+
+
+class _NoAssetRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def fetch_remote_image_asset_with_system_trust(asset_url: str) -> bytes:
+    """Download through urllib so Windows' system certificate store is honored."""
+    current_url = validate_clean_asset_url(asset_url)
+    opener = build_opener(_NoAssetRedirectHandler())
+    for redirect_count in range(4):
+        response = None
+        try:
+            request = UrlRequest(current_url, headers={"User-Agent": "OreateAI-Gateway/1.0"})
+            try:
+                response = opener.open(request, timeout=30)
+            except HTTPError as exc:
+                if exc.code not in {301, 302, 303, 307, 308}:
+                    raise
+                response = exc
+
+            status_code = int(getattr(response, "status", None) or response.getcode())
+            if status_code in {301, 302, 303, 307, 308}:
+                location = str(response.headers.get("location") or "").strip()
+                if not location or redirect_count == 3:
+                    raise HTTPException(502, "image asset redirect is invalid")
+                current_url = validate_clean_asset_url(urljoin(current_url, location))
+                continue
+
+            final_url = str(getattr(response, "url", None) or response.geturl() or current_url)
+            validate_clean_asset_url(final_url)
+            try:
+                declared_length = int(response.headers.get("content-length") or 0)
+            except (TypeError, ValueError):
+                declared_length = 0
+            if declared_length > MAX_CLEAN_ASSET_BYTES:
+                raise HTTPException(413, "image asset is too large")
+
+            payload = bytearray()
+            while True:
+                chunk = response.read(min(1024 * 1024, MAX_CLEAN_ASSET_BYTES + 1 - len(payload)))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+                if len(payload) > MAX_CLEAN_ASSET_BYTES:
+                    raise HTTPException(413, "image asset is too large")
+            if not payload:
+                raise HTTPException(502, "image asset is empty")
+            return bytes(payload)
+        except HTTPException:
+            raise
+        except (HTTPError, URLError, OSError):
+            raise HTTPException(502, "image asset download failed")
+        finally:
+            if response is not None:
+                response.close()
+    raise HTTPException(502, "image asset download failed")
+
+
+def fetch_remote_image_asset(asset_url: str) -> bytes:
+    current_url = validate_clean_asset_url(asset_url)
+    response = None
+    try:
+        for redirect_count in range(4):
+            response = requests.get(
+                current_url,
+                stream=True,
+                timeout=(5, 30),
+                verify=tls_verify_enabled(),
+                allow_redirects=False,
+            )
+            if response.status_code not in {301, 302, 303, 307, 308}:
+                break
+            location = str(response.headers.get("location") or "").strip()
+            response.close()
+            response = None
+            if not location or redirect_count == 3:
+                raise HTTPException(502, "image asset redirect is invalid")
+            current_url = validate_clean_asset_url(urljoin(current_url, location))
+        if response is None:
+            raise HTTPException(502, "image asset download failed")
+        response.raise_for_status()
+        validate_clean_asset_url(str(response.url or current_url))
+        try:
+            declared_length = int(response.headers.get("content-length") or 0)
+        except (TypeError, ValueError):
+            declared_length = 0
+        if declared_length > MAX_CLEAN_ASSET_BYTES:
+            raise HTTPException(413, "image asset is too large")
+        payload = bytearray()
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if not chunk:
+                continue
+            payload.extend(chunk)
+            if len(payload) > MAX_CLEAN_ASSET_BYTES:
+                raise HTTPException(413, "image asset is too large")
+        if not payload:
+            raise HTTPException(502, "image asset is empty")
+        return bytes(payload)
+    except HTTPException:
+        raise
+    except requests.exceptions.SSLError:
+        return fetch_remote_image_asset_with_system_trust(asset_url)
+    except requests.RequestException:
+        raise HTTPException(502, "image asset download failed")
+    finally:
+        if response is not None:
+            response.close()
 
 
 def update_task_record(task_id: int, **fields: Any) -> None:
@@ -7663,6 +7798,36 @@ def admin_task_detail(task_id: int, _=Depends(require_admin)):
     return gateway_task_detail_payload(task_id)
 
 
+@app.get("/api/tasks/{task_id}/assets/{asset_index}/clean")
+def admin_task_clean_asset(task_id: int, asset_index: int, _=Depends(require_admin)):
+    task = gateway_task_detail_payload(task_id)["task"]
+    assets = task.get("assets") if isinstance(task.get("assets"), list) else []
+    if asset_index < 0 or asset_index >= len(assets):
+        raise HTTPException(404, "image asset not found")
+    if str(task.get("kind") or "").lower() != "image":
+        raise HTTPException(409, "watermark removal only supports image tasks")
+    if str(task.get("status") or "").lower() != "completed":
+        raise HTTPException(409, "image task is not completed")
+
+    asset_url = validate_clean_asset_url(str(assets[asset_index] or ""))
+    source = fetch_remote_image_asset(asset_url)
+    try:
+        cleaned, media_type, removed = watermark_free_image_bytes(source)
+    except WatermarkImageError as exc:
+        raise HTTPException(exc.status_code, exc.message)
+    extension = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}[media_type]
+    return Response(
+        content=cleaned,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'inline; filename="task-{task_id}-clean-{asset_index + 1}.{extension}"',
+            "Cache-Control": "private, max-age=3600",
+            "X-Watermark-Removed": "true" if removed else "false",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @app.post("/api/tasks/{task_id}/retry")
 def admin_task_retry(task_id: int, request: Request, _=Depends(require_admin)):
     return retry_task_record(task_id, request_id=gateway_request_id(request))
@@ -7776,6 +7941,11 @@ tr:hover td{background:#fafafa}
 .task-preview-meta{font-size:12px;line-height:1.65;color:#3a3a3c;word-break:break-word}
 .task-preview-assets{display:flex;flex-direction:column;gap:8px}
 .task-preview-media{max-width:100%;border-radius:10px;border:1px solid #e5e5e5;background:#000}
+.clean-asset-shell{display:flex;flex-direction:column;gap:8px}
+.clean-asset-status{font-size:12px;color:#6e6e73;min-height:18px}
+.clean-asset-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.clean-asset-actions a{font-size:12px;color:#1565c0;text-decoration:none}
+.clean-asset-actions a:hover{text-decoration:underline}
 .generation-result{margin-top:12px;min-height:0}
 .generation-result-card{background:#f5f5f7;border:1px solid #e5e5e5;border-radius:12px;padding:14px}
 .generation-result-title{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:14px;font-weight:600}
@@ -8668,6 +8838,7 @@ const GENERATION_TERMINAL_STATUSES=new Set(['completed','failed','cancelled','ex
 function renderGenerateResult(task,message=''){
   const panel=document.getElementById('g-result');
   if(!panel) return;
+  revokeCleanTaskImages(panel);
   if(!task){
     panel.textContent=message;
     return;
@@ -8677,7 +8848,7 @@ function renderGenerateResult(task,message=''){
   const statusLabel=adminLabel('taskStatus',task?.status);
   const errorMessage=task?.error_message ? `<div style="color:#c62828">${escapeHtml(task.error_message)}</div>` : '';
   const assetHtml=assets.length
-    ? assets.map(renderTaskAsset).filter(Boolean).join('')
+    ? assets.map((asset,index)=>renderTaskAsset(asset,task,index)).filter(Boolean).join('')
     : '<div class="task-preview-meta">任务完成后将在这里显示生成结果。</div>';
   panel.innerHTML=`
     <div class="generation-result-card">
@@ -8692,6 +8863,7 @@ function renderGenerateResult(task,message=''){
       </div>
       <div class="generation-result-assets">${assetHtml}</div>
     </div>`;
+  void loadCleanTaskImages(panel);
 }
 async function waitForGeneratedTask(taskId,{initialTask=null,timeoutMs=120000,pollIntervalMs=1000}={}){
   let task=initialTask;
@@ -8741,7 +8913,7 @@ async function gatewayGenerate(){
     const task=await waitForGeneratedTask(r.task_id,{initialTask});
     if(task){
       const terminal=GENERATION_TERMINAL_STATUSES.has(String(task.status || '').toLowerCase());
-      renderGenerateResult(task,terminal ? '' : '任务仍在处理中，可前往“任务”页继续查看。');
+      if(!terminal) renderGenerateResult(task,'任务仍在处理中，可前往“任务”页继续查看。');
     }
     await loadTasks();
     return task;
@@ -8847,13 +9019,100 @@ function safeAssetUrl(asset){
   }catch(_error){}
   return '';
 }
-function renderTaskAsset(asset){
+function revokeCleanTaskImages(root){
+  if(!root) return;
+  root.querySelectorAll('[data-clean-blob-url]').forEach(image=>{
+    const blobUrl=image.dataset.cleanBlobUrl;
+    if(blobUrl) URL.revokeObjectURL(blobUrl);
+    delete image.dataset.cleanBlobUrl;
+  });
+}
+function cleanTaskAssetUrl(taskId,assetIndex){
+  return `${BASE}/api/tasks/${taskId}/assets/${assetIndex}/clean`;
+}
+function imageBlobDataUrl(blob){
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    reader.onload=()=>resolve(String(reader.result || ''));
+    reader.onerror=()=>reject(reader.error || new Error('图片预览读取失败'));
+    reader.readAsDataURL(blob);
+  });
+}
+async function loadCleanTaskImages(root){
+  if(!root) return;
+  const images=Array.from(root.querySelectorAll('img[data-clean-task-id]'));
+  await Promise.all(images.map(async image=>{
+    const taskId=Number(image.dataset.cleanTaskId);
+    const assetIndex=Number(image.dataset.cleanAssetIndex);
+    const originalUrl=safeAssetUrl(image.dataset.originalSrc);
+    const shell=image.closest('.clean-asset-shell');
+    const status=shell?.querySelector('.clean-asset-status');
+    try{
+      const response=await fetch(cleanTaskAssetUrl(taskId,assetIndex),{headers:authHeaders()});
+      if(!response.ok) throw new Error(`HTTP ${response.status}`);
+      const blob=await response.blob();
+      if(!String(blob.type || '').startsWith('image/')) throw new Error('返回内容不是图片');
+      image.src=await imageBlobDataUrl(blob);
+      if(typeof image.decode==='function') await image.decode();
+      image.classList.remove('hidden');
+      const removed=response.headers.get('x-watermark-removed')==='true';
+      if(status) status.textContent=removed ? '已生成无水印预览' : '未检测到可移除的上游水印';
+    }catch(_error){
+      if(originalUrl){
+        image.src=originalUrl;
+        if(typeof image.decode==='function') await image.decode().catch(()=>{});
+        image.classList.remove('hidden');
+      }
+      if(status) status.textContent=originalUrl ? '无水印处理失败，已显示上游原图' : '无水印处理失败';
+    }
+  }));
+}
+async function downloadCleanTaskAsset(taskId,assetIndex,button=null){
+  const originalLabel=button?.textContent || '';
+  if(button){
+    button.disabled=true;
+    button.textContent='处理中…';
+  }
+  try{
+    const response=await fetch(cleanTaskAssetUrl(taskId,assetIndex),{headers:authHeaders()});
+    if(!response.ok) throw new Error(`HTTP ${response.status}`);
+    const blob=await response.blob();
+    const extension=blob.type==='image/png'?'png':blob.type==='image/webp'?'webp':'jpg';
+    const blobUrl=URL.createObjectURL(blob);
+    const link=document.createElement('a');
+    link.href=blobUrl;
+    link.download=`任务-${taskId}-无水印-${assetIndex+1}.${extension}`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(()=>URL.revokeObjectURL(blobUrl),0);
+  }catch(error){
+    alert(`下载无水印图片失败：${error?.message || String(error)}`);
+  }finally{
+    if(button){
+      button.disabled=false;
+      button.textContent=originalLabel;
+    }
+  }
+}
+function renderTaskAsset(asset,task=null,assetIndex=0){
   const url=safeAssetUrl(asset);
   if(!url) return '';
   if(/\\.(mp4|mov|webm)(\\?|$)/i.test(url)) {
     return `<video class="task-preview-media" controls src="${escapeHtml(url)}"></video>`;
   }
-  return `<img class="task-preview-media" src="${escapeHtml(url)}" alt="生成结果">`;
+  const taskId=Number(task?.id);
+  if(!Number.isSafeInteger(taskId) || taskId <= 0){
+    return `<img class="task-preview-media" src="${escapeHtml(url)}" alt="生成结果">`;
+  }
+  return `<div class="clean-asset-shell">
+    <div class="clean-asset-status">正在生成无水印预览…</div>
+    <img class="task-preview-media hidden" data-clean-task-id="${taskId}" data-clean-asset-index="${assetIndex}" data-original-src="${escapeHtml(url)}" alt="无水印生成结果">
+    <div class="clean-asset-actions">
+      <button class="btn-sm btn-secondary" onclick="downloadCleanTaskAsset(${taskId},${assetIndex},this)">下载无水印</button>
+      <a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">打开上游原图</a>
+    </div>
+  </div>`;
 }
 function taskAssetLink(asset,index){
   const url=safeAssetUrl(asset);
@@ -8864,11 +9123,12 @@ function renderTaskPreview(task){
   const panel=document.getElementById('task-preview');
   const body=document.getElementById('task-preview-body');
   if(!panel || !body) return;
+  revokeCleanTaskImages(body);
   const assets=Array.isArray(task?.assets) ? task.assets : [];
   const attempts=Array.isArray(task?.attempts) ? task.attempts : [];
   const scene=capabilityScenes().find(s => s.scene_id === (task?.scene_id || task?.payload?.scene_id)) || null;
   const model=capabilityModels(task?.kind || 'image').find(m => m.name === (task?.model_name || task?.payload?.model_name)) || null;
-  const assetHtml=assets.length ? assets.map(renderTaskAsset).join('') : '<div class="task-preview-meta">暂无结果</div>';
+  const assetHtml=assets.length ? assets.map((asset,index)=>renderTaskAsset(asset,task,index)).join('') : '<div class="task-preview-meta">暂无结果</div>';
   body.innerHTML = `
     <div class="task-preview-card">
       <h3>基础信息</h3>
@@ -8900,6 +9160,7 @@ function renderTaskPreview(task){
     </div>
   `;
   panel.classList.remove('hidden');
+  void loadCleanTaskImages(body);
 }
 async function loadTaskDetail(id){
   const r=await api('GET',`/api/tasks/${id}`);
