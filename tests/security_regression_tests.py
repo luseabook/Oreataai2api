@@ -1,9 +1,13 @@
 import json
 import hashlib
 import io
+import shutil
+import subprocess
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 import zipfile
@@ -756,6 +760,72 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertFalse(pool_response.json()["restart_required"])
         self.assertEqual(server.CFG["pool"]["custom_pool_option"], "kept")
 
+    def test_admin_settings_updates_are_serialized_without_lost_fields(self):
+        server.save_config(server.CFG)
+        first_save_entered = threading.Event()
+        release_first_save = threading.Event()
+        call_count = 0
+        call_count_lock = threading.Lock()
+        original_save_config = server.save_config
+
+        def observed_save_config(candidate):
+            nonlocal call_count
+            with call_count_lock:
+                call_count += 1
+                current_call = call_count
+            if current_call == 1:
+                first_save_entered.set()
+                self.assertTrue(release_first_save.wait(5), "timed out releasing the first settings save")
+            return original_save_config(candidate)
+
+        server_update = server.SettingsIn.model_validate({"server": {"concurrent_server_option": "kept"}})
+        pool_update = server.SettingsIn.model_validate({"pool": {"concurrent_pool_option": "kept"}})
+
+        with patch.object(server, "save_config", side_effect=observed_save_config):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(server.put_settings, server_update, None)
+                self.assertTrue(first_save_entered.wait(5), "the first settings save never started")
+                probe_result = []
+
+                def probe_config_lock():
+                    acquired = server.CONFIG_LOCK.acquire(blocking=False)
+                    probe_result.append(acquired)
+                    if acquired:
+                        server.CONFIG_LOCK.release()
+
+                probe = threading.Thread(target=probe_config_lock)
+                probe.start()
+                probe.join(timeout=5)
+                try:
+                    self.assertFalse(probe.is_alive(), "the config lock probe did not finish")
+                    self.assertEqual(
+                        probe_result,
+                        [False],
+                        "put_settings must hold CONFIG_LOCK across merge and persistence",
+                    )
+                    second = executor.submit(server.put_settings, pool_update, None)
+                finally:
+                    release_first_save.set()
+                first.result(timeout=5)
+                second.result(timeout=5)
+
+        saved = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(server.CFG["server"]["concurrent_server_option"], "kept")
+        self.assertEqual(server.CFG["pool"]["concurrent_pool_option"], "kept")
+        self.assertEqual(saved, server.CFG)
+
+    def test_save_config_replaces_atomically_and_cleans_failed_temp_file(self):
+        server.save_config(server.CFG)
+        original_bytes = self.config_path.read_bytes()
+        candidate = server.deep_merge(server.CFG, {"server": {"port": server.CFG["server"]["port"] + 1}})
+
+        with patch.object(server.os, "replace", side_effect=OSError("simulated replace failure")):
+            with self.assertRaisesRegex(OSError, "simulated replace failure"):
+                server.save_config(candidate)
+
+        self.assertEqual(self.config_path.read_bytes(), original_bytes)
+        self.assertEqual(list(self.config_path.parent.glob(f".{self.config_path.name}.*.tmp")), [])
+
     def test_admin_html_validates_numeric_settings_and_formats_api_errors(self):
         html = server.ADMIN_HTML
 
@@ -768,6 +838,101 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertIn("maintainTarget < minAccounts", html)
         self.assertIn("s.pool?.min_accounts??3", html)
         self.assertIn("s.pool?.maintain_target??5", html)
+        self.assertIn("已保存但刷新失败", html)
+
+    def test_admin_html_javascript_helpers_execute_in_node(self):
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to execute the admin JavaScript regression tests")
+        script = server.ADMIN_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+        node_program = f"""
+const source = {json.dumps(script)};
+function extractFunction(name) {{
+  const marker = `function ${{name}}(`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`missing function ${{name}}`);
+  const braceStart = source.indexOf('{{', start);
+  let depth = 0;
+  for (let index = braceStart; index < source.length; index += 1) {{
+    if (source[index] === '{{') depth += 1;
+    if (source[index] === '}}') {{
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }}
+  }}
+  throw new Error(`unterminated function ${{name}}`);
+}}
+const values = Object.create(null);
+const document = {{
+  getElementById(id) {{
+    return {{value: values[id]}};
+  }},
+}};
+const helpers = new Function(
+  'document',
+  `${{extractFunction('requiredIntegerValue')}}
+${{extractFunction('formatApiError')}}
+return {{requiredIntegerValue, formatApiError}};`,
+)(document);
+function assertEqual(actual, expected, label) {{
+  if (actual !== expected) throw new Error(`${{label}}: expected ${{JSON.stringify(expected)}}, got ${{JSON.stringify(actual)}}`);
+}}
+function assertThrows(callback, label) {{
+  let threw = false;
+  try {{ callback(); }} catch (error) {{ threw = true; }}
+  if (!threw) throw new Error(`${{label}}: expected an exception`);
+}}
+values.number = '';
+assertThrows(() => helpers.requiredIntegerValue('number', 'value', 0), 'blank');
+values.number = '1.5';
+assertThrows(() => helpers.requiredIntegerValue('number', 'value', 0), 'decimal');
+values.number = '65536';
+assertThrows(() => helpers.requiredIntegerValue('number', 'value', 1, 65535), 'out of range');
+values.number = '0';
+assertEqual(helpers.requiredIntegerValue('number', 'value', 0), 0, 'zero');
+values.number = '12';
+assertEqual(helpers.requiredIntegerValue('number', 'value', 0), 12, 'positive integer');
+assertEqual(
+  helpers.formatApiError({{detail: [{{loc: ['body', 'server', 'port'], msg: 'invalid port'}}]}}),
+  'server.port: invalid port',
+  'Pydantic validation detail',
+);
+assertEqual(
+  helpers.formatApiError({{error: {{message: 'request conflict'}}}}),
+  'request conflict',
+  'gateway error message',
+);
+assertEqual(helpers.formatApiError({{message: 'plain failure'}}), 'plain failure', 'top-level message');
+assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 fallback');
+"""
+        node_test_path = Path(self.tmp.name) / "admin_helpers_test.js"
+        node_test_path.write_text(node_program, encoding="utf-8")
+        completed = subprocess.run(
+            [node, str(node_test_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_admin_html_javascript_parses_in_node(self):
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to parse the admin JavaScript regression tests")
+        script = server.ADMIN_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+        node_script_path = Path(self.tmp.name) / "admin_script.js"
+        node_script_path.write_text(script, encoding="utf-8")
+
+        completed = subprocess.run(
+            [node, "--check", str(node_script_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
     def test_admin_settings_response_redacts_secrets(self):
         original_cfg = server.CFG

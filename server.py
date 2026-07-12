@@ -55,6 +55,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 DB_PATH = BASE_DIR / "accounts.db"
 MIGRATIONS_DIR = BASE_DIR / "migrations"
+CONFIG_LOCK = threading.RLock()
 SECRET_PLACEHOLDER = "__redacted__"
 ENCRYPTED_SECRET_PREFIX = "enc:v1:"
 ACCOUNT_SECRET_FIELDS = ("password", "ouid", "ouss")
@@ -205,7 +206,30 @@ def load_config() -> Dict[str, Any]:
 
 
 def save_config(cfg: Dict[str, Any]) -> None:
-    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    with CONFIG_LOCK:
+        serialized = json.dumps(cfg, ensure_ascii=False, indent=2)
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{CONFIG_PATH.name}.",
+            suffix=".tmp",
+            dir=str(CONFIG_PATH.parent),
+        )
+        temp_path = Path(temp_name)
+        try:
+            handle = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+            fd = -1
+            with handle:
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, CONFIG_PATH)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def active_encryption_key() -> str:
@@ -5184,8 +5208,10 @@ def restore_backup_zip_bytes(payload: bytes) -> Dict[str, Any]:
             if not isinstance(restored_cfg, dict):
                 raise HTTPException(400, "backup config is invalid")
             global CFG
-            CFG = deep_merge(DEFAULT_CONFIG, restored_cfg)
-            save_config(CFG)
+            with CONFIG_LOCK:
+                restored_candidate = deep_merge(DEFAULT_CONFIG, restored_cfg)
+                save_config(restored_candidate)
+                CFG = restored_candidate
             if DB_PATH.exists():
                 DB_PATH.unlink()
             shutil.copyfile(db_path, DB_PATH)
@@ -5230,15 +5256,18 @@ def require_admin(request: Request):
 def update_policy_override(section: str, key: str, body: Dict[str, Any], allowed_keys: Iterable[str]) -> Dict[str, Any]:
     global CFG
     patch = {name: body[name] for name in allowed_keys if name in body}
-    gateway_cfg_section = CFG.setdefault("gateway", {})
-    policies = gateway_cfg_section.setdefault(section, {})
-    current = policies.get(key, {})
-    if not isinstance(current, dict):
-        current = {}
-    merged = resolve_policy(current, patch)
-    policies[key] = merged
-    save_config(CFG)
-    return merged
+    with CONFIG_LOCK:
+        candidate = json.loads(json.dumps(CFG))
+        gateway_cfg_section = candidate.setdefault("gateway", {})
+        policies = gateway_cfg_section.setdefault(section, {})
+        current = policies.get(key, {})
+        if not isinstance(current, dict):
+            current = {}
+        merged = resolve_policy(current, patch)
+        policies[key] = merged
+        save_config(candidate)
+        CFG = candidate
+        return merged
 
 
 def get_client_record(client_id: int) -> sqlite3.Row:
@@ -7033,18 +7062,23 @@ def admin_login(body: LoginIn, request: Request):
 @app.post("/api/admin/credentials")
 def update_admin_credentials(body: AdminCredentialsIn, _=Depends(require_admin)):
     global CFG
-    current_password = str(CFG["server"].get("admin_password") or "")
-    if not secrets.compare_digest(body.current_password, current_password):
-        raise HTTPException(401, "current password is incorrect")
-    new_username = body.new_username.strip()
-    if not new_username:
-        raise HTTPException(400, "new username is required")
-    if body.new_password != body.confirm_password:
-        raise HTTPException(400, "new passwords do not match")
-    if len(body.new_password) < 8 or is_unsafe_admin_password(body.new_password):
-        raise HTTPException(400, "new password is too weak")
-    CFG = deep_merge(CFG, {"server": {"admin_username": new_username, "admin_password": body.new_password}})
-    save_config(CFG)
+    with CONFIG_LOCK:
+        current_password = str(CFG["server"].get("admin_password") or "")
+        if not secrets.compare_digest(body.current_password, current_password):
+            raise HTTPException(401, "current password is incorrect")
+        new_username = body.new_username.strip()
+        if not new_username:
+            raise HTTPException(400, "new username is required")
+        if body.new_password != body.confirm_password:
+            raise HTTPException(400, "new passwords do not match")
+        if len(body.new_password) < 8 or is_unsafe_admin_password(body.new_password):
+            raise HTTPException(400, "new password is too weak")
+        candidate = deep_merge(
+            CFG,
+            {"server": {"admin_username": new_username, "admin_password": body.new_password}},
+        )
+        save_config(candidate)
+        CFG = candidate
     revoke_all_admin_sessions("credentials_updated")
     return {"ok": True}
 
@@ -7091,35 +7125,36 @@ def get_settings(_=Depends(require_admin)):
 @app.put("/api/admin/settings")
 def put_settings(body: SettingsIn, _=Depends(require_admin)):
     global CFG
-    if hasattr(body, "model_dump"):
-        update = body.model_dump(exclude_unset=True)
-    else:
-        update = body.dict(exclude_unset=True)
-    data = clean_settings_update(update)
-    candidate = deep_merge(CFG, data)
-    pool_cfg = candidate.get("pool", {})
-    min_accounts = pool_cfg.get("min_accounts", 0)
-    maintain_target = pool_cfg.get("maintain_target", 0)
-    if maintain_target < min_accounts:
-        raise HTTPException(
-            status_code=422,
-            detail=[
-                {
-                    "type": "value_error",
-                    "loc": ["body", "pool", "maintain_target"],
-                    "msg": "Value error, maintain_target must be greater than or equal to min_accounts",
-                    "input": maintain_target,
-                }
-            ],
-        )
-    restart_required = candidate.get("server", {}).get("port") != CFG.get("server", {}).get("port")
-    save_config(candidate)
-    CFG = candidate
-    return {
-        "ok": True,
-        "config": public_config(CFG),
-        "restart_required": restart_required,
-    }
+    with CONFIG_LOCK:
+        if hasattr(body, "model_dump"):
+            update = body.model_dump(exclude_unset=True)
+        else:
+            update = body.dict(exclude_unset=True)
+        data = clean_settings_update(update)
+        candidate = deep_merge(CFG, data)
+        pool_cfg = candidate.get("pool", {})
+        min_accounts = pool_cfg.get("min_accounts", 0)
+        maintain_target = pool_cfg.get("maintain_target", 0)
+        if maintain_target < min_accounts:
+            raise HTTPException(
+                status_code=422,
+                detail=[
+                    {
+                        "type": "value_error",
+                        "loc": ["body", "pool", "maintain_target"],
+                        "msg": "Value error, maintain_target must be greater than or equal to min_accounts",
+                        "input": maintain_target,
+                    }
+                ],
+            )
+        restart_required = candidate.get("server", {}).get("port") != CFG.get("server", {}).get("port")
+        save_config(candidate)
+        CFG = candidate
+        return {
+            "ok": True,
+            "config": public_config(CFG),
+            "restart_required": restart_required,
+        }
 
 
 @app.get("/api/accounts")
@@ -7784,30 +7819,34 @@ async function init() {
   document.getElementById('status-text').textContent = `就绪 — ${v} 可用账号`;
   document.getElementById('gw-url').textContent = location.origin + '/v1/generate';
   document.getElementById('gw-example').textContent =
-    'curl -H "Authorization: Bearer <key>" -H "Content-Type: application/json" -d \'{"kind":"image","prompt":"hello"}\' ' + location.origin + '/v1/generate';
+    'curl -H "Authorization: Bearer <key>" -H "Content-Type: application/json" -d \\'{"kind":"image","prompt":"hello"}\\' ' + location.origin + '/v1/generate';
 }
 function copyExample() { copyText(document.getElementById('gw-example').textContent); }
 
 // === Accounts ===
 let state = {accounts:[],tasks:[],apikeys:[],clients:[],usage:[],uploads:[],costReport:[],auditLogs:[],settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}}};
-function formatApiError(detail){
+function formatApiError(payload, fallback='request failed'){
+  let detail=payload;
+  if(payload && typeof payload === 'object' && !Array.isArray(payload)){
+    detail=payload.detail ?? payload.error?.message ?? payload.message;
+  }
   if(Array.isArray(detail)){
     return detail.map(item => {
       const location=Array.isArray(item?.loc) ? item.loc.filter(part => part !== 'body').join('.') : '';
       const message=item?.msg || String(item);
       return location ? `${location}: ${message}` : message;
-    }).join('\n');
+    }).join('\\n');
   }
   if(detail && typeof detail === 'object') return detail.message || JSON.stringify(detail);
-  return String(detail || 'request failed');
+  return String(detail || fallback);
 }
 async function api(m,u,b){
   const o={method:m,headers:authHeaders()};
   if(b) o.body=JSON.stringify(b);
   const r = await fetch(BASE+u,o);
   const data = await r.json().catch(()=>({}));
-  if (r.status === 401) throw new Error(formatApiError(data.detail || 'unauthorized'));
-  if (!r.ok) throw new Error(formatApiError(data.detail || 'request failed'));
+  if (r.status === 401) throw new Error(formatApiError(data, 'unauthorized'));
+  if (!r.ok) throw new Error(formatApiError(data, 'request failed'));
   return data;
 }
 function escapeHtml(value){
@@ -8302,8 +8341,14 @@ async function saveSettings(){
     const mailKey=document.getElementById('s-mail-key').value;
     if(mailKey) body.mail.api_key=mailKey;
     const r=await api('PUT','/api/admin/settings',body);
-    await loadSettings();
-    alert(r.restart_required ? '✅ 已保存，服务端口变更需重启后生效' : '✅ 已保存');
+    const restartMessage=r.restart_required ? '，服务端口变更需重启后生效' : '';
+    try{
+      await loadSettings();
+    }catch(refreshError){
+      alert('⚠️ 已保存但刷新失败'+restartMessage+'：'+(refreshError?.message || String(refreshError)));
+      return;
+    }
+    alert('✅ 已保存'+restartMessage);
   }catch(error){
     alert('❌ 保存失败：'+(error?.message || String(error)));
   }
