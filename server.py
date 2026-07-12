@@ -2523,6 +2523,13 @@ class SettingsIn(BaseModel):
     mail: Optional[Dict[str, Any]] = None
     pool: Optional[PoolSettingsIn] = None
 
+    @field_validator("server", "oreate", "mail", "pool", mode="before")
+    @classmethod
+    def reject_null_sections(cls, value: Any) -> Any:
+        if value is None:
+            raise PydanticCustomError("dict_type", "Input should be a valid object")
+        return value
+
 
 class AdminCredentialsIn(BaseModel):
     current_password: str
@@ -7084,7 +7091,11 @@ def get_settings(_=Depends(require_admin)):
 @app.put("/api/admin/settings")
 def put_settings(body: SettingsIn, _=Depends(require_admin)):
     global CFG
-    data = clean_settings_update(model_data(body))
+    if hasattr(body, "model_dump"):
+        update = body.model_dump(exclude_unset=True)
+    else:
+        update = body.dict(exclude_unset=True)
+    data = clean_settings_update(update)
     candidate = deep_merge(CFG, data)
     pool_cfg = candidate.get("pool", {})
     min_accounts = pool_cfg.get("min_accounts", 0)
