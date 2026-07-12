@@ -3923,8 +3923,8 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("estimated_point_cost", html)
         self.assertIn("actual_point_cost", html)
         self.assertIn("error_code", html)
-        self.assertIn("createClient", html)
         self.assertIn("client_id", html)
+        self.assertNotIn('onclick="createClient()"', html)
         self.assertIn("loadCostReport", html)
         self.assertIn("/api/admin/cost-report", html)
         self.assertIn("loadAuditLogs", html)
@@ -3936,6 +3936,30 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("/api/admin/backup", html)
         self.assertIn("/api/admin/restore", html)
 
+    def test_admin_html_treats_api_key_as_customer_and_uses_an_editor_drawer(self):
+        html = server.ADMIN_HTML
+
+        self.assertIn('id="apikeys-key-panel"', html)
+        self.assertIn('id="apikey-editor-backdrop"', html)
+        self.assertIn('id="apikey-editor"', html)
+        self.assertIn("openApiKeyEditor", html)
+        self.assertIn("closeApiKeyEditor", html)
+        self.assertIn("copyApiKey", html)
+        self.assertIn("客户名称", html)
+        self.assertIn("每日点数额度", html)
+        self.assertNotIn('id="clients-tbody"', html)
+        self.assertNotIn('id="client-name"', html)
+        self.assertNotIn('onclick="createClient()"', html)
+
+        script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+        render_start = script.index("function renderApiKeys(")
+        render_end = script.index("function renderClients(", render_start)
+        render_source = script[render_start:render_end]
+        self.assertNotIn('id="ak-rate-${k.id}"', render_source)
+        self.assertNotIn('id="ak-point-${k.id}"', render_source)
+        self.assertIn("今日用量", html)
+        self.assertIn("编辑", render_source)
+
     def test_admin_html_preserves_api_key_limit_semantics(self):
         html = server.ADMIN_HTML
         self.assertIn("function optionalNonNegativeIntegerValue", html)
@@ -3945,15 +3969,16 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("daily_request_limit:optionalNonNegativeIntegerValue(", html)
         self.assertIn("daily_point_limit:optionalNonNegativeIntegerValue(", html)
         self.assertIn("function apiKeyLimitInputValue", html)
-        self.assertIn('value="${apiKeyLimitInputValue(k.rate_limit_per_minute)}"', html)
-        self.assertIn('value="${apiKeyLimitInputValue(k.daily_request_limit)}"', html)
-        self.assertIn('value="${apiKeyLimitInputValue(k.daily_point_limit)}"', html)
+        self.assertIn("apiKeyLimitInputValue(key?.rate_limit_per_minute)", html)
+        self.assertIn("apiKeyLimitInputValue(key?.daily_request_limit)", html)
+        self.assertIn("apiKeyLimitInputValue(key?.daily_point_limit)", html)
         self.assertIn("k.status", html)
         self.assertIn("k.status ?? (k.enabled ? 'enabled':'disabled')", html)
         self.assertIn("apiKeyStatusTagClass", html)
         self.assertIn("escapeHtml(adminLabel('apiKeyStatus',keyStatus))", html)
         self.assertIn("escapeHtml(k.key_preview||'')", html)
-        self.assertIn("留空=继承，0=不限", html)
+        self.assertIn('placeholder="留空继承"', html)
+        self.assertIn("0 表示不限额", html)
 
         node = shutil.which("node")
         self.assertIsNotNone(node, "Node.js is required to execute the API key limit helper test")
@@ -3964,18 +3989,15 @@ class GatewayHardeningTests(unittest.TestCase):
             end = script.index(end_marker, start)
             return script[start:end].strip()
 
-        escape_source = source_between("function escapeHtml(", "function normalizedOptionValues(")
         scope_source = source_between("function scopeCsv(", "function optionalNonNegativeIntegerValue(")
         helper_source = source_between("function optionalNonNegativeIntegerValue(", "function apiKeyLimitInputValue(")
         input_value_source = source_between("function apiKeyLimitInputValue(", "function apiKeyStatusTagClass(")
-        status_source = source_between("function apiKeyStatusTagClass(", "function renderApiKeys(")
-        render_source = source_between("function renderApiKeys(", "function renderClients(")
-        update_source = source_between("async function updateApiKeyPolicy(", "async function deleteKey(")
+        editor_body_source = source_between("function apiKeyEditorBody(", "async function createApiKey(")
+        update_source = source_between("async function updateApiKeyPolicy(", "async function saveApiKeyEditor(")
         self.assertNotIn("await loadClients();", update_source)
         node_program = f"""
 {helper_source}
 {input_value_source}
-{status_source}
 const validCases = [
   ['', null],
   ['   ', null],
@@ -4020,64 +4042,33 @@ for (const [input, expected] of [
     throw new Error(`render value ${{JSON.stringify(input)}}: expected ${{JSON.stringify(expected)}}, got ${{JSON.stringify(actual)}}`);
   }}
 }}
-for (const [status, expectedClass] of Object.entries({{
-  enabled: 'tag-green',
-  disabled: 'tag-gray',
-  expired: 'tag-red',
-  deleted: 'tag-gray',
-  unknown: 'tag-gray',
-}})) {{
-  const actualClass = apiKeyStatusTagClass(status);
-  if (actualClass !== expectedClass) {{
-    throw new Error(`${{status}}: expected ${{expectedClass}}, got ${{actualClass}}`);
-  }}
-}}
-{escape_source}
 {scope_source}
-const tbody = {{innerHTML: ''}};
-const state = {{apikeys: [
-  {{
-    id: 1,
-    key_preview: '"><img src=x onerror=alert(1)>',
-    name: 'malicious',
-    client_name: 'client',
-    status: 'evil" onclick="alert(1)',
-    rate_limit_per_minute: '" onfocus="alert(1)',
-    daily_request_limit: 0,
-    daily_point_limit: 17,
-  }},
-  {{id: 2, enabled: true, key_preview: 'enabled-key'}},
-  {{id: 3, enabled: false, key_preview: 'disabled-key'}},
-]}};
-const renderDocument = {{getElementById: id => {{
-  if (id !== 'apikeys-tbody') throw new Error(`unexpected render element ${{id}}`);
-  return tbody;
-}}}};
-{render_source.replace("document.getElementById", "renderDocument.getElementById")}
-renderApiKeys();
-if (tbody.innerHTML.includes('onfocus=')) throw new Error('malicious limit escaped the value attribute');
-if (tbody.innerHTML.includes('<img')) throw new Error('key preview was not escaped');
-if (!tbody.innerHTML.includes('&lt;img src=x onerror=alert(1)&gt;')) throw new Error('escaped key preview missing');
-if (tbody.innerHTML.includes('class="tag evil')) throw new Error('untrusted status entered the class attribute');
-if (tbody.innerHTML.includes('evil" onclick=')) throw new Error('status text was not escaped');
-if (!tbody.innerHTML.includes('evil&quot; onclick=&quot;alert(1)')) throw new Error('escaped status text missing');
-if (!tbody.innerHTML.includes('class="tag tag-green">启用</span>')) throw new Error('enabled fallback missing');
-if (!tbody.innerHTML.includes('class="tag tag-gray">停用</span>')) throw new Error('disabled fallback missing');
-if (!tbody.innerHTML.includes('value="0"')) throw new Error('zero limit was not rendered');
-if (!tbody.innerHTML.includes('value="17"')) throw new Error('positive limit was not rendered');
 const fields = {{
-  'ak-rate-9': {{value: ''}},
-  'ak-req-9': {{value: '0'}},
-  'ak-point-9': {{value: '17'}},
-  'ak-kinds-9': {{value: 'image'}},
-  'ak-models-9': {{value: ''}},
-  'ak-scenes-9': {{value: ''}},
-  'ak-resolutions-9': {{value: ''}},
-  'ak-durations-9': {{value: ''}},
-  'ak-uploads-9': {{checked: true}},
-  'ak-experimental-9': {{checked: false}},
+  'ak-editor-name': {{value: '测试客户'}},
+  'ak-editor-note': {{value: '标准套餐'}},
+  'ak-editor-rate': {{value: ''}},
+  'ak-editor-requests': {{value: '0'}},
+  'ak-editor-points': {{value: '17'}},
+  'ak-editor-kind-image': {{checked: true}},
+  'ak-editor-kind-video': {{checked: false}},
+  'ak-editor-models': {{value: 'model-a, model-a, model-b'}},
+  'ak-editor-scenes': {{value: ''}},
+  'ak-editor-resolutions': {{value: '1K,4K'}},
+  'ak-editor-durations': {{value: '5,10'}},
+  'ak-editor-uploads': {{checked: true}},
+  'ak-editor-experimental': {{checked: false}},
+  'ak-editor-enabled': {{checked: true}},
 }};
 const document = {{getElementById: id => fields[id]}};
+{editor_body_source}
+const editorBody = apiKeyEditorBody();
+const expectedEditorLimits = {{rate_limit_per_minute: null, daily_request_limit: 0, daily_point_limit: 17}};
+for (const [field, value] of Object.entries(expectedEditorLimits)) {{
+  if (editorBody[field] !== value) throw new Error(`${{field}} editor value mismatch`);
+}}
+if (JSON.stringify(editorBody.allowed_models) !== JSON.stringify(['model-a','model-b'])) {{
+  throw new Error(`model scope was not normalized: ${{JSON.stringify(editorBody.allowed_models)}}`);
+}}
 let capturedBody = undefined;
 let patchCalls = 0;
 async function api(method, path, body) {{
@@ -4091,7 +4082,7 @@ const alerts = [];
 function alert(message) {{ alerts.push(message); }}
 {update_source}
 (async () => {{
-  await updateApiKeyPolicy(9);
+  await updateApiKeyPolicy(9, editorBody);
   if (alerts.length) throw new Error(`unexpected alert: ${{alerts.join(' | ')}}`);
   const expected = {{rate_limit_per_minute: null, daily_request_limit: 0, daily_point_limit: 17}};
   for (const [field, value] of Object.entries(expected)) {{
@@ -4103,7 +4094,7 @@ function alert(message) {{ alerts.push(message); }}
     }}
   }}
   loadApiKeys = async () => {{ throw new Error('refresh boom'); }};
-  await updateApiKeyPolicy(9);
+  await updateApiKeyPolicy(9, editorBody);
   if (patchCalls !== 2) throw new Error(`expected two successful PATCH calls, got ${{patchCalls}}`);
   if (alerts.length !== 1 || !alerts[0].includes('已保存但刷新失败')) {{
     throw new Error(`refresh failure alert was misleading: ${{alerts.join(' | ')}}`);
@@ -4287,7 +4278,6 @@ function alert(message) {{ alerts.push(String(message)); }}
             "usage-filter-kind",
             "usage-filter-status",
             "usage-filter-model-name",
-            "usage-filter-client-id",
             "usage-filter-api-key-id",
             "usage-filter-account-id",
             "usage-filter-error-code",
@@ -4622,6 +4612,60 @@ if (!listPageSummary(page).includes('共 0 条')) throw new Error(`empty summary
         self.assertEqual(item["rate_limit_per_minute"], 7)
         self.assertEqual(item["daily_request_limit"], 11)
         self.assertEqual(item["daily_point_limit"], 13)
+
+    def test_admin_can_create_customer_key_with_limits_and_update_its_identity(self):
+        response = self.client.post(
+            "/api/admin/apikeys",
+            headers=self.admin_headers(),
+            json={
+                "name": "上海演示客户",
+                "rate_limit_per_minute": 7,
+                "daily_request_limit": 80,
+                "daily_point_limit": 1200,
+                "enabled": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        item = response.json()["item"]
+        self.assertEqual(item["name"], "上海演示客户")
+        self.assertEqual(item["rate_limit_per_minute"], 7)
+        self.assertEqual(item["daily_request_limit"], 80)
+        self.assertEqual(item["daily_point_limit"], 1200)
+        self.assertEqual(item["status"], "disabled")
+
+        updated = self.client.patch(
+            f"/api/admin/apikeys/{item['id']}",
+            headers=self.admin_headers(),
+            json={"name": "上海正式客户", "enabled": True},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["item"]["name"], "上海正式客户")
+        self.assertEqual(updated.json()["item"]["status"], "enabled")
+
+    def test_admin_can_copy_a_key_through_an_authenticated_secret_endpoint(self):
+        created_response = self.client.post(
+            "/api/admin/apikeys",
+            headers=self.admin_headers(),
+            json={"name": "复制测试客户"},
+        )
+        self.assertEqual(created_response.status_code, 200)
+        created = created_response.json()["item"]
+
+        unauthorized = self.client.get(f"/api/admin/apikeys/{created['id']}/secret")
+        self.assertEqual(unauthorized.status_code, 401)
+
+        revealed = self.client.get(
+            f"/api/admin/apikeys/{created['id']}/secret",
+            headers=self.admin_headers(),
+        )
+        self.assertEqual(revealed.status_code, 200)
+        self.assertEqual(revealed.json()["key"], created["key"])
+        self.assertEqual(revealed.json()["id"], created["id"])
+
+        listed = self.client.get("/api/admin/apikeys", headers=self.admin_headers())
+        listed_item = next(value for value in listed.json()["items"] if value["id"] == created["id"])
+        self.assertNotIn("key", listed_item)
 
     def test_api_key_scope_columns_exist(self):
         conn = server.db_conn()

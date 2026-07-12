@@ -5670,19 +5670,66 @@ def optional_text_payload_value(payload: Dict[str, Any], field: str, current: Op
     return str(payload.get(field) or "").strip()
 
 
+def optional_non_negative_integer_payload_value(
+    payload: Dict[str, Any],
+    field: str,
+    current: Optional[sqlite3.Row] = None,
+) -> Optional[int]:
+    if field not in payload:
+        return current[field] if current is not None else None
+    value = payload.get(field)
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        raise HTTPException(400, f"{field} must be a non-negative integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"{field} must be a non-negative integer")
+    if str(value).strip() != str(parsed) or parsed < 0:
+        raise HTTPException(400, f"{field} must be a non-negative integer")
+    return parsed
+
+
 @app.get("/api/admin/apikeys")
 def list_api_keys(_=Depends(require_admin)):
     conn = db_conn()
     rows = conn.execute(
         """
-        SELECT api_keys.*, clients.name AS client_name, clients.contact AS client_contact, clients.status AS client_status
+        SELECT
+            api_keys.*,
+            clients.name AS client_name,
+            clients.contact AS client_contact,
+            clients.status AS client_status,
+            COALESCE(today.request_count, 0) AS today_request_count,
+            COALESCE(today.point_usage, 0) AS today_point_usage
         FROM api_keys
         LEFT JOIN clients ON clients.id=api_keys.client_id
+        LEFT JOIN (
+            SELECT
+                api_key_id,
+                COUNT(*) AS request_count,
+                COALESCE(SUM(estimated_point_cost), 0) AS point_usage
+            FROM usage_log
+            WHERE created_at>=?
+            GROUP BY api_key_id
+        ) AS today ON today.api_key_id=api_keys.id
         ORDER BY api_keys.id DESC
-        """
+        """,
+        (day_start_timestamp(time.time()),),
     ).fetchall()
     conn.close()
     return {"items": [public_api_key(r) for r in rows]}
+
+
+@app.get("/api/admin/apikeys/{key_id}/secret")
+def reveal_api_key_secret(key_id: int, _=Depends(require_admin)):
+    conn = db_conn()
+    row = conn.execute("SELECT id, key FROM api_keys WHERE id=?", (key_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "api key not found")
+    return {"id": row["id"], "key": row["key"]}
 
 
 @app.get("/api/admin/clients")
@@ -5738,7 +5785,7 @@ def patch_video_scene_policy(scene_id: str, body: Dict[str, Any], _=Depends(requ
 @app.post("/api/admin/apikeys")
 def create_api_key(body: Dict[str, Any] = None, _=Depends(require_admin)):
     payload = body or {}
-    name = payload.get("name", "")
+    name = str(payload.get("name") or "").strip()
     client_id = payload.get("client_id")
     client_id_value = None
     if client_id not in (None, ""):
@@ -5753,16 +5800,19 @@ def create_api_key(body: Dict[str, Any] = None, _=Depends(require_admin)):
     rotated_from_id = optional_api_key_id_payload_value(payload, "rotated_from_id")
     rotation_note = optional_text_payload_value(payload, "rotation_note")
     disabled_reason = optional_text_payload_value(payload, "disabled_reason")
-    enabled = 0 if disabled_reason else 1
+    enabled = int(parse_boolean_flag(payload.get("enabled"), "enabled")) if "enabled" in payload else 1
+    if disabled_reason:
+        enabled = 0
     conn = db_conn()
     conn.execute(
         """
         INSERT INTO api_keys (
             client_id, key, name, enabled, created_at,
+            rate_limit_per_minute, daily_request_limit, daily_point_limit,
             allowed_kinds, allowed_models, allowed_scenes,
             allow_uploads, allow_experimental, allowed_resolutions, allowed_durations,
             expires_at, rotated_from_id, rotation_note, disabled_reason
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             client_id_value,
@@ -5770,6 +5820,9 @@ def create_api_key(body: Dict[str, Any] = None, _=Depends(require_admin)):
             name,
             enabled,
             time.time(),
+            optional_non_negative_integer_payload_value(payload, "rate_limit_per_minute"),
+            optional_non_negative_integer_payload_value(payload, "daily_request_limit"),
+            optional_non_negative_integer_payload_value(payload, "daily_point_limit"),
             scopes["allowed_kinds"],
             scopes["allowed_models"],
             scopes["allowed_scenes"],
@@ -5801,15 +5854,6 @@ def create_api_key(body: Dict[str, Any] = None, _=Depends(require_admin)):
 def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_admin)):
     payload = body or {}
 
-    def limit_value(name: str) -> Optional[int]:
-        value = payload.get(name)
-        if value in (None, ""):
-            return None
-        value = int(value)
-        if value < 0:
-            raise HTTPException(400, f"{name} must be non-negative")
-        return value
-
     conn = db_conn()
     current = conn.execute("SELECT * FROM api_keys WHERE id=?", (key_id,)).fetchone()
     if not current:
@@ -5837,10 +5881,11 @@ def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_a
         enabled = 0
     else:
         enabled = int(current["enabled"])
+    name = optional_text_payload_value(payload, "name", current)
     conn.execute(
         """
         UPDATE api_keys
-        SET client_id=?, rate_limit_per_minute=?, daily_request_limit=?, daily_point_limit=?,
+        SET client_id=?, name=?, rate_limit_per_minute=?, daily_request_limit=?, daily_point_limit=?,
             allowed_kinds=?, allowed_models=?, allowed_scenes=?,
             allow_uploads=?, allow_experimental=?, allowed_resolutions=?, allowed_durations=?,
             expires_at=?, rotated_from_id=?, rotation_note=?, disabled_reason=?, enabled=?
@@ -5848,9 +5893,10 @@ def update_api_key_policy(key_id: int, body: Dict[str, Any], _=Depends(require_a
         """,
         (
             client_id_value,
-            limit_value("rate_limit_per_minute"),
-            limit_value("daily_request_limit"),
-            limit_value("daily_point_limit"),
+            name,
+            optional_non_negative_integer_payload_value(payload, "rate_limit_per_minute", current),
+            optional_non_negative_integer_payload_value(payload, "daily_request_limit", current),
+            optional_non_negative_integer_payload_value(payload, "daily_point_limit", current),
             scopes["allowed_kinds"],
             scopes["allowed_models"],
             scopes["allowed_scenes"],
@@ -6127,7 +6173,7 @@ def get_cost_report(
         SELECT
             date(datetime(u.created_at, 'unixepoch', 'localtime')) AS report_date,
             k.client_id AS client_id,
-            COALESCE(c.name, '') AS client_name,
+            COALESCE(NULLIF(c.name, ''), NULLIF(k.name, ''), '') AS client_name,
             u.api_key_id AS api_key_id,
             COALESCE(k.name, '') AS api_key_name,
             u.account_id AS account_id,
@@ -7958,6 +8004,60 @@ tr:hover td{background:#fafafa}
 .list-pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:12px;min-height:32px}
 .list-status{font-size:12px;color:#6e6e73;margin-right:auto}
 .list-status.error{color:#c62828}
+.apikey-shell{display:flex;flex-direction:column;gap:18px}
+.apikey-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.apikey-header h2{margin-bottom:5px}
+.apikey-subtitle{font-size:13px;color:#6e6e73;line-height:1.6}
+.apikey-tabs{display:flex;gap:6px;padding:4px;background:#f5f5f7;border-radius:10px;width:max-content}
+.apikey-tab{padding:7px 14px;background:transparent;color:#6e6e73;border-radius:7px;font-size:13px}
+.apikey-tab.active{background:#fff;color:#1d1d1f;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.apikey-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.apikey-summary-card{border:1px solid #e5e5e5;border-radius:12px;padding:14px 16px;background:#fafafa}
+.apikey-summary-card strong{display:block;font-size:22px;line-height:1.2}
+.apikey-summary-card span{display:block;margin-top:4px;color:#86868b;font-size:12px}
+.apikey-toolbar{display:grid;grid-template-columns:minmax(220px,1fr) 170px auto;gap:10px;align-items:end}
+.apikey-name{font-weight:600;color:#1d1d1f}
+.apikey-meta{font-size:11px;color:#86868b;margin-top:4px;line-height:1.45}
+.apikey-value{display:flex;align-items:center;gap:8px}
+.apikey-value code{font-size:11px;color:#3a3a3c;background:#f5f5f7;padding:5px 8px;border-radius:6px}
+.apikey-actions{display:flex;gap:6px;white-space:nowrap}
+.quota-cell{min-width:155px}
+.quota-main{font-weight:600;font-variant-numeric:tabular-nums}
+.quota-sub{font-size:11px;color:#86868b;margin-top:3px}
+.quota-track{height:5px;background:#ececf0;border-radius:999px;margin-top:7px;overflow:hidden}
+.quota-fill{height:100%;background:#1d1d1f;border-radius:999px;transition:width .25s}
+.scope-summary{font-size:12px;line-height:1.55;max-width:190px;color:#3a3a3c}
+.empty-state{text-align:center;padding:42px 16px;color:#86868b}
+.drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.32);z-index:190;opacity:1;transition:opacity .2s}
+.drawer{position:fixed;top:0;right:0;width:min(520px,100vw);height:100vh;background:#fff;z-index:200;box-shadow:-16px 0 40px rgba(0,0,0,.14);display:flex;flex-direction:column;animation:drawerIn .25s cubic-bezier(.22,1,.36,1)}
+.drawer-header{display:flex;justify-content:space-between;gap:16px;padding:22px 24px;border-bottom:1px solid #e5e5e5}
+.drawer-header h3{font-size:18px;margin-bottom:4px}
+.drawer-header p{font-size:12px;color:#86868b}
+.drawer-close{width:34px;height:34px;padding:0;border-radius:50%;background:#f0f0f0;font-size:20px;line-height:1}
+.drawer-body{padding:22px 24px;overflow:auto;flex:1}
+.drawer-section{padding-bottom:22px;margin-bottom:22px;border-bottom:1px solid #ededf0}
+.drawer-section:last-child{border-bottom:none;margin-bottom:0}
+.drawer-section-title{font-size:14px;font-weight:600;margin-bottom:12px}
+.drawer-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.drawer-help{font-size:11px;color:#86868b;line-height:1.55;margin-top:6px}
+.drawer-switches{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.drawer-switch{display:flex;align-items:center;gap:9px;border:1px solid #e5e5e5;border-radius:10px;padding:11px 12px;color:#3a3a3c;font-size:13px}
+.drawer-switch input{width:auto}
+.drawer-footer{display:flex;justify-content:flex-end;gap:8px;padding:16px 24px;border-top:1px solid #e5e5e5;background:#fff}
+.secret-card{background:#f5f5f7;border:1px solid #e5e5e5;border-radius:12px;padding:14px;margin-top:12px}
+.secret-card code{display:block;word-break:break-all;font-size:12px;line-height:1.6;margin-bottom:10px}
+.operations-stack{display:flex;flex-direction:column;gap:24px}
+@keyframes drawerIn{from{transform:translateX(24px);opacity:.4}to{transform:translateX(0);opacity:1}}
+@media(max-width:760px){
+  .container{padding:16px}
+  .nav{padding:12px 16px;overflow-x:auto}
+  .apikey-header{flex-direction:column}
+  .apikey-summary{grid-template-columns:1fr}
+  .apikey-toolbar{grid-template-columns:1fr}
+  .drawer{width:100vw}
+  .drawer-grid,.drawer-switches{grid-template-columns:1fr}
+  .apikey-actions{flex-wrap:wrap}
+}
 button:disabled{cursor:not-allowed;opacity:.5;transform:none}
 .hidden{display:none!important}
 @keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
@@ -8098,123 +8198,158 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
 
 <!-- Tab: API Keys -->
 <div id="tab-apikeys" class="section hidden">
-  <h2>🔑 API Keys</h2>
-  <h3 style="margin-top:0;font-size:14px">客户</h3>
-  <div class="row" style="margin-bottom:16px">
-    <div class="col"><input id="client-name" placeholder="客户名称"></div>
-    <div class="col"><input id="client-contact" placeholder="联系方式"></div>
-    <div><button class="btn-primary" onclick="createClient()">创建客户</button></div>
-  </div>
-  <div style="margin-bottom:16px">
-    <div class="endpoint-box">
-      <div class="url">POST /v1/generate</div>
-      <div class="desc">请求头: <code>Authorization: Bearer &lt;你的 API Key&gt;</code></div>
+  <div class="apikey-shell">
+    <div class="apikey-header">
+      <div>
+        <h2>API Key 管理</h2>
+        <div class="apikey-subtitle">一个 Key 对应一个客户，可独立设置额度、访问范围和启用状态。</div>
+      </div>
+      <div class="apikey-tabs" role="tablist" aria-label="API Key 页面">
+        <button id="apikey-tab-keys" class="apikey-tab active" onclick="switchApiKeyPanel('keys')" role="tab">Key 管理</button>
+        <button id="apikey-tab-operations" class="apikey-tab" onclick="switchApiKeyPanel('operations')" role="tab">调用日志</button>
+      </div>
+    </div>
+
+    <div id="apikeys-key-panel">
+      <div class="apikey-summary">
+        <div class="apikey-summary-card"><strong id="ak-summary-total">0</strong><span>客户 / Key 总数</span></div>
+        <div class="apikey-summary-card"><strong id="ak-summary-enabled">0</strong><span>当前启用</span></div>
+        <div class="apikey-summary-card"><strong id="ak-summary-usage">0</strong><span>今日用量（点数）</span></div>
+      </div>
+      <div class="endpoint-box" style="margin-top:14px">
+        <div class="url">POST /v1/generate</div>
+        <div class="desc">请求头：<code>Authorization: Bearer &lt;API Key&gt;</code></div>
+      </div>
+      <div class="apikey-toolbar">
+        <div><label>搜索客户或 Key</label><input id="ak-search" placeholder="客户名称、Key 前缀" oninput="renderApiKeys()"></div>
+        <div><label>状态</label><select id="ak-status-filter" onchange="renderApiKeys()"><option value="">全部状态</option><option value="enabled">启用</option><option value="disabled">停用</option><option value="expired">已过期</option><option value="deleted">已删除</option></select></div>
+        <button class="btn-primary" onclick="openApiKeyEditor()">创建客户 Key</button>
+      </div>
+      <div class="table-wrap" style="margin-top:14px">
+        <table>
+          <thead><tr><th>客户</th><th>API Key</th><th>状态</th><th>今日额度</th><th>访问范围</th><th>最后使用</th><th>操作</th></tr></thead>
+          <tbody id="apikeys-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div id="apikeys-operations-panel" class="hidden">
+      <div class="operations-stack">
+        <div>
+          <h2>用量日志</h2>
+          <div class="list-filters">
+            <div><label>类型</label><select id="usage-filter-kind"><option value="">全部</option><option value="image">图片</option><option value="video">视频</option></select></div>
+            <div><label>状态</label><select id="usage-filter-status"><option value="">全部</option><option value="queued">待处理</option><option value="running">生成中</option><option value="submitted">已提交</option><option value="hydrating">获取结果中</option><option value="completed">已完成</option><option value="failed">失败</option><option value="expired">已过期</option><option value="cancelled">已取消</option></select></div>
+            <div><label>模型</label><input id="usage-filter-model-name" placeholder="模型名"></div>
+            <div><label>客户 Key ID</label><input id="usage-filter-api-key-id" type="number" min="1" step="1"></div>
+            <div><label>账号 ID</label><input id="usage-filter-account-id" type="number" min="1" step="1"></div>
+            <div><label>错误码</label><input id="usage-filter-error-code" placeholder="error_code"></div>
+            <div><label>开始日期</label><input id="usage-filter-date-from" type="date"></div>
+            <div><label>结束日期</label><input id="usage-filter-date-to" type="date"></div>
+            <div><label>每页</label><select id="usage-page-size"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></div>
+          </div>
+          <div class="list-filter-actions">
+            <button class="btn-primary btn-sm" onclick="applyUsageFilters()">应用筛选</button>
+            <button class="btn-secondary btn-sm" onclick="resetUsageFilters()">重置</button>
+            <button class="btn-secondary btn-sm" onclick="void loadUsage().catch(()=>{})">刷新</button>
+          </div>
+          <div class="table-wrap">
+            <table><thead><tr><th>ID</th><th>类型</th><th>账号</th><th>模型</th><th>点数</th><th>错误码</th><th>状态</th><th>提示词</th><th>时间</th></tr></thead><tbody id="usage-tbody"></tbody></table>
+          </div>
+          <div class="list-pagination"><span id="usage-list-status" class="list-status"></span><button id="usage-prev" class="btn-secondary btn-sm" onclick="previousUsagePage()">上一页</button><button id="usage-next" class="btn-secondary btn-sm" onclick="nextUsagePage()">下一页</button></div>
+        </div>
+
+        <div>
+          <h2>上传素材</h2>
+          <div class="list-filters">
+            <div><label>类型</label><select id="upload-filter-kind"><option value="">全部</option><option value="image">图片</option><option value="video">视频</option></select></div>
+            <div><label>状态</label><select id="upload-filter-status"><option value="">全部</option><option value="pending">待处理</option><option value="uploading">上传中</option><option value="completed">已完成</option><option value="failed">失败</option><option value="deleted">已删除</option></select></div>
+            <div><label>客户 Key ID</label><input id="upload-filter-api-key-id" type="number" min="1" step="1"></div>
+            <div><label>账号 ID</label><input id="upload-filter-account-id" type="number" min="1" step="1"></div>
+            <div><label>开始日期</label><input id="upload-filter-date-from" type="date"></div>
+            <div><label>结束日期</label><input id="upload-filter-date-to" type="date"></div>
+            <div><label>每页</label><select id="upload-page-size"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></div>
+          </div>
+          <div class="list-filter-actions">
+            <button class="btn-primary btn-sm" onclick="applyUploadFilters()">应用筛选</button>
+            <button class="btn-secondary btn-sm" onclick="resetUploadFilters()">重置</button>
+            <button class="btn-secondary btn-sm" onclick="void loadUploads().catch(()=>{})">刷新</button>
+          </div>
+          <div class="table-wrap">
+            <table><thead><tr><th>ID</th><th>类型</th><th>账号</th><th>Key</th><th>文件</th><th>Object</th><th>关联任务</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody id="uploads-tbody"></tbody></table>
+          </div>
+          <div class="list-pagination"><span id="uploads-list-status" class="list-status"></span><button id="uploads-prev" class="btn-secondary btn-sm" onclick="previousUploadPage()">上一页</button><button id="uploads-next" class="btn-secondary btn-sm" onclick="nextUploadPage()">下一页</button></div>
+        </div>
+
+        <div>
+          <h2>成本报表</h2>
+          <div class="row" style="margin-bottom:16px">
+            <div class="col"><label>开始日期</label><input id="cost-date-from" type="date"></div>
+            <div class="col"><label>结束日期</label><input id="cost-date-to" type="date"></div>
+            <div class="col"><label>模型</label><input id="cost-model-name" placeholder="模型名（可选）"></div>
+            <div class="col" style="align-self:end"><button class="btn-secondary" onclick="loadCostReport()">刷新报表</button></div>
+          </div>
+          <div class="table-wrap">
+            <table><thead><tr><th>日期</th><th>客户 / Key</th><th>账号</th><th>模型</th><th>请求数</th><th>预估点数</th><th>实际点数</th><th>成功扣点</th><th>失败扣点</th></tr></thead><tbody id="cost-report-tbody"></tbody></table>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
-  <div class="row" style="margin-bottom:16px">
-    <div class="col"><input id="ak-name" placeholder="名称（可选）"></div>
-    <div class="col"><select id="ak-client"></select></div>
-    <div><button class="btn-primary" onclick="createApiKey()">创建 Key</button></div>
-  </div>
-  <div class="row" style="margin-bottom:16px">
-    <div class="col"><input id="ak-kinds" placeholder="允许类型：图片(image)、视频(video)"></div>
-    <div class="col"><input id="ak-models" placeholder="允许模型: 逗号分隔"></div>
-    <div class="col"><input id="ak-scenes" placeholder="允许场景: text_or_image"></div>
-  </div>
-  <div class="row" style="margin-bottom:16px">
-    <div class="col"><input id="ak-resolutions" placeholder="允许分辨率: 4K,480"></div>
-    <div class="col"><input id="ak-durations" placeholder="允许时长: 5,10"></div>
-    <div class="col" style="display:flex;gap:16px;align-items:center;padding-top:8px">
-      <label style="display:flex;gap:6px;align-items:center"><input id="ak-allow-uploads" type="checkbox" checked> 允许上传</label>
-      <label style="display:flex;gap:6px;align-items:center"><input id="ak-allow-experimental" type="checkbox"> 允许实验场景</label>
+
+  <div id="apikey-editor-backdrop" class="drawer-backdrop hidden" onclick="closeApiKeyEditor()"></div>
+  <aside id="apikey-editor" class="drawer hidden" role="dialog" aria-modal="true" aria-labelledby="apikey-editor-title">
+    <div class="drawer-header">
+      <div><h3 id="apikey-editor-title">创建客户 Key</h3><p id="apikey-editor-subtitle">创建后即可复制完整 Key。</p></div>
+      <button class="drawer-close" onclick="closeApiKeyEditor()" aria-label="关闭">×</button>
     </div>
-  </div>
-  <div id="ak-new" class="hidden" style="background:#e8f5e9;padding:12px;border-radius:10px;margin-bottom:12px">
-    <strong>新 Key:</strong> <code id="ak-new-value"></code>
-    <button class="copy-btn" onclick="copyKey()">📋 复制</button>
-  </div>
-  <div style="font-size:12px;color:#86868b;margin-bottom:8px">限额设置：留空=继承，0=不限，正整数=自定义。</div>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>ID</th><th>Key</th><th>名称</th><th>客户</th><th>状态</th><th>每分钟</th><th>每日请求</th><th>每日点数</th><th>允许类型</th><th>允许模型</th><th>允许场景</th><th>允许分辨率</th><th>允许时长</th><th>上传</th><th>实验</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead>
-      <tbody id="apikeys-tbody"></tbody>
-    </table>
-  </div>
-  <h2 style="margin-top:24px">👥 客户列表</h2>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>ID</th><th>名称</th><th>联系方式</th><th>状态</th><th>创建时间</th></tr></thead>
-      <tbody id="clients-tbody"></tbody>
-    </table>
-  </div>
-  <h2 style="margin-top:24px">📊 用量日志</h2>
-  <div class="list-filters">
-    <div><label>类型</label><select id="usage-filter-kind"><option value="">全部</option><option value="image">图片</option><option value="video">视频</option></select></div>
-    <div><label>状态</label><select id="usage-filter-status"><option value="">全部</option><option value="queued">待处理</option><option value="running">生成中</option><option value="submitted">已提交</option><option value="hydrating">获取结果中</option><option value="completed">已完成</option><option value="failed">失败</option><option value="expired">已过期</option><option value="cancelled">已取消</option></select></div>
-    <div><label>模型</label><input id="usage-filter-model-name" placeholder="模型名"></div>
-    <div><label>客户 ID</label><input id="usage-filter-client-id" type="number" min="1" step="1"></div>
-    <div><label>API Key ID</label><input id="usage-filter-api-key-id" type="number" min="1" step="1"></div>
-    <div><label>账号 ID</label><input id="usage-filter-account-id" type="number" min="1" step="1"></div>
-    <div><label>错误码</label><input id="usage-filter-error-code" placeholder="error_code"></div>
-    <div><label>开始日期</label><input id="usage-filter-date-from" type="date"></div>
-    <div><label>结束日期</label><input id="usage-filter-date-to" type="date"></div>
-    <div><label>每页</label><select id="usage-page-size"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></div>
-  </div>
-  <div class="list-filter-actions">
-    <button class="btn-primary btn-sm" onclick="applyUsageFilters()">应用筛选</button>
-    <button class="btn-secondary btn-sm" onclick="resetUsageFilters()">重置</button>
-    <button class="btn-secondary btn-sm" onclick="void loadUsage().catch(()=>{})">刷新</button>
-  </div>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>ID</th><th>类型</th><th>账号</th><th>模型</th><th>点数</th><th>错误码</th><th>状态</th><th>提示词</th><th>时间</th></tr></thead>
-      <tbody id="usage-tbody"></tbody>
-    </table>
-  </div>
-  <div class="list-pagination">
-    <span id="usage-list-status" class="list-status"></span>
-    <button id="usage-prev" class="btn-secondary btn-sm" onclick="previousUsagePage()">上一页</button>
-    <button id="usage-next" class="btn-secondary btn-sm" onclick="nextUsagePage()">下一页</button>
-  </div>
-  <h2 style="margin-top:24px">上传素材</h2>
-  <div class="list-filters">
-    <div><label>类型</label><select id="upload-filter-kind"><option value="">全部</option><option value="image">图片</option><option value="video">视频</option></select></div>
-    <div><label>状态</label><select id="upload-filter-status"><option value="">全部</option><option value="pending">待处理</option><option value="uploading">上传中</option><option value="completed">已完成</option><option value="failed">失败</option><option value="deleted">已删除</option></select></div>
-    <div><label>API Key ID</label><input id="upload-filter-api-key-id" type="number" min="1" step="1"></div>
-    <div><label>账号 ID</label><input id="upload-filter-account-id" type="number" min="1" step="1"></div>
-    <div><label>开始日期</label><input id="upload-filter-date-from" type="date"></div>
-    <div><label>结束日期</label><input id="upload-filter-date-to" type="date"></div>
-    <div><label>每页</label><select id="upload-page-size"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></div>
-  </div>
-  <div class="list-filter-actions">
-    <button class="btn-primary btn-sm" onclick="applyUploadFilters()">应用筛选</button>
-    <button class="btn-secondary btn-sm" onclick="resetUploadFilters()">重置</button>
-    <button class="btn-secondary btn-sm" onclick="void loadUploads().catch(()=>{})">刷新</button>
-  </div>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>ID</th><th>类型</th><th>账号</th><th>Key</th><th>文件</th><th>Object</th><th>关联任务</th><th>状态</th><th>时间</th><th>操作</th></tr></thead>
-      <tbody id="uploads-tbody"></tbody>
-    </table>
-  </div>
-  <div class="list-pagination">
-    <span id="uploads-list-status" class="list-status"></span>
-    <button id="uploads-prev" class="btn-secondary btn-sm" onclick="previousUploadPage()">上一页</button>
-    <button id="uploads-next" class="btn-secondary btn-sm" onclick="nextUploadPage()">下一页</button>
-  </div>
-  <h2 style="margin-top:24px">💹 成本报表</h2>
-  <div class="row" style="margin-bottom:16px">
-    <div class="col"><label>开始日期</label><input id="cost-date-from" type="date"></div>
-    <div class="col"><label>结束日期</label><input id="cost-date-to" type="date"></div>
-    <div class="col"><label>模型</label><input id="cost-model-name" placeholder="模型名（可选）"></div>
-    <div class="col" style="align-self:end"><button class="btn-secondary" onclick="loadCostReport()">刷新报表</button></div>
-  </div>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>日期</th><th>客户</th><th>Key</th><th>账号</th><th>模型</th><th>请求数</th><th>预估点数</th><th>实际点数</th><th>成功扣点</th><th>失败扣点</th></tr></thead>
-      <tbody id="cost-report-tbody"></tbody>
-    </table>
-  </div>
+    <div class="drawer-body">
+      <div class="drawer-section">
+        <div class="drawer-section-title">客户信息</div>
+        <label>客户名称</label>
+        <input id="ak-editor-name" maxlength="120" placeholder="例如：上海设计工作室">
+        <div class="drawer-help">客户和 Key 是一一对应关系，名称将显示在列表和报表中。</div>
+        <div style="margin-top:12px"><label>备注</label><input id="ak-editor-note" maxlength="240" placeholder="可填写套餐、负责人或用途"></div>
+      </div>
+      <div class="drawer-section">
+        <div class="drawer-section-title">额度与频率</div>
+        <div class="drawer-grid">
+          <div><label>每日点数额度</label><input id="ak-editor-points" type="number" min="0" step="1" placeholder="留空继承"><div class="drawer-help">0 表示不限额。</div></div>
+          <div><label>每日请求数</label><input id="ak-editor-requests" type="number" min="0" step="1" placeholder="留空继承"><div class="drawer-help">0 表示不限次数。</div></div>
+          <div><label>每分钟请求数</label><input id="ak-editor-rate" type="number" min="0" step="1" placeholder="留空继承"><div class="drawer-help">用于限制突发调用。</div></div>
+        </div>
+      </div>
+      <div class="drawer-section">
+        <div class="drawer-section-title">访问权限</div>
+        <div class="drawer-switches">
+          <label class="drawer-switch"><input id="ak-editor-kind-image" type="checkbox" checked>允许图片生成</label>
+          <label class="drawer-switch"><input id="ak-editor-kind-video" type="checkbox" checked>允许视频生成</label>
+          <label class="drawer-switch"><input id="ak-editor-uploads" type="checkbox" checked>允许上传素材</label>
+          <label class="drawer-switch"><input id="ak-editor-experimental" type="checkbox">允许实验模型</label>
+        </div>
+        <div style="margin-top:12px"><label>允许模型</label><input id="ak-editor-models" placeholder="留空表示全部；多个模型用逗号分隔"></div>
+        <div class="drawer-grid" style="margin-top:12px">
+          <div><label>允许分辨率</label><input id="ak-editor-resolutions" placeholder="例如：1K,2K,4K"></div>
+          <div><label>允许视频时长</label><input id="ak-editor-durations" placeholder="例如：5,10"></div>
+        </div>
+        <div style="margin-top:12px"><label>允许视频场景</label><input id="ak-editor-scenes" placeholder="留空表示全部场景"></div>
+      </div>
+      <div class="drawer-section">
+        <div class="drawer-section-title">Key 状态</div>
+        <label class="drawer-switch"><input id="ak-editor-enabled" type="checkbox" checked>启用此 Key</label>
+      </div>
+      <div id="ak-new" class="secret-card hidden">
+        <strong>新 Key 已创建</strong>
+        <div class="drawer-help">请立即复制并妥善保存。</div>
+        <code id="ak-new-value"></code>
+        <button class="btn-primary btn-sm" onclick="copyKey()">复制完整 Key</button>
+      </div>
+    </div>
+    <div class="drawer-footer">
+      <button class="btn-secondary" onclick="closeApiKeyEditor()">取消</button>
+      <button id="ak-editor-save" class="btn-primary" onclick="saveApiKeyEditor()">创建 Key</button>
+    </div>
+  </aside>
 </div>
 
 <!-- Tab: 设置 -->
@@ -8282,7 +8417,25 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
 const BASE = location.origin;
 let adminToken = localStorage.getItem('oreate_admin_token') || '';
 
-function copyText(t) { navigator.clipboard.writeText(t).catch(()=>{}); }
+async function copyText(t) {
+  const text=String(t ?? '');
+  if(navigator.clipboard?.writeText){
+    try{
+      await navigator.clipboard.writeText(text);
+      return;
+    }catch(_error){}
+  }
+  const textarea=document.createElement('textarea');
+  textarea.value=text;
+  textarea.setAttribute('readonly','');
+  textarea.style.position='fixed';
+  textarea.style.opacity='0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied=document.execCommand('copy');
+  textarea.remove();
+  if(!copied) throw new Error('浏览器未允许写入剪贴板');
+}
 function authHeaders(){
   const headers = {'Content-Type':'application/json'};
   if (adminToken) headers.Authorization = 'Bearer ' + adminToken;
@@ -8374,7 +8527,6 @@ async function init() {
   showApp();
   document.getElementById('status-text').textContent = '加载中...';
   try {
-    await loadClients();
     await Promise.all([loadAccounts(), loadTasks(), loadApiKeys(), loadUsage(), loadUploads(), loadCostReport(), loadAuditLogs(), loadSettings()]);
     await loadCapabilities();
   } catch (e) {
@@ -9197,6 +9349,9 @@ async function hydrateTask(id){
 // === API Keys ===
 async function loadApiKeys(){const r=await api('GET','/api/admin/apikeys');state.apikeys=r.items||[];renderApiKeys();updateStats();}
 function scopeCsv(values){return (Array.isArray(values)?values:[]).join(',');}
+function splitScopeInput(rawValue){
+  return String(rawValue ?? '').split(',').map(value=>value.trim()).filter((value,index,items)=>value && items.indexOf(value)===index);
+}
 function optionalNonNegativeIntegerValue(rawValue,label='限额'){
   const text=String(rawValue ?? '').trim();
   if(text==='') return null;
@@ -9216,85 +9371,206 @@ function apiKeyLimitInputValue(rawValue){
 function apiKeyStatusTagClass(status){
   return ({enabled:'tag-green',disabled:'tag-gray',expired:'tag-red',deleted:'tag-gray'})[status] || 'tag-gray';
 }
+let apiKeyEditorId=null;
+function switchApiKeyPanel(panel){
+  const showingKeys=panel!=='operations';
+  document.getElementById('apikeys-key-panel')?.classList.toggle('hidden',!showingKeys);
+  document.getElementById('apikeys-operations-panel')?.classList.toggle('hidden',showingKeys);
+  document.getElementById('apikey-tab-keys')?.classList.toggle('active',showingKeys);
+  document.getElementById('apikey-tab-operations')?.classList.toggle('active',!showingKeys);
+}
+function apiKeyDisplayName(key){
+  return String(key?.name || key?.client_name || `客户 Key #${key?.id ?? '-'}`);
+}
+function apiKeyQuotaSummary(key){
+  const used=Math.max(0,Number(key?.today_point_usage)||0);
+  const configured=key?.daily_point_limit;
+  const limit=configured===null || configured===undefined || configured==='' ? null : Math.max(0,Number(configured)||0);
+  if(limit===null) return {used,limit:null,main:`${used} / 继承`,sub:'每日点数额度继承系统设置',percent:0};
+  if(limit===0) return {used,limit:0,main:`${used} / 不限`,sub:'每日点数不限额',percent:0};
+  const remaining=Math.max(0,limit-used);
+  return {used,limit,main:`${used} / ${limit}`,sub:`剩余 ${remaining} 点`,percent:Math.min(100,Math.round(used/limit*100))};
+}
+function apiKeyScopeSummary(key){
+  const kinds=Array.isArray(key?.allowed_kinds) && key.allowed_kinds.length ? key.allowed_kinds.map(value=>adminLabel('kind',value)).join('、') : '图片、视频';
+  const models=Array.isArray(key?.allowed_models) && key.allowed_models.length ? `${key.allowed_models.length} 个指定模型` : '全部模型';
+  return `${escapeHtml(kinds)}<div class="apikey-meta">${escapeHtml(models)}</div>`;
+}
+function updateApiKeySummary(){
+  const keys=Array.isArray(state.apikeys)?state.apikeys:[];
+  const active=keys.filter(key=>String(key.status ?? (key.enabled?'enabled':'disabled')).toLowerCase()==='enabled').length;
+  const usage=keys.reduce((sum,key)=>sum+(Number(key.today_point_usage)||0),0);
+  const totalEl=document.getElementById('ak-summary-total');
+  const enabledEl=document.getElementById('ak-summary-enabled');
+  const usageEl=document.getElementById('ak-summary-usage');
+  if(totalEl) totalEl.textContent=String(keys.filter(key=>String(key.status)!=='deleted').length);
+  if(enabledEl) enabledEl.textContent=String(active);
+  if(usageEl) usageEl.textContent=String(usage);
+}
 function renderApiKeys(){
-  document.getElementById('apikeys-tbody').innerHTML = state.apikeys.map(k => {
+  const tbody=document.getElementById('apikeys-tbody');
+  if(!tbody) return;
+  const search=String(document.getElementById('ak-search')?.value||'').trim().toLowerCase();
+  const statusFilter=String(document.getElementById('ak-status-filter')?.value||'').trim().toLowerCase();
+  const keys=(Array.isArray(state.apikeys)?state.apikeys:[]).filter(key=>{
+    const status=String(key.status ?? (key.enabled?'enabled':'disabled')).toLowerCase();
+    if(statusFilter && status!==statusFilter) return false;
+    if(!search) return true;
+    return [apiKeyDisplayName(key),key.key_preview,key.id].some(value=>String(value??'').toLowerCase().includes(search));
+  });
+  updateApiKeySummary();
+  if(!keys.length){
+    tbody.innerHTML='<tr><td colspan="7" class="empty-state">没有符合条件的客户 Key</td></tr>';
+    return;
+  }
+  tbody.innerHTML = keys.map(k => {
     const kp=escapeHtml(k.key_preview||'');
     const keyStatus=String(k.status ?? (k.enabled ? 'enabled':'disabled')).toLowerCase();
     const statusClass=apiKeyStatusTagClass(keyStatus);
-    return `<tr><td>${k.id}</td><td style="font-family:monospace;font-size:11px">${kp}</td><td>${escapeHtml(k.name||'-')}</td><td>${escapeHtml(k.client_name||'-')}</td><td><span class="tag ${statusClass}">${escapeHtml(adminLabel('apiKeyStatus',keyStatus))}</span></td><td><input id="ak-rate-${k.id}" data-field="rate_limit_per_minute" type="number" min="0" step="1" value="${apiKeyLimitInputValue(k.rate_limit_per_minute)}" style="width:84px"></td><td><input id="ak-req-${k.id}" data-field="daily_request_limit" type="number" min="0" step="1" value="${apiKeyLimitInputValue(k.daily_request_limit)}" style="width:84px"></td><td><input id="ak-point-${k.id}" data-field="daily_point_limit" type="number" min="0" step="1" value="${apiKeyLimitInputValue(k.daily_point_limit)}" style="width:84px"></td><td><input id="ak-kinds-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_kinds))}" style="width:120px"></td><td><input id="ak-models-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_models))}" style="width:160px"></td><td><input id="ak-scenes-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_scenes))}" style="width:130px"></td><td><input id="ak-resolutions-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_resolutions))}" style="width:110px"></td><td><input id="ak-durations-${k.id}" value="${escapeHtml(scopeCsv(k.allowed_durations))}" style="width:90px"></td><td><input id="ak-uploads-${k.id}" type="checkbox" ${k.allow_uploads!==false ? 'checked' : ''}></td><td><input id="ak-experimental-${k.id}" type="checkbox" ${k.allow_experimental ? 'checked' : ''}></td><td style="font-size:11px">${new Date((k.created_at||0)*1000).toLocaleString()}</td><td style="font-size:11px">${k.last_used_at?new Date(k.last_used_at*1000).toLocaleString():'-'}</td><td><button class="btn-sm btn-secondary" onclick="updateApiKeyPolicy(${k.id})">保存</button> <button class="btn-sm btn-danger" onclick="deleteKey(${k.id})">删除</button></td></tr>`;
+    const quota=apiKeyQuotaSummary(k);
+    const toggleLabel=keyStatus==='enabled'?'停用':'启用';
+    const disabledActions=keyStatus==='deleted';
+    return `<tr>
+      <td><div class="apikey-name">${escapeHtml(apiKeyDisplayName(k))}</div><div class="apikey-meta">ID ${k.id} · 创建于 ${new Date((k.created_at||0)*1000).toLocaleDateString()}</div></td>
+      <td><div class="apikey-value"><code>${kp}</code><button class="copy-btn" onclick="copyApiKey(${k.id})">复制</button></div></td>
+      <td><span class="tag ${statusClass}">${escapeHtml(adminLabel('apiKeyStatus',keyStatus))}</span></td>
+      <td class="quota-cell"><div class="quota-main">${escapeHtml(quota.main)}</div><div class="quota-sub">${escapeHtml(quota.sub)} · 今日 ${Number(k.today_request_count)||0} 次</div>${quota.limit>0?`<div class="quota-track"><div class="quota-fill" style="width:${quota.percent}%"></div></div>`:''}</td>
+      <td><div class="scope-summary">${apiKeyScopeSummary(k)}</div></td>
+      <td><div style="font-size:12px">${k.last_used_at?new Date(k.last_used_at*1000).toLocaleString():'从未调用'}</div></td>
+      <td><div class="apikey-actions"><button class="btn-sm btn-secondary" onclick="openApiKeyEditor(${k.id})" ${disabledActions?'disabled':''}>编辑</button><button class="btn-sm btn-secondary" onclick="toggleApiKey(${k.id},${keyStatus!=='enabled'})" ${disabledActions?'disabled':''}>${toggleLabel}</button><button class="btn-sm btn-danger" onclick="deleteKey(${k.id})" ${disabledActions?'disabled':''}>删除</button></div></td>
+    </tr>`;
   }).join('');
 }
 function renderClients(){
-  const tbody=document.getElementById('clients-tbody');
-  if(!tbody) return;
-  tbody.innerHTML = (state.clients||[]).map(c => {
-    return `<tr><td>${c.id}</td><td>${escapeHtml(c.name||'-')}</td><td>${escapeHtml(c.contact||'-')}</td><td><span class="tag ${c.status==='active'?'tag-green':'tag-gray'}">${escapeHtml(adminLabel('clientStatus',c.status||'active'))}</span></td><td style="font-size:11px">${new Date((c.created_at||0)*1000).toLocaleString()}</td></tr>`;
-  }).join('');
+  // 历史客户数据仅用于兼容旧 Key 和报表，不再提供独立管理界面。
 }
-async function createClient(){
-  const r=await api('POST','/api/admin/clients',{name:document.getElementById('client-name').value,contact:document.getElementById('client-contact').value});
-  document.getElementById('client-name').value='';
-  document.getElementById('client-contact').value='';
-  await loadClients();
-  alert(r.ok?'✅ 客户已创建':'❌ 创建失败');
+function setApiKeyEditorValue(id,value){
+  const element=document.getElementById(id);
+  if(element) element.value=value ?? '';
 }
-async function createApiKey(){
-  const name=document.getElementById('ak-name').value;
-  const clientValue=document.getElementById('ak-client').value;
-  const body={
-    name:name,
-    allowed_kinds:document.getElementById('ak-kinds').value || '',
-    allowed_models:document.getElementById('ak-models').value || '',
-    allowed_scenes:document.getElementById('ak-scenes').value || '',
-    allowed_resolutions:document.getElementById('ak-resolutions').value || '',
-    allowed_durations:document.getElementById('ak-durations').value || '',
-    allow_uploads:document.getElementById('ak-allow-uploads').checked,
-    allow_experimental:document.getElementById('ak-allow-experimental').checked,
+function setApiKeyEditorChecked(id,value){
+  const element=document.getElementById(id);
+  if(element) element.checked=Boolean(value);
+}
+function openApiKeyEditor(id=null){
+  const key=id===null?null:(state.apikeys||[]).find(item=>Number(item.id)===Number(id));
+  if(id!==null && !key){alert('未找到此 Key，请刷新后重试');return;}
+  apiKeyEditorId=key?Number(key.id):null;
+  document.getElementById('apikey-editor-title').textContent=key?'编辑客户 Key':'创建客户 Key';
+  document.getElementById('apikey-editor-subtitle').textContent=key?'修改额度、权限和启用状态。':'创建后即可复制完整 Key。';
+  document.getElementById('ak-editor-save').textContent=key?'保存修改':'创建 Key';
+  document.getElementById('ak-editor-save').disabled=false;
+  setApiKeyEditorValue('ak-editor-name',key?apiKeyDisplayName(key):'');
+  setApiKeyEditorValue('ak-editor-note',key?.rotation_note||'');
+  setApiKeyEditorValue('ak-editor-rate',apiKeyLimitInputValue(key?.rate_limit_per_minute));
+  setApiKeyEditorValue('ak-editor-requests',apiKeyLimitInputValue(key?.daily_request_limit));
+  setApiKeyEditorValue('ak-editor-points',apiKeyLimitInputValue(key?.daily_point_limit));
+  setApiKeyEditorValue('ak-editor-models',scopeCsv(key?.allowed_models));
+  setApiKeyEditorValue('ak-editor-scenes',scopeCsv(key?.allowed_scenes));
+  setApiKeyEditorValue('ak-editor-resolutions',scopeCsv(key?.allowed_resolutions));
+  setApiKeyEditorValue('ak-editor-durations',scopeCsv(key?.allowed_durations));
+  const kinds=Array.isArray(key?.allowed_kinds)&&key.allowed_kinds.length?key.allowed_kinds:['image','video'];
+  setApiKeyEditorChecked('ak-editor-kind-image',kinds.includes('image'));
+  setApiKeyEditorChecked('ak-editor-kind-video',kinds.includes('video'));
+  setApiKeyEditorChecked('ak-editor-uploads',key?key.allow_uploads!==false:true);
+  setApiKeyEditorChecked('ak-editor-experimental',Boolean(key?.allow_experimental));
+  setApiKeyEditorChecked('ak-editor-enabled',key?String(key.status ?? (key.enabled?'enabled':'disabled'))==='enabled':true);
+  document.getElementById('ak-new').classList.add('hidden');
+  document.getElementById('ak-new-value').textContent='';
+  document.getElementById('apikey-editor-backdrop').classList.remove('hidden');
+  document.getElementById('apikey-editor').classList.remove('hidden');
+  setTimeout(()=>document.getElementById('ak-editor-name')?.focus(),0);
+}
+function closeApiKeyEditor(){
+  document.getElementById('apikey-editor-backdrop')?.classList.add('hidden');
+  document.getElementById('apikey-editor')?.classList.add('hidden');
+  apiKeyEditorId=null;
+}
+function apiKeyEditorBody(){
+  const name=String(document.getElementById('ak-editor-name')?.value||'').trim();
+  if(!name) throw new Error('请填写客户名称');
+  const allowedKinds=[];
+  if(document.getElementById('ak-editor-kind-image')?.checked) allowedKinds.push('image');
+  if(document.getElementById('ak-editor-kind-video')?.checked) allowedKinds.push('video');
+  if(!allowedKinds.length) throw new Error('图片和视频至少允许一种');
+  return {
+    name,
+    rotation_note:String(document.getElementById('ak-editor-note')?.value||'').trim(),
+    rate_limit_per_minute:optionalNonNegativeIntegerValue(document.getElementById('ak-editor-rate')?.value,'每分钟请求数'),
+    daily_request_limit:optionalNonNegativeIntegerValue(document.getElementById('ak-editor-requests')?.value,'每日请求数'),
+    daily_point_limit:optionalNonNegativeIntegerValue(document.getElementById('ak-editor-points')?.value,'每日点数额度'),
+    allowed_kinds:allowedKinds,
+    allowed_models:splitScopeInput(document.getElementById('ak-editor-models')?.value),
+    allowed_scenes:splitScopeInput(document.getElementById('ak-editor-scenes')?.value),
+    allowed_resolutions:splitScopeInput(document.getElementById('ak-editor-resolutions')?.value),
+    allowed_durations:splitScopeInput(document.getElementById('ak-editor-durations')?.value),
+    allow_uploads:Boolean(document.getElementById('ak-editor-uploads')?.checked),
+    allow_experimental:Boolean(document.getElementById('ak-editor-experimental')?.checked),
+    enabled:Boolean(document.getElementById('ak-editor-enabled')?.checked),
   };
-  if(clientValue) body.client_id=Number(clientValue);
-  const r=await api('POST','/api/admin/apikeys',body);
-  if(r.item){
-    document.getElementById('ak-new').classList.remove('hidden');
-    document.getElementById('ak-new-value').textContent=r.item.key;
-    document.getElementById('ak-name').value='';
-    document.getElementById('ak-kinds').value='';
-    document.getElementById('ak-models').value='';
-    document.getElementById('ak-scenes').value='';
-    document.getElementById('ak-resolutions').value='';
-    document.getElementById('ak-durations').value='';
-    document.getElementById('ak-allow-uploads').checked=true;
-    document.getElementById('ak-allow-experimental').checked=false;
-    await loadClients();
-    await loadApiKeys();
-  } else alert('创建失败: '+JSON.stringify(r));
 }
-function copyKey(){const v=document.getElementById('ak-new-value').textContent;copyText(v);alert('已复制');}
-async function updateApiKeyPolicy(id){
+async function createApiKey(bodyOverride=null){
+  const body=bodyOverride || apiKeyEditorBody();
+  const result=await api('POST','/api/admin/apikeys',body);
+  if(!result.item?.key) throw new Error('服务端未返回新 Key');
+  document.getElementById('ak-new-value').textContent=result.item.key;
+  document.getElementById('ak-new').classList.remove('hidden');
+  document.getElementById('ak-editor-save').disabled=true;
+  await loadApiKeys();
+  return result.item;
+}
+async function updateApiKeyPolicy(id,bodyOverride=null){
+  const body=bodyOverride || apiKeyEditorBody();
   try{
-    const body={
-      rate_limit_per_minute:optionalNonNegativeIntegerValue(document.getElementById('ak-rate-'+id).value,'每分钟限额'),
-      daily_request_limit:optionalNonNegativeIntegerValue(document.getElementById('ak-req-'+id).value,'每日请求限额'),
-      daily_point_limit:optionalNonNegativeIntegerValue(document.getElementById('ak-point-'+id).value,'每日点数限额'),
-      allowed_kinds:document.getElementById('ak-kinds-'+id).value || '',
-      allowed_models:document.getElementById('ak-models-'+id).value || '',
-      allowed_scenes:document.getElementById('ak-scenes-'+id).value || '',
-      allowed_resolutions:document.getElementById('ak-resolutions-'+id).value || '',
-      allowed_durations:document.getElementById('ak-durations-'+id).value || '',
-      allow_uploads:document.getElementById('ak-uploads-'+id).checked,
-      allow_experimental:document.getElementById('ak-experimental-'+id).checked,
-    };
     await api('PATCH','/api/admin/apikeys/'+id,body);
   }catch(error){
-    alert('❌ 保存失败：'+(error?.message || String(error)));
-    return;
+    alert('保存失败：'+(error?.message || String(error)));
+    return null;
   }
   try{
     await loadApiKeys();
   }catch(error){
-    alert('⚠️ 已保存但刷新失败：'+(error?.message || String(error)));
+    alert('已保存但刷新失败：'+(error?.message || String(error)));
+  }
+  return true;
+}
+async function saveApiKeyEditor(){
+  const saveButton=document.getElementById('ak-editor-save');
+  saveButton.disabled=true;
+  try{
+    if(apiKeyEditorId===null){
+      await createApiKey();
+    }else{
+      const saved=await updateApiKeyPolicy(apiKeyEditorId);
+      if(saved) closeApiKeyEditor();
+    }
+  }catch(error){
+    alert('保存失败：'+(error?.message || String(error)));
+    saveButton.disabled=false;
   }
 }
-async function deleteKey(id){if(!confirm('确认删除此 API Key？')) return; await api('DELETE','/api/admin/apikeys/'+id);await loadApiKeys();}
+async function copyApiKey(id){
+  try{
+    const result=await api('GET',`/api/admin/apikeys/${id}/secret`);
+    await copyText(result.key);
+    alert('完整 Key 已复制');
+  }catch(error){
+    alert('复制失败：'+(error?.message || String(error)));
+  }
+}
+async function copyKey(){
+  const value=document.getElementById('ak-new-value').textContent;
+  if(!value) return;
+  await copyText(value);
+  alert('完整 Key 已复制');
+}
+async function toggleApiKey(id,enabled){
+  const action=enabled?'启用':'停用';
+  if(!confirm(`确认${action}此客户 Key？`)) return;
+  const saved=await updateApiKeyPolicy(id,{enabled});
+  if(saved) alert(`已${action}`);
+}
+async function deleteKey(id){if(!confirm('确认删除此客户 Key？删除后不可恢复。')) return; await api('DELETE','/api/admin/apikeys/'+id);await loadApiKeys();}
 
 // === Usage ===
 async function loadUsage(){
@@ -9306,7 +9582,6 @@ function applyUsageFilters(){
     kind:'usage-filter-kind',
     status:'usage-filter-status',
     model_name:'usage-filter-model-name',
-    client_id:'usage-filter-client-id',
     api_key_id:'usage-filter-api-key-id',
     account_id:'usage-filter-account-id',
     error_code:'usage-filter-error-code',
@@ -9319,7 +9594,7 @@ function applyUsageFilters(){
 }
 function resetUsageFilters(){
   clearListInputs([
-    'usage-filter-kind','usage-filter-status','usage-filter-model-name','usage-filter-client-id',
+    'usage-filter-kind','usage-filter-status','usage-filter-model-name',
     'usage-filter-api-key-id','usage-filter-account-id','usage-filter-error-code',
     'usage-filter-date-from','usage-filter-date-to',
   ],'usage-page-size');
@@ -9410,7 +9685,8 @@ function renderCostReport(){
   const tbody=document.getElementById('cost-report-tbody');
   if(!tbody) return;
   tbody.innerHTML = (state.costReport||[]).map(item => {
-    return `<tr><td>${escapeHtml(item.report_date||'-')}</td><td>${escapeHtml(item.client_name||'-')}</td><td>${escapeHtml(item.api_key_name||'-')}</td><td>${escapeHtml(item.account_email||'-')}</td><td>${escapeHtml(item.model_name||'-')}</td><td>${item.request_count ?? 0}</td><td>${item.estimated_point_cost ?? 0}</td><td>${item.actual_point_cost ?? 0}</td><td>${item.success_actual_point_cost ?? 0}</td><td>${item.failed_actual_point_cost ?? 0}</td></tr>`;
+    const customerName=item.client_name || item.api_key_name || '-';
+    return `<tr><td>${escapeHtml(item.report_date||'-')}</td><td>${escapeHtml(customerName)}</td><td>${escapeHtml(item.account_email||'-')}</td><td>${escapeHtml(item.model_name||'-')}</td><td>${item.request_count ?? 0}</td><td>${item.estimated_point_cost ?? 0}</td><td>${item.actual_point_cost ?? 0}</td><td>${item.success_actual_point_cost ?? 0}</td><td>${item.failed_actual_point_cost ?? 0}</td></tr>`;
   }).join('');
 }
 
@@ -9516,6 +9792,11 @@ function updateStats(){
   document.getElementById('st-tasks').textContent=state.lists.tasks.total;
   document.getElementById('st-apikeys').textContent=(state.apikeys||[]).length;
 }
+document.addEventListener('keydown',event=>{
+  if(event.key==='Escape' && !document.getElementById('apikey-editor')?.classList.contains('hidden')){
+    closeApiKeyEditor();
+  }
+});
 init();
 </script>
 </body>

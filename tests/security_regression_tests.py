@@ -1009,7 +1009,6 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertIn("adminLabel('healthStatus',a.health_status)", html)
         self.assertIn("adminLabel('riskStatus',a.risk_status||'clean')", html)
         self.assertIn("adminLabel('apiKeyStatus',keyStatus)", html)
-        self.assertIn("adminLabel('clientStatus',c.status||'active')", html)
         self.assertIn("adminLabel('kind',u.kind)", html)
         self.assertIn("adminLabel('uploadStatus',item.status)", html)
 
@@ -1511,8 +1510,10 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertIn("${escapeHtml(u.model_name||'-')}", html)
         self.assertIn("${escapeHtml(em)}", html)
         self.assertIn("data-copy-value=\"${escapeHtml(em)}\"", html)
-        self.assertIn("${escapeHtml(c.name||'-')}", html)
-        self.assertIn("${escapeHtml(c.contact||'-')}", html)
+        self.assertIn("${escapeHtml(apiKeyDisplayName(k))}", html)
+        self.assertIn("${escapeHtml(customerName)}", html)
+        self.assertIn("return `${escapeHtml(kinds)}", html)
+        self.assertIn("${escapeHtml(models)}", html)
         self.assertNotIn("${(u.prompt||'').substring(0,40)}", html)
 
     def test_admin_page_sets_defensive_browser_headers(self):
