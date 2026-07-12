@@ -1,3 +1,4 @@
+import base64
 import json
 import hashlib
 import io
@@ -841,6 +842,17 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertIn("s.pool?.maintain_target??5", html)
         self.assertIn("已保存但刷新失败", html)
 
+    def test_admin_generate_ui_polls_task_and_renders_chinese_result_status(self):
+        html = server.ADMIN_HTML
+
+        self.assertIn('id="g-submit"', html)
+        self.assertIn('id="g-result"', html)
+        self.assertIn("function renderGenerateResult(", html)
+        self.assertIn("async function waitForGeneratedTask(", html)
+        self.assertIn("await waitForGeneratedTask(r.task_id", html)
+        self.assertIn("adminLabel('taskStatus',task?.status)", html)
+        self.assertIn("生成结果", html)
+
     def test_admin_html_localizes_operational_enums_without_changing_filter_values(self):
         html = server.ADMIN_HTML
 
@@ -1171,15 +1183,98 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
             def hydrate_generation_result(self, session, chat_id):
                 return {"raw": {}, "assets": []}
 
-        with patch.object(server, "CLIENT", StubClient()):
-            response = self.client.post(
-                "/api/media/generate",
-                headers=self.admin_headers(),
-                json={"kind": "image", "prompt": "hello"},
-            )
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {"gateway": {"demo_generation_enabled": False}},
+        )
+        try:
+            with patch.object(server, "CLIENT", StubClient()):
+                response = self.client.post(
+                    "/api/media/generate",
+                    headers=self.admin_headers(),
+                    json={"kind": "image", "prompt": "hello"},
+                )
+        finally:
+            server.CFG = original_cfg
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ok"])
+        self.assertEqual(response.json()["status"], "queued")
+        self.assertNotIn("task", response.json())
+
+    def test_admin_demo_generation_completes_locally_with_safe_svg_asset(self):
+        account_id = self.seed_account()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET model_info_json=?, video_info_json=? WHERE id=?",
+            (json.dumps(self.sample_image_info()), json.dumps(self.sample_video_info()), account_id),
+        )
+        conn.commit()
+        conn.close()
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "server": {"host": "127.0.0.1"},
+                "gateway": {
+                    "demo_generation_enabled": True,
+                    "enable_background_worker": False,
+                },
+            },
+        )
+        try:
+            response = self.client.post(
+                "/api/media/generate",
+                headers=self.admin_headers(),
+                json={
+                    "kind": "image",
+                    "prompt": "<script>alert('x')</script>\u0001 一只小猫",
+                    "model_name": "Google Nano Banana 2",
+                    "ratio": "16:9",
+                    "resolution": "4K",
+                },
+            )
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["task"]["status"], "completed")
+        self.assertEqual(payload["task"]["actual_point_cost"], 0)
+        self.assertEqual(len(payload["task"]["attempts"]), 1)
+        self.assertEqual(payload["task"]["attempts"][0]["status"], "completed")
+        self.assertEqual(len(payload["task"]["assets"]), 1)
+        asset = payload["task"]["assets"][0]
+        self.assertTrue(asset.startswith("data:image/svg+xml;base64,"))
+        svg = base64.b64decode(asset.split(",", 1)[1]).decode("utf-8")
+        self.assertIn("本地演示生成", svg)
+        self.assertIn("&lt;script&gt;", svg)
+        self.assertNotIn("<script>", svg)
+        self.assertNotIn("\u0001", svg)
+
+        task = self.client.get(
+            f"/api/tasks/{payload['task_id']}",
+            headers=self.admin_headers(),
+        )
+        self.assertEqual(task.status_code, 200)
+        self.assertEqual(task.json()["task"]["status"], "completed")
+
+    def test_admin_demo_generation_is_restricted_to_loopback(self):
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "server": {"host": "0.0.0.0"},
+                "gateway": {"demo_generation_enabled": True},
+            },
+        )
+        try:
+            self.assertFalse(server.demo_generation_enabled())
+        finally:
+            server.CFG = original_cfg
 
     def test_delete_api_key_soft_deletes_without_dropping_usage_log(self):
         account_id = self.seed_account()
