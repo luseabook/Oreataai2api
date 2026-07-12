@@ -1120,6 +1120,123 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIsNone(usage_row["actual_point_cost"])
         self.assertEqual(usage_row["status_code"], 499)
 
+    def test_late_cancel_handler_preserves_completed_attempt_terminal_fields(self):
+        task_id = self.seed_task(status="running", kind="image", started_at=time.time())
+        task = dict(server.fetch_task_row(task_id))
+        attempt_id = server.create_task_attempt(task, "generation")
+        completed_at = time.time() - 10
+        assets = ["https://cdn.oreateai.com/static/result/already-completed.jpg"]
+        server.update_task_record(
+            task_id,
+            status="completed",
+            assets_json=assets,
+            error_code="",
+            error_message="",
+            finished_at=completed_at,
+        )
+        server.update_task_attempt(
+            attempt_id,
+            status="completed",
+            error_code="UPSTREAM_RESULT_ACCEPTED",
+            error_message="completed before late cancellation handler",
+            assets_json=assets,
+            finished_at=completed_at,
+        )
+        conn = server.db_conn()
+        before = dict(
+            conn.execute(
+                """
+                SELECT status,error_code,error_message,assets_json,finished_at
+                FROM task_attempts WHERE id=?
+                """,
+                (attempt_id,),
+            ).fetchone()
+        )
+        conn.close()
+
+        server.cancel_task_attempt(task, attempt_id, "late cancellation handler")
+
+        conn = server.db_conn()
+        after = dict(
+            conn.execute(
+                """
+                SELECT status,error_code,error_message,assets_json,finished_at
+                FROM task_attempts WHERE id=?
+                """,
+                (attempt_id,),
+            ).fetchone()
+        )
+        task_row = conn.execute(
+            "SELECT status,assets_json,error_code FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(after, before)
+        self.assertEqual(task_row["status"], "completed")
+        self.assertEqual(json.loads(task_row["assets_json"]), assets)
+        self.assertEqual(task_row["error_code"], "")
+
+    def test_late_finalize_preserves_attempt_expired_by_worker_recovery(self):
+        task_id = self.seed_task(status="running", kind="image", started_at=800.0)
+        task = dict(server.fetch_task_row(task_id))
+        attempt_id = server.create_task_attempt(task, "generation")
+        server.update_task_record(task_id, updated_at=900.0)
+
+        recovered = server.recover_stale_running_tasks(
+            now=1000.0,
+            stale_after_seconds=60.0,
+        )
+        self.assertEqual(recovered, 1)
+        conn = server.db_conn()
+        before = dict(
+            conn.execute(
+                """
+                SELECT status,error_code,error_message,assets_json,finished_at
+                FROM task_attempts WHERE id=?
+                """,
+                (attempt_id,),
+            ).fetchone()
+        )
+        conn.close()
+        self.assertEqual(before["status"], "expired")
+        self.assertEqual(before["error_code"], "WORKER_LOST")
+
+        server.finalize_task_attempt(
+            task,
+            attempt_id,
+            "generation",
+            {
+                "account_id": task["account_id"],
+                "chat_id": "chat-late-finalize",
+                "focus_id": "focus-late-finalize",
+                "response_json": {"status": "completed"},
+                "assets": ["https://cdn.oreateai.com/static/result/late-finalize.jpg"],
+                "response_summary": "completed",
+                "status_code": 200,
+            },
+            "completed",
+        )
+
+        conn = server.db_conn()
+        after = dict(
+            conn.execute(
+                """
+                SELECT status,error_code,error_message,assets_json,finished_at
+                FROM task_attempts WHERE id=?
+                """,
+                (attempt_id,),
+            ).fetchone()
+        )
+        task_row = conn.execute(
+            "SELECT status,error_code,assets_json FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(after, before)
+        self.assertEqual(task_row["status"], "expired")
+        self.assertEqual(task_row["error_code"], "WORKER_LOST")
+        self.assertEqual(json.loads(task_row["assets_json"]), [])
+
     def test_submitted_task_expires_after_hydration_deadline(self):
         original_cfg = server.CFG
         server.CFG = server.deep_merge(

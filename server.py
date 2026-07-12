@@ -3881,13 +3881,7 @@ def cancel_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "t
             "SELECT status,cancel_requested_at FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
-        task_is_cancelled = bool(
-            current
-            and (
-                str(current["status"] or "") == "cancelled"
-                or current["cancel_requested_at"] is not None
-            )
-        )
+        task_is_cancelled = bool(current and str(current["status"] or "") == "cancelled")
         if current and expected_status in {"running", "hydrating"}:
             result = conn.execute(
                 """
@@ -3900,15 +3894,16 @@ def cancel_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "t
                 (message, now, now, now, task_id, expected_status),
             )
             task_is_cancelled = task_is_cancelled or result.rowcount == 1
-        conn.execute(
-            """
-            UPDATE task_attempts
-            SET status='cancelled', error_code='TASK_CANCELLED', error_message=?,
-                assets_json=?, finished_at=?
-            WHERE id=? AND task_id=?
-            """,
-            (message, encode_json_value([]), now, attempt_id, task_id),
-        )
+        if task_is_cancelled:
+            conn.execute(
+                """
+                UPDATE task_attempts
+                SET status='cancelled', error_code='TASK_CANCELLED', error_message=?,
+                    assets_json=?, finished_at=?
+                WHERE id=? AND task_id=? AND status='running'
+                """,
+                (message, encode_json_value([]), now, attempt_id, task_id),
+            )
         if task_is_cancelled and task.get("api_key_id"):
             conn.execute(
                 """
@@ -4126,7 +4121,7 @@ def finalize_task_attempt(task: sqlite3.Row, attempt_id: int, phase: str, result
                 """
                 UPDATE task_attempts
                 SET status=?, error_code=?, error_message=?, assets_json=?, finished_at=?
-                WHERE id=? AND task_id=?
+                WHERE id=? AND task_id=? AND status='running'
                 """,
                 (
                     discarded_status,
