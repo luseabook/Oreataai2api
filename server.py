@@ -28,7 +28,8 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Web
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic_core import PydanticCustomError
 
 from banti_token_generator import generate_banti_artifacts, generate_jt_token
 from gateway.openai_compat import (
@@ -2492,12 +2493,26 @@ class ServerSettingsIn(BaseModel):
 
     port: Optional[Annotated[int, Field(strict=True, ge=1, le=65535)]] = None
 
+    @field_validator("port", mode="before")
+    @classmethod
+    def reject_null_port(cls, value: Any) -> Any:
+        if value is None:
+            raise PydanticCustomError("int_type", "Input should be a valid integer")
+        return value
+
 
 class PoolSettingsIn(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     min_accounts: Optional[Annotated[int, Field(strict=True, ge=0)]] = None
     maintain_target: Optional[Annotated[int, Field(strict=True, ge=0)]] = None
+
+    @field_validator("min_accounts", "maintain_target", mode="before")
+    @classmethod
+    def reject_null_pool_counts(cls, value: Any) -> Any:
+        if value is None:
+            raise PydanticCustomError("int_type", "Input should be a valid integer")
+        return value
 
 
 class SettingsIn(BaseModel):

@@ -607,11 +607,36 @@ class SecurityRegressionTests(unittest.TestCase):
             {"server": {"port": 65536}},
             {"server": {"port": 8890.5}},
             {"server": {"port": "8890"}},
+            {"server": {"port": True}},
             {"pool": {"min_accounts": -1}},
             {"pool": {"maintain_target": -1}},
         ]
 
         for update in invalid_updates:
+            with self.subTest(update=update):
+                server.CFG = json.loads(json.dumps(baseline_cfg))
+                server.save_config(server.CFG)
+                saved_before = self.config_path.read_bytes()
+
+                response = self.client.put(
+                    "/api/admin/settings",
+                    headers=headers,
+                    json=update,
+                )
+
+                self.assertEqual(response.status_code, 422)
+                self.assertEqual(server.CFG, baseline_cfg)
+                self.assertEqual(self.config_path.read_bytes(), saved_before)
+
+    def test_admin_settings_reject_null_numeric_values(self):
+        headers = self.admin_headers()
+        baseline_cfg = json.loads(json.dumps(server.CFG))
+
+        for update in (
+            {"server": {"port": None}},
+            {"pool": {"min_accounts": None}},
+            {"pool": {"maintain_target": None}},
+        ):
             with self.subTest(update=update):
                 server.CFG = json.loads(json.dumps(baseline_cfg))
                 server.save_config(server.CFG)
