@@ -3376,6 +3376,7 @@ def list_accounts() -> List[Dict[str, Any]]:
 
 
 TASK_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "expired"}
+TASK_CANCELLABLE_STATUSES = ("queued", "running", "submitted", "hydrating")
 
 
 def encode_json_value(value: Any) -> Any:
@@ -3810,6 +3811,10 @@ def task_retryable_status(status: str) -> bool:
 
 def task_hydratable_status(status: str) -> bool:
     return status in {"submitted", "hydrating"}
+
+
+def task_cancellable_status(status: str) -> bool:
+    return status in TASK_CANCELLABLE_STATUSES
 
 
 def task_retry_interval_seconds(status: str) -> float:
@@ -6907,20 +6912,74 @@ def cancel_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[s
     task = dict(row)
     if task.get("status") == "cancelled":
         return gateway_task_detail_payload(task_id, api_key_id)
+    if not task_cancellable_status(task.get("status") or ""):
+        raise GatewayAPIError(
+            409,
+            "TASK_NOT_CANCELLABLE",
+            "only active tasks can be cancelled",
+            {
+                "status": task.get("status") or "",
+                "allowed": list(TASK_CANCELLABLE_STATUSES),
+            },
+        )
     now = time.time()
-    update_task_record(
-        task_id,
-        status="cancelled",
-        error_code="TASK_CANCELLED",
-        error_message="task cancelled",
-        cancel_requested_at=now,
-        next_attempt_at=None,
-        finished_at=now,
-    )
-    if task.get("api_key_id"):
+    conn = db_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        where = ["id=?"]
+        params: List[Any] = [task_id]
+        if api_key_id is not None:
+            where.append("api_key_id=?")
+            params.append(api_key_id)
+        current = conn.execute(
+            f"SELECT status,api_key_id FROM tasks WHERE {' AND '.join(where)}",
+            tuple(params),
+        ).fetchone()
+        if not current:
+            raise GatewayAPIError(404, "TASK_NOT_FOUND", "task not found")
+        current_status = str(current["status"] or "")
+        if current_status == "cancelled":
+            conn.rollback()
+            return gateway_task_detail_payload(task_id, api_key_id)
+        if not task_cancellable_status(current_status):
+            raise GatewayAPIError(
+                409,
+                "TASK_NOT_CANCELLABLE",
+                "only active tasks can be cancelled",
+                {
+                    "status": current_status,
+                    "allowed": list(TASK_CANCELLABLE_STATUSES),
+                },
+            )
+        result = conn.execute(
+            f"""
+            UPDATE tasks
+            SET status='cancelled', error_code='TASK_CANCELLED', error_message='task cancelled',
+                cancel_requested_at=?, next_attempt_at=NULL, finished_at=?, updated_at=?
+            WHERE {' AND '.join(where)}
+              AND status IN ('queued', 'running', 'submitted', 'hydrating')
+            """,
+            tuple([now, now, now] + params),
+        )
+        if result.rowcount != 1:
+            raise GatewayAPIError(
+                409,
+                "TASK_NOT_CANCELLABLE",
+                "task state changed before cancellation could be reserved",
+                {"status": current_status},
+            )
+        tenant_api_key_id = current["api_key_id"]
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+    if tenant_api_key_id:
         update_usage_log_for_task(
             task_id,
-            task.get("api_key_id"),
+            tenant_api_key_id,
             status="cancelled",
             response_summary="cancelled",
             error_code="TASK_CANCELLED",
@@ -8072,6 +8131,25 @@ async function gatewayGenerate(){
 
 // === Tasks ===
 async function loadTasks(){const r=await api('GET','/api/tasks');state.tasks=r.items||[];renderTasks();updateStats();}
+function taskCanRetry(status){
+  return ['failed','expired'].includes(String(status ?? '').toLowerCase());
+}
+function taskCanHydrate(status){
+  return ['submitted','hydrating'].includes(String(status ?? '').toLowerCase());
+}
+function taskCanCancel(status){
+  return ['queued','running','submitted','hydrating'].includes(String(status ?? '').toLowerCase());
+}
+function taskActionButtons(task){
+  const id=Number(task?.id);
+  if(!Number.isSafeInteger(id) || id <= 0) return '';
+  const status=String(task?.status ?? '').toLowerCase();
+  const buttons=[];
+  if(taskCanHydrate(status)) buttons.push(`<button class="btn-sm btn-secondary" onclick="hydrateTask(${id})">重水合</button>`);
+  if(taskCanRetry(status)) buttons.push(`<button class="btn-sm btn-secondary" onclick="retryTask(${id})">重试</button>`);
+  if(taskCanCancel(status)) buttons.push(`<button class="btn-sm btn-danger" onclick="cancelTask(${id})">取消</button>`);
+  return buttons.join('');
+}
 function renderTasks(){
   document.getElementById('tasks-tbody').innerHTML = state.tasks.slice(0,50).map(t => {
     const statusClass=t.status==='completed'?'tag-green':t.status==='failed'?'tag-red':t.status==='cancelled'?'tag-gray':t.status==='submitted'?'tag-blue':'tag-gray';
@@ -8087,9 +8165,7 @@ function renderTasks(){
       <td>
         <div class="task-actions">
           <button class="btn-sm btn-secondary" onclick="loadTaskDetail(${t.id})">详情</button>
-          <button class="btn-sm btn-secondary" onclick="hydrateTask(${t.id})">重水合</button>
-          <button class="btn-sm btn-secondary" onclick="retryTask(${t.id})">重试</button>
-          <button class="btn-sm btn-danger" onclick="cancelTask(${t.id})">取消</button>
+          ${taskActionButtons(t)}
         </div>
       </td>
     </tr>`;
@@ -8128,9 +8204,7 @@ function renderTaskPreview(task){
         <div><strong>错误码</strong> ${escapeHtml(task?.error_code || '-')}</div>
       </div>
       <div style="margin-top:12px" class="task-actions">
-        <button class="btn-sm btn-secondary" onclick="retryTask(${task?.id || 0})">retryTask</button>
-        <button class="btn-sm btn-secondary" onclick="cancelTask(${task?.id || 0})">cancelTask</button>
-        <button class="btn-sm btn-secondary" onclick="hydrateTask(${task?.id || 0})">hydrateTask</button>
+        ${taskActionButtons(task)}
       </div>
     </div>
     <div class="task-preview-card">
@@ -8151,20 +8225,31 @@ async function loadTaskDetail(id){
   renderTaskPreview(r.task);
   return r.task;
 }
+async function runTaskAction(id, action, label){
+  let result;
+  try{
+    result=await api('POST',`/api/tasks/${id}/${action}`);
+  }catch(error){
+    alert(`❌ 任务 #${id} ${label}失败：${error?.message || String(error)}`);
+    return null;
+  }
+  renderTaskPreview(result.task);
+  try{
+    await loadTasks();
+  }catch(error){
+    alert(`⚠️ 任务 #${id} ${label}成功，但列表刷新失败：${error?.message || String(error)}`);
+  }
+  return result.task;
+}
 async function retryTask(id){
-  const r=await api('POST',`/api/tasks/${id}/retry`);
-  await loadTasks();
-  renderTaskPreview(r.task);
+  return runTaskAction(id,'retry','重试');
 }
 async function cancelTask(id){
-  const r=await api('POST',`/api/tasks/${id}/cancel`);
-  await loadTasks();
-  renderTaskPreview(r.task);
+  if(!confirm(`确认取消任务 #${id}？`)) return null;
+  return runTaskAction(id,'cancel','取消');
 }
 async function hydrateTask(id){
-  const r=await api('POST',`/api/tasks/${id}/hydrate`);
-  await loadTasks();
-  renderTaskPreview(r.task);
+  return runTaskAction(id,'hydrate','重水合');
 }
 
 // === API Keys ===

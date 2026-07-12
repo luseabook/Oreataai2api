@@ -620,6 +620,95 @@ class GatewayHardeningTests(unittest.TestCase):
             self.assertEqual(cancel.status_code, 200)
             self.assertEqual(cancel.json()["task"]["status"], "cancelled")
 
+    def test_terminal_tasks_cannot_be_cancelled(self):
+        headers = self.admin_headers()
+        for status in ("completed", "failed", "expired"):
+            with self.subTest(status=status):
+                task_id = self.seed_task(
+                    status=status,
+                    response={
+                        "status": status,
+                        "chat": {"chatId": f"chat-{status}", "focusId": f"focus-{status}"},
+                        "assets": [f"https://cdn.oreateai.com/{status}.mp4"],
+                    },
+                    finished_at=time.time(),
+                )
+                conn = server.db_conn()
+                before = dict(
+                    conn.execute(
+                        """
+                        SELECT status,response_json,assets_json,chat_id,focus_id,
+                               error_code,error_message,cancel_requested_at,finished_at
+                        FROM tasks WHERE id=?
+                        """,
+                        (task_id,),
+                    ).fetchone()
+                )
+                conn.close()
+
+                with (
+                    patch.object(server, "update_task_record") as update_task,
+                    patch.object(server, "update_usage_log_for_task") as update_usage,
+                ):
+                    response = self.client.post(
+                        f"/api/tasks/{task_id}/cancel",
+                        headers=headers,
+                    )
+
+                self.assertEqual(response.status_code, 409)
+                payload = response.json()
+                self.assertFalse(payload["ok"])
+                self.assertEqual(payload["error"]["code"], "TASK_NOT_CANCELLABLE")
+                self.assertIn(status, payload["error"]["details"]["status"])
+                update_task.assert_not_called()
+                update_usage.assert_not_called()
+
+                conn = server.db_conn()
+                after = dict(
+                    conn.execute(
+                        """
+                        SELECT status,response_json,assets_json,chat_id,focus_id,
+                               error_code,error_message,cancel_requested_at,finished_at
+                        FROM tasks WHERE id=?
+                        """,
+                        (task_id,),
+                    ).fetchone()
+                )
+                conn.close()
+                self.assertEqual(after, before)
+
+    def test_task_cancel_is_allowed_for_active_states_and_idempotent_after_cancel(self):
+        headers = self.admin_headers()
+        for status in ("queued", "running", "submitted", "hydrating"):
+            with self.subTest(status=status):
+                task_id = self.seed_task(
+                    status=status,
+                    started_at=time.time() if status == "running" else None,
+                )
+
+                first = self.client.post(f"/api/tasks/{task_id}/cancel", headers=headers)
+
+                self.assertEqual(first.status_code, 200)
+                first_task = first.json()["task"]
+                self.assertEqual(first_task["status"], "cancelled")
+                self.assertEqual(first_task["error_code"], "TASK_CANCELLED")
+                first_cancel_requested_at = first_task["cancel_requested_at"]
+                first_finished_at = first_task["finished_at"]
+
+                with (
+                    patch.object(server, "update_task_record") as update_task,
+                    patch.object(server, "update_usage_log_for_task") as update_usage,
+                ):
+                    second = self.client.post(f"/api/tasks/{task_id}/cancel", headers=headers)
+
+                self.assertEqual(second.status_code, 200)
+                second_task = second.json()["task"]
+                self.assertEqual(second_task["status"], "cancelled")
+                self.assertEqual(second_task["cancel_requested_at"], first_cancel_requested_at)
+                self.assertEqual(second_task["finished_at"], first_finished_at)
+                update_task.assert_not_called()
+                update_usage.assert_not_called()
+
     def test_task_retry_rechecks_api_key_model_scope(self):
         self.seed_account_with_capabilities()
         self.seed_account_with_capabilities("retry-scope-failover@example.com")
@@ -3346,6 +3435,145 @@ function alert(message) {{ alerts.push(message); }}
 }});
 """
         node_test_path = Path(self.tmp.name) / "api_key_limit_helper_test.js"
+        node_test_path.write_text(node_program, encoding="utf-8")
+        completed = subprocess.run(
+            [node, str(node_test_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_admin_html_gates_task_actions_by_status(self):
+        html = server.ADMIN_HTML
+        self.assertIn("function taskCanRetry", html)
+        self.assertIn("function taskCanHydrate", html)
+        self.assertIn("function taskCanCancel", html)
+        self.assertIn("function taskActionButtons", html)
+        self.assertIn("taskActionButtons(t)", html)
+        self.assertIn("taskActionButtons(task)", html)
+        self.assertIn("确认取消任务 #${id}", html)
+        self.assertNotIn('onclick="hydrateTask(${t.id})">重水合</button>', html)
+        self.assertNotIn('onclick="retryTask(${t.id})">重试</button>', html)
+        self.assertNotIn('onclick="cancelTask(${t.id})">取消</button>', html)
+
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to execute the task action helper test")
+        script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+
+        def source_between(start_marker, end_marker):
+            start = script.index(start_marker)
+            end = script.index(end_marker, start)
+            return script[start:end].strip()
+
+        escape_source = source_between("function escapeHtml(", "function normalizedOptionValues(")
+        predicates_source = source_between("function taskCanRetry(", "function renderTasks(")
+        render_source = source_between("function renderTasks(", "function renderTaskAsset(")
+        action_source = source_between("async function runTaskAction(", "// === API Keys ===")
+        node_program = f"""
+{escape_source}
+{predicates_source}
+const expectations = {{
+  queued:    {{retry:false, hydrate:false, cancel:true}},
+  running:   {{retry:false, hydrate:false, cancel:true}},
+  submitted: {{retry:false, hydrate:true,  cancel:true}},
+  hydrating: {{retry:false, hydrate:true,  cancel:true}},
+  failed:    {{retry:true,  hydrate:false, cancel:false}},
+  expired:   {{retry:true,  hydrate:false, cancel:false}},
+  completed: {{retry:false, hydrate:false, cancel:false}},
+  cancelled: {{retry:false, hydrate:false, cancel:false}},
+}};
+for (const [status, expected] of Object.entries(expectations)) {{
+  const actual = {{
+    retry: taskCanRetry(status),
+    hydrate: taskCanHydrate(status),
+    cancel: taskCanCancel(status),
+  }};
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {{
+    throw new Error(`${{status}} predicates: expected ${{JSON.stringify(expected)}}, got ${{JSON.stringify(actual)}}`);
+  }}
+  const actions = taskActionButtons({{id: 17, status}});
+  for (const [action, allowed] of Object.entries(expected)) {{
+    const handler = action === 'retry' ? 'retryTask(17)' : action === 'hydrate' ? 'hydrateTask(17)' : 'cancelTask(17)';
+    if (actions.includes(handler) !== allowed) {{
+      throw new Error(`${{status}} ${{action}} button mismatch: ${{actions}}`);
+    }}
+  }}
+}}
+const tbody = {{innerHTML: ''}};
+const state = {{tasks: Object.keys(expectations).map((status, index) => ({{
+  id: index + 1,
+  kind: 'video',
+  status,
+  prompt: status,
+  created_at: 1,
+}}))}};
+const document = {{getElementById: id => {{
+  if (id !== 'tasks-tbody') throw new Error(`unexpected element ${{id}}`);
+  return tbody;
+}}}};
+{render_source}
+renderTasks();
+for (const [index, [status, expected]] of Object.entries(Object.entries(expectations))) {{
+  const id = Number(index) + 1;
+  for (const [action, allowed] of Object.entries(expected)) {{
+    const handler = action === 'retry' ? `retryTask(${{id}})` : action === 'hydrate' ? `hydrateTask(${{id}})` : `cancelTask(${{id}})`;
+    const rowStart = tbody.innerHTML.indexOf(`<td>${{id}}</td>`);
+    const rowEnd = tbody.innerHTML.indexOf('</tr>', rowStart);
+    const row = tbody.innerHTML.slice(rowStart, rowEnd);
+    if (row.includes(handler) !== allowed) {{
+      throw new Error(`${{status}} rendered ${{action}} mismatch: ${{row}}`);
+    }}
+  }}
+}}
+let apiCalls = 0;
+let refreshCalls = 0;
+const alerts = [];
+let confirmResult = false;
+async function api(method, path) {{
+  apiCalls += 1;
+  if (method !== 'POST' || path !== '/api/tasks/42/cancel') throw new Error('unexpected API call');
+  return {{task: {{id: 42, status: 'cancelled'}}}};
+}}
+async function loadTasks() {{
+  refreshCalls += 1;
+  throw new Error('refresh boom');
+}}
+function renderTaskPreview() {{}}
+function confirm(message) {{
+  if (message !== '确认取消任务 #42？') throw new Error(`unexpected confirmation: ${{message}}`);
+  return confirmResult;
+}}
+function alert(message) {{ alerts.push(String(message)); }}
+{action_source}
+(async () => {{
+  await cancelTask(42);
+  if (apiCalls !== 0) throw new Error('cancel API was called after confirmation rejection');
+  confirmResult = true;
+  await cancelTask(42);
+  if (apiCalls !== 1) throw new Error(`expected one cancel API call, got ${{apiCalls}}`);
+  if (refreshCalls !== 1) throw new Error(`expected one refresh, got ${{refreshCalls}}`);
+  if (alerts.length !== 1 || !alerts[0].includes('取消成功，但列表刷新失败')) {{
+    throw new Error(`refresh failure message was not action-specific: ${{alerts.join(' | ')}}`);
+  }}
+  if (alerts[0].includes('取消失败')) {{
+    throw new Error(`refresh failure was reported as action failure: ${{alerts[0]}}`);
+  }}
+  api = async () => {{
+    throw new Error('TASK_NOT_CANCELLABLE: only active tasks can be cancelled');
+  }};
+  await cancelTask(42);
+  if (alerts.length !== 2 || !alerts[1].includes('TASK_NOT_CANCELLABLE')) {{
+    throw new Error(`Gateway envelope error was not readable: ${{alerts.join(' | ')}}`);
+  }}
+}})().catch(error => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+        node_test_path = Path(self.tmp.name) / "task_action_helper_test.js"
         node_test_path.write_text(node_program, encoding="utf-8")
         completed = subprocess.run(
             [node, str(node_test_path)],
