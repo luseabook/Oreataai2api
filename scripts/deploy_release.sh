@@ -44,7 +44,7 @@ mkdir -p "$release_root"
 mkdir "$release_dir"
 tar -xzf "$archive" -C "$release_dir"
 
-# 仓库中可保留本地开发配置和数据库，但线上版本必须始终指向持久化目录。
+# 仓库可保留本地开发配置和数据库，但线上版本必须始终指向持久化目录。
 for state_file in config.json accounts.db; do
   rm -f -- "$release_dir/$state_file"
   ln -s "$state_dir/$state_file" "$release_dir/$state_file"

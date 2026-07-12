@@ -4,9 +4,15 @@ from pathlib import Path
 
 class DeploymentReleaseTests(unittest.TestCase):
     def setUp(self):
-        self.source = (
-            Path(__file__).resolve().parents[1] / "scripts" / "deploy_release.sh"
-        ).read_text(encoding="utf-8")
+        self.project_root = Path(__file__).resolve().parents[1]
+        self.script_path = self.project_root / "scripts" / "deploy_release.sh"
+        self.source = self.script_path.read_text(encoding="utf-8")
+
+    def test_shell_scripts_are_pinned_to_lf_line_endings(self):
+        attributes = (self.project_root / ".gitattributes").read_text(encoding="utf-8")
+
+        self.assertIn("*.sh text eol=lf", attributes)
+        self.assertNotIn(b"\r\n", self.script_path.read_bytes())
 
     def test_links_all_runtime_state_before_switching_current(self):
         state_loop = "for state_file in config.json accounts.db; do"
