@@ -1,5 +1,7 @@
 import json
+import shutil
 import struct
+import subprocess
 import threading
 import tempfile
 import time
@@ -3162,6 +3164,134 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("restoreBackup", html)
         self.assertIn("/api/admin/backup", html)
         self.assertIn("/api/admin/restore", html)
+
+    def test_admin_html_preserves_api_key_limit_semantics(self):
+        html = server.ADMIN_HTML
+        self.assertIn("function optionalNonNegativeIntegerValue", html)
+        self.assertIn("k.rate_limit_per_minute??''", html)
+        self.assertIn("k.daily_request_limit??''", html)
+        self.assertIn("k.daily_point_limit??''", html)
+        self.assertNotIn("k.rate_limit_per_minute||''", html)
+        self.assertIn("rate_limit_per_minute:optionalNonNegativeIntegerValue(", html)
+        self.assertIn("daily_request_limit:optionalNonNegativeIntegerValue(", html)
+        self.assertIn("daily_point_limit:optionalNonNegativeIntegerValue(", html)
+        self.assertIn("k.status", html)
+        self.assertIn("apiKeyStatusTagClass", html)
+        self.assertIn("escapeHtml(keyStatus)", html)
+        self.assertIn("留空=继承，0=不限", html)
+
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to execute the API key limit helper test")
+        script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+
+        def extract_function(marker):
+            start = script.index(marker)
+            brace_start = script.index("{", start)
+            depth = 0
+            for index in range(brace_start, len(script)):
+                if script[index] == "{":
+                    depth += 1
+                elif script[index] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return script[start : index + 1]
+            self.fail(f"{marker} function was not complete")
+
+        helper_source = extract_function("function optionalNonNegativeIntegerValue(")
+        status_source = extract_function("function apiKeyStatusTagClass(")
+        update_source = extract_function("async function updateApiKeyPolicy(")
+        node_program = f"""
+{helper_source}
+{status_source}
+const validCases = [
+  ['', null],
+  ['   ', null],
+  ['0', 0],
+  ['7', 7],
+  ['0007', 7],
+  [0, 0],
+  [42, 42],
+];
+for (const [input, expected] of validCases) {{
+  const actual = optionalNonNegativeIntegerValue(input, '限额');
+  if (actual !== expected) {{
+    throw new Error(`input ${{JSON.stringify(input)}}: expected ${{expected}}, got ${{actual}}`);
+  }}
+  if (actual !== null && typeof actual !== 'number') {{
+    throw new Error(`input ${{JSON.stringify(input)}} returned non-number ${{typeof actual}}`);
+  }}
+}}
+for (const input of ['-1', '1.5', 'abc', '1e3', '9007199254740992']) {{
+  let rejected = false;
+  try {{
+    optionalNonNegativeIntegerValue(input, '限额');
+  }} catch (error) {{
+    rejected = true;
+  }}
+  if (!rejected) throw new Error(`invalid input ${{JSON.stringify(input)}} was accepted`);
+}}
+for (const [status, expectedClass] of Object.entries({{
+  enabled: 'tag-green',
+  disabled: 'tag-gray',
+  expired: 'tag-red',
+  deleted: 'tag-gray',
+  unknown: 'tag-gray',
+}})) {{
+  const actualClass = apiKeyStatusTagClass(status);
+  if (actualClass !== expectedClass) {{
+    throw new Error(`${{status}}: expected ${{expectedClass}}, got ${{actualClass}}`);
+  }}
+}}
+const fields = {{
+  'ak-rate-9': {{value: ''}},
+  'ak-req-9': {{value: '0'}},
+  'ak-point-9': {{value: '17'}},
+  'ak-kinds-9': {{value: 'image'}},
+  'ak-models-9': {{value: ''}},
+  'ak-scenes-9': {{value: ''}},
+  'ak-resolutions-9': {{value: ''}},
+  'ak-durations-9': {{value: ''}},
+  'ak-uploads-9': {{checked: true}},
+  'ak-experimental-9': {{checked: false}},
+}};
+const document = {{getElementById: id => fields[id]}};
+let capturedBody = undefined;
+async function api(method, path, body) {{
+  if (method !== 'PATCH' || path !== '/api/admin/apikeys/9') throw new Error('unexpected API call');
+  capturedBody = body;
+  return {{ok: true}};
+}}
+async function loadClients() {{}}
+async function loadApiKeys() {{}}
+function alert(message) {{ throw new Error(`unexpected alert: ${{message}}`); }}
+{update_source}
+(async () => {{
+  await updateApiKeyPolicy(9);
+  const expected = {{rate_limit_per_minute: null, daily_request_limit: 0, daily_point_limit: 17}};
+  for (const [field, value] of Object.entries(expected)) {{
+    if (capturedBody?.[field] !== value) {{
+      throw new Error(`${{field}}: expected ${{value}}, got ${{capturedBody?.[field]}}`);
+    }}
+    if (value !== null && typeof capturedBody[field] !== 'number') {{
+      throw new Error(`${{field}} was not sent as a number`);
+    }}
+  }}
+}})().catch(error => {{
+  console.error(error);
+  process.exitCode = 1;
+}});
+"""
+        node_test_path = Path(self.tmp.name) / "api_key_limit_helper_test.js"
+        node_test_path.write_text(node_program, encoding="utf-8")
+        completed = subprocess.run(
+            [node, str(node_test_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
     def test_admin_html_contains_balance_refresh_controls(self):
         html = server.ADMIN_HTML
