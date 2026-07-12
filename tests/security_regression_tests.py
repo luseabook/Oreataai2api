@@ -1,6 +1,7 @@
 import json
 import hashlib
 import io
+import re
 import shutil
 import subprocess
 import tempfile
@@ -925,6 +926,33 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
 
         completed = subprocess.run(
             [node, "--check", str(node_script_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
+    def test_admin_html_raw_source_script_parses_in_node(self):
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to parse the raw embedded admin script")
+        source = Path(server.__file__).read_text(encoding="utf-8")
+        html_match = re.search(r'ADMIN_HTML\s*=\s*"""(.*?)"""', source, flags=re.DOTALL)
+        self.assertIsNotNone(html_match, "ADMIN_HTML source literal was not found")
+        raw_html = html_match.group(1)
+        raw_script = raw_html.split("<script>", 1)[1].split("</script>", 1)[0]
+        raw_script_path = Path(self.tmp.name) / "admin_raw_source_script.js"
+        raw_script_path.write_text(raw_script, encoding="utf-8")
+        runner_path = Path(self.tmp.name) / "parse_admin_raw_source.js"
+        runner_path.write_text(
+            "const fs=require('fs'); new Function(fs.readFileSync(process.argv[2], 'utf8'));",
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [node, str(runner_path), str(raw_script_path)],
             capture_output=True,
             text=True,
             encoding="utf-8",

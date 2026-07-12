@@ -7819,7 +7819,7 @@ async function init() {
   document.getElementById('status-text').textContent = `就绪 — ${v} 可用账号`;
   document.getElementById('gw-url').textContent = location.origin + '/v1/generate';
   document.getElementById('gw-example').textContent =
-    'curl -H "Authorization: Bearer <key>" -H "Content-Type: application/json" -d \\'{"kind":"image","prompt":"hello"}\\' ' + location.origin + '/v1/generate';
+    `curl -H "Authorization: Bearer <key>" -H "Content-Type: application/json" -d '{"kind":"image","prompt":"hello"}' ${location.origin}/v1/generate`;
 }
 function copyExample() { copyText(document.getElementById('gw-example').textContent); }
 
