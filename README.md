@@ -343,6 +343,19 @@ Content-Type: multipart/form-data
 }
 ```
 
+### 发布部署
+
+systemd 服务器可将 Git 版本打包为不可变发布目录：
+
+```bash
+git archive --format=tar.gz -o /tmp/oreateai-<revision>.tar.gz <revision>
+sudo bash scripts/deploy_release.sh /tmp/oreateai-<revision>.tar.gz <revision>
+```
+
+脚本会在切换 `current` 软链接前，将 `config.json` 和 `accounts.db` 同时链接到
+`/var/lib/oreateai` 持久化目录。服务重启后会检查 `/healthz`，未通过时自动回滚到
+上一版本。
+
 工作节点依赖 `puppeteer-core`，账号 Cookie 通过子进程标准输入传递，不会出现在进程命令行中。
 - 网关结果：已支持同步解析 SSE 和历史消息资源 URL，后续可补异步任务轮询、失败任务重试/取消
 
