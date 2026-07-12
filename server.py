@@ -3878,33 +3878,78 @@ def cancel_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "t
     try:
         conn.execute("BEGIN IMMEDIATE")
         current = conn.execute(
-            "SELECT status,cancel_requested_at FROM tasks WHERE id=?",
+            "SELECT status,api_key_id,attempt_count FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
+        if not current:
+            conn.rollback()
+            return
+        current_attempt = conn.execute(
+            """
+            SELECT id,attempt_no
+            FROM task_attempts
+            WHERE id=? AND task_id=? AND status='running'
+              AND attempt_no=?
+              AND id=(
+                  SELECT id FROM task_attempts
+                  WHERE task_id=?
+                  ORDER BY attempt_no DESC,id DESC
+                  LIMIT 1
+              )
+            """,
+            (attempt_id, task_id, current["attempt_count"], task_id),
+        ).fetchone()
+        if not current_attempt:
+            conn.rollback()
+            return
         task_is_cancelled = bool(current and str(current["status"] or "") == "cancelled")
-        if current and expected_status in {"running", "hydrating"}:
+        if not task_is_cancelled and expected_status in {"running", "hydrating"}:
             result = conn.execute(
                 """
                 UPDATE tasks
                 SET status='cancelled', error_code='TASK_CANCELLED', error_message=?,
                     cancel_requested_at=COALESCE(cancel_requested_at, ?),
                     finished_at=?, next_attempt_at=NULL, updated_at=?
-                WHERE id=? AND status=?
+                WHERE id=? AND status=? AND attempt_count=?
                 """,
-                (message, now, now, now, task_id, expected_status),
+                (
+                    message,
+                    now,
+                    now,
+                    now,
+                    task_id,
+                    expected_status,
+                    current_attempt["attempt_no"],
+                ),
             )
-            task_is_cancelled = task_is_cancelled or result.rowcount == 1
-        if task_is_cancelled:
-            conn.execute(
-                """
-                UPDATE task_attempts
-                SET status='cancelled', error_code='TASK_CANCELLED', error_message=?,
-                    assets_json=?, finished_at=?
-                WHERE id=? AND task_id=? AND status='running'
-                """,
-                (message, encode_json_value([]), now, attempt_id, task_id),
-            )
-        if task_is_cancelled and task.get("api_key_id"):
+            if result.rowcount != 1:
+                conn.rollback()
+                return
+            task_is_cancelled = True
+        if not task_is_cancelled:
+            conn.rollback()
+            return
+        attempt_update = conn.execute(
+            """
+            UPDATE task_attempts
+            SET status='cancelled', error_code='TASK_CANCELLED', error_message=?,
+                assets_json=?, finished_at=?
+            WHERE id=? AND task_id=? AND status='running' AND attempt_no=?
+            """,
+            (
+                message,
+                encode_json_value([]),
+                now,
+                attempt_id,
+                task_id,
+                current_attempt["attempt_no"],
+            ),
+        )
+        if attempt_update.rowcount != 1:
+            conn.rollback()
+            return
+        tenant_api_key_id = current["api_key_id"] or task.get("api_key_id")
+        if tenant_api_key_id:
             conn.execute(
                 """
                 UPDATE usage_log
@@ -3916,7 +3961,7 @@ def cancel_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "t
                     ORDER BY id DESC LIMIT 1
                 )
                 """,
-                (task_id, task.get("api_key_id")),
+                (task_id, tenant_api_key_id),
             )
         conn.commit()
     except Exception:
@@ -7045,7 +7090,7 @@ def cancel_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[s
     try:
         conn.execute("BEGIN IMMEDIATE")
         current = conn.execute(
-            "SELECT status,api_key_id FROM tasks WHERE id=?",
+            "SELECT status,api_key_id,attempt_count FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
         if not current:
@@ -7075,6 +7120,20 @@ def cancel_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[s
                     "allowed": list(TASK_CANCELLABLE_STATUSES),
                 },
             )
+        current_attempt = conn.execute(
+            """
+            SELECT id,attempt_no
+            FROM task_attempts
+            WHERE task_id=? AND status='running' AND attempt_no=?
+              AND id=(
+                  SELECT id FROM task_attempts
+                  WHERE task_id=?
+                  ORDER BY attempt_no DESC,id DESC
+                  LIMIT 1
+              )
+            """,
+            (task_id, current["attempt_count"], task_id),
+        ).fetchone()
         result = conn.execute(
             f"""
             UPDATE tasks
@@ -7093,6 +7152,42 @@ def cancel_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[s
                 {"status": current_status},
             )
         tenant_api_key_id = current_api_key_id or api_key_id
+        if current_attempt:
+            attempt_update = conn.execute(
+                """
+                UPDATE task_attempts
+                SET status='cancelled', error_code='TASK_CANCELLED',
+                    error_message='task cancelled', assets_json=?, finished_at=?
+                WHERE id=? AND task_id=? AND status='running' AND attempt_no=?
+                """,
+                (
+                    encode_json_value([]),
+                    now,
+                    current_attempt["id"],
+                    task_id,
+                    current_attempt["attempt_no"],
+                ),
+            )
+            if attempt_update.rowcount != 1:
+                raise RuntimeError("current task attempt changed during cancellation")
+        usage_scope = "task_id=?"
+        usage_params: List[Any] = [task_id]
+        if tenant_api_key_id is not None:
+            usage_scope += " AND api_key_id=?"
+            usage_params.append(tenant_api_key_id)
+        conn.execute(
+            f"""
+            UPDATE usage_log
+            SET status='cancelled', response_summary='cancelled',
+                error_code='TASK_CANCELLED', status_code=499
+            WHERE id=(
+                SELECT id FROM usage_log
+                WHERE {usage_scope}
+                ORDER BY id DESC LIMIT 1
+            )
+            """,
+            tuple(usage_params),
+        )
         conn.commit()
     except Exception:
         if conn.in_transaction:
@@ -7100,15 +7195,6 @@ def cancel_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[s
         raise
     finally:
         conn.close()
-    if tenant_api_key_id:
-        update_usage_log_for_task(
-            task_id,
-            tenant_api_key_id,
-            status="cancelled",
-            response_summary="cancelled",
-            error_code="TASK_CANCELLED",
-            status_code=499,
-        )
     return gateway_task_detail_payload(task_id, api_key_id)
 
 

@@ -1176,6 +1176,107 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(json.loads(task_row["assets_json"]), assets)
         self.assertEqual(task_row["error_code"], "")
 
+    def test_stale_attempt_cancel_cannot_cancel_retried_current_attempt(self):
+        self.seed_account_with_capabilities()
+        api_key_id = self.seed_api_key("stale-attempt-cancel-key")
+        created = self.client.post(
+            "/v1/generate",
+            headers={"Authorization": "Bearer stale-attempt-cancel-key"},
+            json=self.valid_image_request(),
+        )
+        self.assertEqual(created.status_code, 202)
+        task_id = created.json()["task_id"]
+        attempt_a_task = server.claim_next_task()
+        self.assertEqual(attempt_a_task["id"], task_id)
+        attempt_a_id = server.create_task_attempt(attempt_a_task, "generation")
+        server.update_task_record(task_id, updated_at=900.0)
+        self.assertEqual(
+            server.recover_stale_running_tasks(now=1000.0, stale_after_seconds=60.0),
+            1,
+        )
+
+        retried = self.client.post(
+            f"/v1/tasks/{task_id}/retry",
+            headers={"Authorization": "Bearer stale-attempt-cancel-key"},
+        )
+        self.assertEqual(retried.status_code, 200)
+        attempt_b_task = server.claim_next_task()
+        self.assertEqual(attempt_b_task["id"], task_id)
+        attempt_b_id = server.create_task_attempt(attempt_b_task, "generation")
+        conn = server.db_conn()
+        before_task = dict(
+            conn.execute(
+                "SELECT status,attempt_count,error_code,cancel_requested_at FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+        )
+        before_attempt_b = dict(
+            conn.execute(
+                """
+                SELECT status,error_code,error_message,assets_json,finished_at
+                FROM task_attempts WHERE id=?
+                """,
+                (attempt_b_id,),
+            ).fetchone()
+        )
+        before_usage = dict(
+            conn.execute(
+                """
+                SELECT status,response_summary,error_code,status_code,actual_point_cost
+                FROM usage_log WHERE task_id=? AND api_key_id=?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (task_id, api_key_id),
+            ).fetchone()
+        )
+        conn.close()
+        self.assertEqual(before_task["status"], "running")
+        self.assertEqual(before_task["attempt_count"], 2)
+        self.assertEqual(before_attempt_b["status"], "running")
+
+        server.cancel_task_attempt(
+            attempt_a_task,
+            attempt_a_id,
+            "late cancellation from attempt A",
+        )
+
+        conn = server.db_conn()
+        after_task = dict(
+            conn.execute(
+                "SELECT status,attempt_count,error_code,cancel_requested_at FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+        )
+        attempt_a = conn.execute(
+            "SELECT status,error_code FROM task_attempts WHERE id=?",
+            (attempt_a_id,),
+        ).fetchone()
+        after_attempt_b = dict(
+            conn.execute(
+                """
+                SELECT status,error_code,error_message,assets_json,finished_at
+                FROM task_attempts WHERE id=?
+                """,
+                (attempt_b_id,),
+            ).fetchone()
+        )
+        after_usage = dict(
+            conn.execute(
+                """
+                SELECT status,response_summary,error_code,status_code,actual_point_cost
+                FROM usage_log WHERE task_id=? AND api_key_id=?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (task_id, api_key_id),
+            ).fetchone()
+        )
+        conn.close()
+        self.assertEqual(attempt_a["status"], "expired")
+        self.assertEqual(attempt_a["error_code"], "WORKER_LOST")
+        self.assertEqual(after_task, before_task)
+        self.assertEqual(after_attempt_b, before_attempt_b)
+        self.assertEqual(after_usage, before_usage)
+
     def test_late_finalize_preserves_attempt_expired_by_worker_recovery(self):
         task_id = self.seed_task(status="running", kind="image", started_at=800.0)
         task = dict(server.fetch_task_row(task_id))
@@ -1236,6 +1337,163 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(task_row["status"], "expired")
         self.assertEqual(task_row["error_code"], "WORKER_LOST")
         self.assertEqual(json.loads(task_row["assets_json"]), [])
+
+    def test_api_cancel_transaction_finishes_current_running_attempt(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("transactional-cancel-key")
+        created = self.client.post(
+            "/v1/generate",
+            headers={"Authorization": "Bearer transactional-cancel-key"},
+            json=self.valid_image_request(),
+        )
+        self.assertEqual(created.status_code, 202)
+        task_id = created.json()["task_id"]
+        task = server.claim_next_task()
+        self.assertEqual(task["id"], task_id)
+        attempt_id = server.create_task_attempt(task, "generation")
+
+        cancelled = self.client.post(
+            f"/v1/tasks/{task_id}/cancel",
+            headers={"Authorization": "Bearer transactional-cancel-key"},
+        )
+
+        self.assertEqual(cancelled.status_code, 200)
+        conn = server.db_conn()
+        task_row = conn.execute(
+            "SELECT status,error_code FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        attempt_row = conn.execute(
+            "SELECT status,error_code,assets_json,finished_at FROM task_attempts WHERE id=?",
+            (attempt_id,),
+        ).fetchone()
+        usage_row = conn.execute(
+            "SELECT status,error_code,status_code FROM usage_log WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(task_row["status"], "cancelled")
+        self.assertEqual(task_row["error_code"], "TASK_CANCELLED")
+        self.assertEqual(attempt_row["status"], "cancelled")
+        self.assertEqual(attempt_row["error_code"], "TASK_CANCELLED")
+        self.assertEqual(json.loads(attempt_row["assets_json"]), [])
+        self.assertIsNotNone(attempt_row["finished_at"])
+        self.assertEqual(usage_row["status"], "cancelled")
+        self.assertEqual(usage_row["error_code"], "TASK_CANCELLED")
+        self.assertEqual(usage_row["status_code"], 499)
+
+    def test_api_cancel_rolls_back_task_attempt_and_usage_when_usage_update_fails(self):
+        self.seed_account_with_capabilities()
+        self.seed_api_key("cancel-rollback-key")
+        created = self.client.post(
+            "/v1/generate",
+            headers={"Authorization": "Bearer cancel-rollback-key"},
+            json=self.valid_image_request(),
+        )
+        self.assertEqual(created.status_code, 202)
+        task_id = created.json()["task_id"]
+        task = server.claim_next_task()
+        self.assertEqual(task["id"], task_id)
+        attempt_id = server.create_task_attempt(task, "generation")
+        conn = server.db_conn()
+        before_task = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+        before_attempt = dict(
+            conn.execute("SELECT * FROM task_attempts WHERE id=?", (attempt_id,)).fetchone()
+        )
+        before_usage = dict(
+            conn.execute(
+                "SELECT * FROM usage_log WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        )
+        conn.close()
+
+        real_db_conn = server.db_conn
+
+        class FailingUsageConnection:
+            def __init__(self):
+                self.connection = real_db_conn()
+                self.closed = False
+
+            @property
+            def in_transaction(self):
+                return False if self.closed else self.connection.in_transaction
+
+            def execute(self, sql, parameters=()):
+                normalized = " ".join(str(sql).split()).upper()
+                is_cancel_usage = normalized.startswith("UPDATE USAGE_LOG SET") and (
+                    "STATUS='CANCELLED'" in normalized
+                    or (parameters and parameters[0] == "cancelled")
+                )
+                if is_cancel_usage:
+                    self.connection.rollback()
+                    self.connection.close()
+                    self.closed = True
+                    raise RuntimeError("forced usage cancellation failure")
+                return self.connection.execute(sql, parameters)
+
+            def commit(self):
+                return self.connection.commit()
+
+            def rollback(self):
+                if not self.closed:
+                    return self.connection.rollback()
+                return None
+
+            def close(self):
+                if not self.closed:
+                    self.connection.close()
+                    self.closed = True
+
+        with patch.object(server, "db_conn", side_effect=FailingUsageConnection):
+            failure_client = TestClient(server.app, raise_server_exceptions=False)
+            try:
+                failed = failure_client.post(
+                    f"/v1/tasks/{task_id}/cancel",
+                    headers={"Authorization": "Bearer cancel-rollback-key"},
+                )
+            finally:
+                failure_client.close()
+        self.assertEqual(failed.status_code, 500)
+
+        conn = server.db_conn()
+        after_task = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+        after_attempt = dict(
+            conn.execute("SELECT * FROM task_attempts WHERE id=?", (attempt_id,)).fetchone()
+        )
+        after_usage = dict(
+            conn.execute(
+                "SELECT * FROM usage_log WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        )
+        conn.close()
+        self.assertEqual(after_task, before_task)
+        self.assertEqual(after_attempt, before_attempt)
+        self.assertEqual(after_usage, before_usage)
+
+        retried = self.client.post(
+            f"/v1/tasks/{task_id}/cancel",
+            headers={"Authorization": "Bearer cancel-rollback-key"},
+        )
+        self.assertEqual(retried.status_code, 200)
+        conn = server.db_conn()
+        final_task = conn.execute(
+            "SELECT status FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        final_attempt = conn.execute(
+            "SELECT status FROM task_attempts WHERE id=?",
+            (attempt_id,),
+        ).fetchone()
+        final_usage = conn.execute(
+            "SELECT status FROM usage_log WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(final_task["status"], "cancelled")
+        self.assertEqual(final_attempt["status"], "cancelled")
+        self.assertEqual(final_usage["status"], "cancelled")
 
     def test_submitted_task_expires_after_hydration_deadline(self):
         original_cfg = server.CFG
