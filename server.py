@@ -5800,16 +5800,19 @@ def run_pool_maintenance_job(job_id: int) -> None:
         elif status == "invalid":
             category = "invalid"
             invalid_found += 1
-        elif status in {"verified", "active"}:
+        elif status in {"verified", "active", "pending_validation"}:
             try:
-                session = CLIENT.session_from_account(row)
-                detail = CLIENT.fetch_account_point_detail(session, row)
-                update_account_balance_snapshot(account_id, detail)
                 update_pool_maintenance_job(
                     job_id,
                     current_step="checking_generation",
                 )
-                probe_account_generation_health(row)
+                if status == "pending_validation":
+                    validate_registered_account(account_id)
+                else:
+                    session = CLIENT.session_from_account(row)
+                    detail = CLIENT.fetch_account_point_detail(session, row)
+                    update_account_balance_snapshot(account_id, detail)
+                    probe_account_generation_health(row)
             except Exception as exc:
                 check_failures += 1
                 code = upstream_error_code(exc)

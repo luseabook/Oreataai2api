@@ -1854,6 +1854,58 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertEqual(row["status"], "disabled")
         self.assertIn("212361", row["last_error"])
 
+    def test_pool_maintenance_revalidates_and_promotes_pending_registered_account(self):
+        account_id = self.seed_account()
+        conn = server.db_conn()
+        conn.execute(
+            """
+            UPDATE accounts
+            SET status='pending_validation',
+                model_info_json=?,
+                rest_point=NULL,
+                balance_updated_at=NULL,
+                last_used_at=NULL
+            WHERE id=?
+            """,
+            (json.dumps(self.sample_image_info()), account_id),
+        )
+        conn.commit()
+        conn.close()
+        job = server.create_pool_maintenance_job(
+            clean_risk=True,
+            supplement=False,
+            target_healthy=1,
+            max_register=0,
+        )
+
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(
+                server.CLIENT,
+                "fetch_account_point_detail",
+                return_value={"restPoint": 100},
+            ),
+            patch.object(
+                server,
+                "probe_account_generation_health",
+                return_value={"ok": True, "asset_count": 1},
+            ),
+        ):
+            server.run_pool_maintenance_job(job["id"])
+
+        completed = server.get_pool_maintenance_job(job["id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["healthy_before"], 0)
+        self.assertEqual(completed["healthy_after"], 1)
+        conn = server.db_conn()
+        row = conn.execute(
+            "SELECT status,last_error FROM accounts WHERE id=?",
+            (account_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row["status"], "verified")
+        self.assertIsNone(row["last_error"])
+
     def test_pool_maintenance_does_not_reprocess_previously_isolated_accounts(self):
         account_id = self.seed_account()
         conn = server.db_conn()
