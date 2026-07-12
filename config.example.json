@@ -48,6 +48,12 @@
     "idempotency_ttl_hours": 24,
     "idempotency_key_max_length": 255,
     "account_cooldown_seconds": 300,
+    "account_risk_quarantine_seconds": 3600,
+    "account_failover_max_attempts": 5,
+    "account_failover_error_codes": [
+      "200001",
+      "212361"
+    ],
     "prompt_max_length": 4000,
     "request_id_max_length": 128,
     "upload_max_bytes": 104857600,

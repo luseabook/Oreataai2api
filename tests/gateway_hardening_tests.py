@@ -3791,6 +3791,168 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertGreater(row["cooldown_until"], time.time())
         self.assertIn("upstream down", row["last_error"])
 
+    def test_risk_control_failure_automatically_switches_account_and_succeeds(self):
+        first_account_id = self.seed_account_with_capabilities("failover-first@example.com")
+        second_account_id = self.seed_account_with_capabilities("failover-second@example.com")
+        self.seed_api_key("automatic-failover-key")
+        attempted_account_ids = []
+
+        def submit(account, *_args, **_kwargs):
+            attempted_account_ids.append(account["id"])
+            if len(attempted_account_ids) == 1:
+                raise server.UpstreamGenerationError({"code": "212361", "message": "spam user"})
+            return {
+                "payload": {},
+                "response": {"chat": {"chatId": "chat-failover", "focusId": "focus-failover"}},
+                "assets": ["https://cdn.oreateai.com/static/result/failover.jpg"],
+                "stream": {"status": "streamed"},
+                "hydration": {"status": "completed"},
+                "status": "completed",
+            }
+
+        with (
+            patch.object(server, "capture_account_balance_snapshot", return_value=None),
+            patch.object(server, "submit_generation_for_account", side_effect=submit),
+        ):
+            response = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer automatic-failover-key"},
+                json=self.valid_image_request(sync_wait_seconds=1),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        task = response.json()["task"]
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(task["assets"], ["https://cdn.oreateai.com/static/result/failover.jpg"])
+        self.assertEqual(task["attempt_count"], 2)
+        self.assertEqual(len(task["attempts"]), 2)
+        self.assertEqual(task["attempts"][0]["status"], "failed")
+        self.assertEqual(task["attempts"][0]["error_code"], "212361")
+        self.assertEqual(task["attempts"][1]["status"], "completed")
+        self.assertEqual(len(set(attempted_account_ids)), 2)
+        self.assertEqual(set(attempted_account_ids), {first_account_id, second_account_id})
+        self.assertEqual(task["account_id"], attempted_account_ids[-1])
+
+        conn = server.db_conn()
+        failed_account = conn.execute(
+            "SELECT failure_count,cooldown_until,last_error FROM accounts WHERE id=?",
+            (attempted_account_ids[0],),
+        ).fetchone()
+        successful_account = conn.execute(
+            "SELECT failure_count,cooldown_until,last_error FROM accounts WHERE id=?",
+            (attempted_account_ids[-1],),
+        ).fetchone()
+        usage_rows = conn.execute(
+            "SELECT account_id,status,error_code FROM usage_log WHERE task_id=?",
+            (task["id"],),
+        ).fetchall()
+        conn.close()
+        self.assertEqual(failed_account["failure_count"], 1)
+        self.assertGreater(failed_account["cooldown_until"], time.time() + 3500)
+        self.assertIn("212361", failed_account["last_error"])
+        self.assertEqual(successful_account["failure_count"], 0)
+        self.assertIsNone(successful_account["cooldown_until"])
+        self.assertEqual(len(usage_rows), 1)
+        self.assertEqual(usage_rows[0]["account_id"], attempted_account_ids[-1])
+        self.assertEqual(usage_rows[0]["status"], "completed")
+        self.assertEqual(usage_rows[0]["error_code"], "")
+
+    def test_parameter_error_does_not_rotate_through_account_pool(self):
+        self.seed_account_with_capabilities("params-first@example.com")
+        self.seed_account_with_capabilities("params-second@example.com")
+        self.seed_api_key("non-retryable-params-key")
+        attempted_account_ids = []
+
+        def submit(account, *_args, **_kwargs):
+            attempted_account_ids.append(account["id"])
+            raise server.UpstreamGenerationError({"code": "200002", "message": "params error"})
+
+        with (
+            patch.object(server, "capture_account_balance_snapshot", return_value=None),
+            patch.object(server, "submit_generation_for_account", side_effect=submit),
+        ):
+            response = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer non-retryable-params-key"},
+                json=self.valid_image_request(sync_wait_seconds=1),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "200002")
+        self.assertEqual(len(attempted_account_ids), 1)
+        task = response.json()["error"]["details"]["task_id"]
+        detail = self.client.get(
+            f"/v1/tasks/{task}",
+            headers={"Authorization": "Bearer non-retryable-params-key"},
+        ).json()["task"]
+        self.assertEqual(detail["attempt_count"], 1)
+        self.assertEqual(len(detail["attempts"]), 1)
+
+    def test_account_failover_stops_at_configured_attempt_limit(self):
+        for index in range(3):
+            self.seed_account_with_capabilities(f"bounded-failover-{index}@example.com")
+        self.seed_api_key("bounded-failover-key")
+        attempted_account_ids = []
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {"gateway": {"account_failover_max_attempts": 2}},
+        )
+
+        def submit(account, *_args, **_kwargs):
+            attempted_account_ids.append(account["id"])
+            raise server.UpstreamGenerationError({"code": "212361", "message": "spam user"})
+
+        try:
+            with (
+                patch.object(server, "capture_account_balance_snapshot", return_value=None),
+                patch.object(server, "submit_generation_for_account", side_effect=submit),
+            ):
+                response = self.client.post(
+                    "/v1/generate",
+                    headers={"Authorization": "Bearer bounded-failover-key"},
+                    json=self.valid_image_request(sync_wait_seconds=1),
+                )
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "212361")
+        self.assertEqual(len(attempted_account_ids), 2)
+        self.assertEqual(len(set(attempted_account_ids)), 2)
+        task_id = response.json()["error"]["details"]["task_id"]
+        detail = self.client.get(
+            f"/v1/tasks/{task_id}",
+            headers={"Authorization": "Bearer bounded-failover-key"},
+        ).json()["task"]
+        self.assertEqual(detail["attempt_count"], 2)
+        self.assertEqual([attempt["status"] for attempt in detail["attempts"]], ["failed", "failed"])
+
+    def test_explicit_account_request_does_not_switch_to_another_account(self):
+        requested_account_id = self.seed_account_with_capabilities("fixed-account@example.com")
+        self.seed_account_with_capabilities("fixed-account-spare@example.com")
+        self.seed_api_key("fixed-account-key")
+        attempted_account_ids = []
+        request = self.valid_image_request(sync_wait_seconds=1)
+        request["account_id"] = requested_account_id
+
+        def submit(account, *_args, **_kwargs):
+            attempted_account_ids.append(account["id"])
+            raise server.UpstreamGenerationError({"code": "212361", "message": "spam user"})
+
+        with (
+            patch.object(server, "capture_account_balance_snapshot", return_value=None),
+            patch.object(server, "submit_generation_for_account", side_effect=submit),
+        ):
+            response = self.client.post(
+                "/v1/generate",
+                headers={"Authorization": "Bearer fixed-account-key"},
+                json=request,
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(attempted_account_ids, [requested_account_id])
+
     def test_session_expired_upstream_error_marks_account_invalid(self):
         account_id = self.seed_account_with_capabilities()
 

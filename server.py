@@ -142,6 +142,9 @@ DEFAULT_CONFIG = {
         "idempotency_ttl_hours": 24,
         "idempotency_key_max_length": 255,
         "account_cooldown_seconds": 300,
+        "account_risk_quarantine_seconds": 3600,
+        "account_failover_max_attempts": 5,
+        "account_failover_error_codes": ["200001", "212361"],
         "prompt_max_length": 4000,
         "request_id_max_length": 128,
         "upload_max_bytes": 104857600,
@@ -2012,7 +2015,11 @@ def check_daily_quota(api_key_id: int, estimated_point_cost: Optional[int], poli
         )
 
 
-def candidate_accounts_for_generation(kind: str, requested_account_id: Optional[int] = None) -> List[sqlite3.Row]:
+def candidate_accounts_for_generation(
+    kind: str,
+    requested_account_id: Optional[int] = None,
+    excluded_account_ids: Optional[Iterable[int]] = None,
+) -> List[sqlite3.Row]:
     now = time.time()
     capability_clause = "a.model_info_json IS NOT NULL AND a.model_info_json != ''" if kind == "image" else "a.video_info_json IS NOT NULL AND a.video_info_json != ''"
     params: List[Any] = [now]
@@ -2020,6 +2027,17 @@ def candidate_accounts_for_generation(kind: str, requested_account_id: Optional[
     if requested_account_id:
         account_clause = "AND a.id=?"
         params.append(requested_account_id)
+    excluded_ids = sorted(
+        {
+            int(account_id)
+            for account_id in (excluded_account_ids or [])
+            if account_id not in (None, "")
+        }
+    )
+    exclusion_clause = ""
+    if excluded_ids:
+        exclusion_clause = f"AND a.id NOT IN ({','.join('?' for _ in excluded_ids)})"
+        params.extend(excluded_ids)
     conn = db_conn()
     rows = conn.execute(
         f"""
@@ -2030,6 +2048,7 @@ def candidate_accounts_for_generation(kind: str, requested_account_id: Optional[
           AND ({capability_clause})
           AND (a.cooldown_until IS NULL OR a.cooldown_until <= ?)
           {account_clause}
+          {exclusion_clause}
         ORDER BY (
             SELECT COUNT(*)
             FROM tasks AS t
@@ -2047,13 +2066,25 @@ def candidate_accounts_for_generation(kind: str, requested_account_id: Optional[
     return list(rows)
 
 
-def pick_account_for_generation(kind: str, requested_account_id: Optional[int] = None) -> Optional[sqlite3.Row]:
-    rows = candidate_accounts_for_generation(kind, requested_account_id)
+def pick_account_for_generation(
+    kind: str,
+    requested_account_id: Optional[int] = None,
+    excluded_account_ids: Optional[Iterable[int]] = None,
+) -> Optional[sqlite3.Row]:
+    rows = candidate_accounts_for_generation(kind, requested_account_id, excluded_account_ids)
     return rows[0] if rows else None
 
 
-def select_generation_account(body: Any, request_id: str = "") -> Tuple[sqlite3.Row, Dict[str, Any], Dict[str, Any], Optional[int]]:
-    candidates = candidate_accounts_for_generation(body.kind, getattr(body, "account_id", None))
+def select_generation_account(
+    body: Any,
+    request_id: str = "",
+    excluded_account_ids: Optional[Iterable[int]] = None,
+) -> Tuple[sqlite3.Row, Dict[str, Any], Dict[str, Any], Optional[int]]:
+    candidates = candidate_accounts_for_generation(
+        body.kind,
+        getattr(body, "account_id", None),
+        excluded_account_ids,
+    )
     last_validation_error: Optional[GatewayAPIError] = None
     had_balance_miss = False
     for account in candidates:
@@ -2131,7 +2162,19 @@ def mark_account_failure(account_id: int, error: Exception) -> None:
         conn.commit()
         conn.close()
         return
-    cooldown_seconds = int(CFG.get("gateway", {}).get("account_cooldown_seconds") or 300) * min(next_failure_count, 6)
+    if code in account_failover_error_codes():
+        cooldown_seconds = max(
+            1,
+            int_or_default(
+                gateway_cfg().get("account_risk_quarantine_seconds"),
+                3600,
+            ),
+        )
+    else:
+        cooldown_seconds = max(
+            1,
+            int_or_default(gateway_cfg().get("account_cooldown_seconds"), 300),
+        ) * min(next_failure_count, 6)
     conn.execute(
         "UPDATE accounts SET failure_count=?, cooldown_until=?, last_error=?, updated_at=? WHERE id=?",
         (next_failure_count, now + cooldown_seconds, last_error, now, account_id),
@@ -3960,11 +4003,92 @@ def task_worker_poll_interval() -> float:
         return 1.0
 
 
+def account_failover_max_attempts() -> int:
+    return max(
+        1,
+        min(
+            20,
+            int_or_default(gateway_cfg().get("account_failover_max_attempts"), 5),
+        ),
+    )
+
+
+def account_failover_error_codes() -> set[str]:
+    configured = gateway_cfg().get(
+        "account_failover_error_codes",
+        ["200001", "212361"],
+    )
+    if isinstance(configured, str):
+        values = re.split(r"[,;\s]+", configured)
+    elif isinstance(configured, (list, tuple, set)):
+        values = configured
+    else:
+        values = []
+    return {str(value).strip() for value in values if str(value).strip()}
+
+
+def task_generation_attempt_account_ids(task_id: int) -> List[int]:
+    conn = db_conn()
+    rows = conn.execute(
+        """
+        SELECT account_id
+        FROM task_attempts
+        WHERE task_id=? AND phase='generation' AND account_id IS NOT NULL
+        ORDER BY attempt_no ASC, id ASC
+        """,
+        (task_id,),
+    ).fetchall()
+    conn.close()
+    return [int(row["account_id"]) for row in rows]
+
+
 def resolve_task_body(task: sqlite3.Row):
     payload = json_value_from_db(task["payload_json"]) or {}
     if not isinstance(payload, dict):
         raise RuntimeError("task payload is malformed")
     return GatewayGenerateIn(**payload)
+
+
+def resolve_task_failover_body(task: Dict[str, Any]) -> Any:
+    body = resolve_task_body(task)
+    data = model_data(body)
+    for field in ("model_name", "ratio", "resolution", "duration", "scene_id"):
+        selected_value = task.get(field)
+        if selected_value not in (None, ""):
+            data[field] = selected_value
+    return GatewayGenerateIn(**data)
+
+
+def select_task_failover_account(
+    task: Dict[str, Any],
+    error: Exception,
+) -> Optional[Tuple[sqlite3.Row, Dict[str, Any], Dict[str, Any], Optional[int]]]:
+    if upstream_error_code(error) not in account_failover_error_codes():
+        return None
+    body = resolve_task_failover_body(task)
+    if body.account_id is not None:
+        return None
+    attempted_account_ids = task_generation_attempt_account_ids(int(task["id"]))
+    if len(attempted_account_ids) >= account_failover_max_attempts():
+        return None
+    try:
+        account, caps, options, estimated_point_cost = select_generation_account(
+            body,
+            request_id=str(task.get("request_id") or ""),
+            excluded_account_ids=attempted_account_ids,
+        )
+        if task.get("api_key_id"):
+            policy = resolve_api_key_policy(get_api_key_record(int(task["api_key_id"])))
+            enforce_api_key_scope(
+                policy,
+                body.kind,
+                options,
+                caps,
+                str(task.get("request_id") or ""),
+            )
+    except (GatewayAPIError, HTTPException):
+        return None
+    return account, caps, options, estimated_point_cost
 
 
 def task_retryable_status(status: str) -> bool:
@@ -4398,6 +4522,103 @@ def finalize_task_attempt(task: sqlite3.Row, attempt_id: int, phase: str, result
         conn.close()
 
 
+def schedule_task_account_failover(
+    task: Dict[str, Any],
+    attempt_id: int,
+    error: UpstreamGenerationError,
+    account: sqlite3.Row,
+    options: Dict[str, Any],
+    estimated_point_cost: Optional[int],
+) -> bool:
+    now = time.time()
+    task_id = int(task["id"])
+    code = upstream_error_code(error) or "UPSTREAM_ERROR"
+    message = account_failure_message(error, code)
+    response = {
+        "status": "queued",
+        "account_failover_count": len(task_generation_attempt_account_ids(task_id)),
+    }
+    conn = db_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        task_update = conn.execute(
+            """
+            UPDATE tasks
+            SET status='queued', account_id=?, model_name=?, scene_id=?, resolution=?, ratio=?,
+                duration=?, estimated_point_cost=?, response_json=?, assets_json=?,
+                chat_id='', focus_id='', error_code='', error_message='',
+                balance_before_json=NULL, balance_after_json=NULL,
+                balance_before_rest_point=NULL, balance_before_daily_point=NULL,
+                balance_before_bonus_point=NULL, balance_after_rest_point=NULL,
+                balance_after_daily_point=NULL, balance_after_bonus_point=NULL,
+                actual_point_cost=NULL, next_attempt_at=NULL, finished_at=NULL, updated_at=?
+            WHERE id=? AND status='running' AND cancel_requested_at IS NULL
+            """,
+            (
+                account["id"],
+                options.get("model_name") or "",
+                options.get("scene_id") or "",
+                options.get("resolution") or "",
+                options.get("ratio") or "",
+                options.get("duration"),
+                estimated_point_cost,
+                encode_json_value(response),
+                encode_json_value([]),
+                now,
+                task_id,
+            ),
+        )
+        if task_update.rowcount != 1:
+            conn.rollback()
+            return False
+        attempt_update = conn.execute(
+            """
+            UPDATE task_attempts
+            SET status='failed', error_code=?, error_message=?, assets_json=?, finished_at=?
+            WHERE id=? AND task_id=? AND status='running'
+            """,
+            (
+                code,
+                message,
+                encode_json_value([]),
+                now,
+                attempt_id,
+                task_id,
+            ),
+        )
+        if attempt_update.rowcount != 1:
+            conn.rollback()
+            return False
+        if task.get("api_key_id"):
+            conn.execute(
+                """
+                UPDATE usage_log
+                SET account_id=?, status='queued', response_summary=?,
+                    error_code='', estimated_point_cost=?, actual_point_cost=NULL, status_code=202
+                WHERE id=(
+                    SELECT id FROM usage_log
+                    WHERE task_id=? AND api_key_id=?
+                    ORDER BY id DESC LIMIT 1
+                )
+                """,
+                (
+                    account["id"],
+                    f"账号异常，正在切换账号重试（上游错误 {code}）"[:200],
+                    estimated_point_cost,
+                    task_id,
+                    task.get("api_key_id"),
+                ),
+            )
+        conn.commit()
+        TASK_WORKER_WAKE.set()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def execute_task(task: sqlite3.Row) -> bool:
     phase = "generation" if task.get("status") == "running" else "hydration"
     attempt_id = create_task_attempt(task, phase, status="running")
@@ -4468,9 +4689,22 @@ def execute_task(task: sqlite3.Row) -> bool:
         error = exc.error if isinstance(exc.error, dict) else {}
         code = error.get("code") or "UPSTREAM_ERROR"
         message = error.get("message") or str(exc)
-        result_payload = build_failed_task_result_payload(task["id"], task.get("account_id"), code, message, status_code=503)
         if task.get("account_id"):
             mark_account_failure(task["account_id"], exc)
+        if phase == "generation":
+            failover = select_task_failover_account(task, exc)
+            if failover is not None:
+                account, _caps, options, estimated_point_cost = failover
+                if schedule_task_account_failover(
+                    task,
+                    attempt_id,
+                    exc,
+                    account,
+                    options,
+                    estimated_point_cost,
+                ):
+                    return True
+        result_payload = build_failed_task_result_payload(task["id"], task.get("account_id"), code, message, status_code=503)
         finalize_task_attempt(task, attempt_id, phase, result_payload, "failed")
         return False
     except Exception as exc:
@@ -6701,6 +6935,7 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
     if sync_wait_seconds and float(sync_wait_seconds) > 0:
         snapshot = wait_for_task_snapshot(task_id, api_key_id, float(sync_wait_seconds))
         result["status"] = snapshot.get("status") or result["status"]
+        result["account_id"] = snapshot.get("account_id") or result["account_id"]
         result["task"] = snapshot
         result["assets"] = snapshot.get("assets") or []
         result["response"] = snapshot.get("response") or {}

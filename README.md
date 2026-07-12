@@ -272,10 +272,12 @@ Content-Type: multipart/form-data
 - 上游 `200002 params error`：`/oreate/sse/stream` 参数合同未通过，不是额度不足；通常不会扣点。已确认关键原因包括缺少网页 `ZCe` 用户镜像字段（`vip/reg_ts`）或 Banti `__bid_n`。
 
 账号健康分类：
-- `200001`：登录态失效，账号标记为 `invalid`。
+- `200001`：登录态失效，账号标记为 `invalid`，未指定固定账号时自动换号重试。
 - `200002`：协议参数被拒绝，账号保留但进入冷却。
-- `212361`：上游风控/垃圾用户，账号保留但进入冷却。
+- `212361`：上游风控/垃圾用户，账号进入风险隔离，未指定固定账号时自动换号重试。
 - `110012`：历史消息未生成或未持久化，只记录警告，不惩罚账号池。
+
+自动换号在同一个任务内执行，不会新增 API Key 请求计数；每次账号尝试都会写入任务尝试记录。默认最多尝试 5 个不同账号，参数错误等请求级失败不会遍历号池。
 
 ### API Key 策略
 后台 API Keys 页面可配置：
@@ -292,6 +294,9 @@ Content-Type: multipart/form-data
     "default_daily_point_limit": 0,
     "idempotency_ttl_hours": 24,
     "account_cooldown_seconds": 300,
+    "account_risk_quarantine_seconds": 3600,
+    "account_failover_max_attempts": 5,
+    "account_failover_error_codes": ["200001", "212361"],
     "prompt_max_length": 4000
   },
   "oreate": {
