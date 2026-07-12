@@ -206,4 +206,3 @@ node -e "const fs=require('fs');const t=fs.readFileSync('server.py','utf8');cons
 **Step 3: Inspect the final diff**
 
 Confirm no route removals, no secret material, no unrelated refactors, and no changes to the user's untracked scripts in the original workspace.
-
