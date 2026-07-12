@@ -85,6 +85,8 @@ UNSAFE_ADMIN_PASSWORDS = {"", "admin123", "CHANGE_ME", "changeme", "password"}
 MAX_CLEAN_ASSET_BYTES = 30 * 1024 * 1024
 REGISTRATION_THREADS_LOCK = threading.Lock()
 REGISTRATION_THREADS: Dict[int, threading.Thread] = {}
+POOL_MAINTENANCE_THREADS_LOCK = threading.Lock()
+POOL_MAINTENANCE_THREADS: Dict[int, threading.Thread] = {}
 
 DEFAULT_CONFIG = {
     "database": {
@@ -632,8 +634,13 @@ def account_risk_status(row: sqlite3.Row) -> str:
 
 
 def account_health_status(row: sqlite3.Row, now: Optional[float] = None) -> str:
-    if str(row["status"] or "") == "invalid":
+    status = str(row["status"] or "")
+    if status == "disabled":
+        return "disabled"
+    if status == "invalid":
         return "invalid"
+    if status not in {"verified", "active"}:
+        return "pending"
     if account_cooldown_remaining_seconds(row, now) > 0:
         return "cooling"
     if account_risk_status(row) == "risk_control":
@@ -2496,6 +2503,39 @@ def init_db():
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_registration_jobs_status ON registration_jobs(status, id)"
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pool_maintenance_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status TEXT NOT NULL DEFAULT 'queued',
+            total_accounts INTEGER NOT NULL DEFAULT 0,
+            checked_accounts INTEGER NOT NULL DEFAULT 0,
+            healthy_before INTEGER NOT NULL DEFAULT 0,
+            healthy_after INTEGER NOT NULL DEFAULT 0,
+            risk_found INTEGER NOT NULL DEFAULT 0,
+            invalid_found INTEGER NOT NULL DEFAULT 0,
+            isolated_accounts INTEGER NOT NULL DEFAULT 0,
+            clean_risk INTEGER NOT NULL DEFAULT 1,
+            supplement INTEGER NOT NULL DEFAULT 1,
+            target_healthy INTEGER NOT NULL,
+            max_register INTEGER NOT NULL DEFAULT 0,
+            registration_target INTEGER NOT NULL DEFAULT 0,
+            registered INTEGER NOT NULL DEFAULT 0,
+            registration_failed INTEGER NOT NULL DEFAULT 0,
+            current_account_id INTEGER,
+            current_email TEXT NOT NULL DEFAULT '',
+            current_step TEXT NOT NULL DEFAULT 'queued',
+            items_json TEXT NOT NULL DEFAULT '[]',
+            error_message TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            finished_at REAL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pool_maintenance_jobs_status ON pool_maintenance_jobs(status, id)"
+    )
     add_column_if_missing(conn, "api_keys", "rate_limit_per_minute", "INTEGER")
     add_column_if_missing(conn, "api_keys", "daily_request_limit", "INTEGER")
     add_column_if_missing(conn, "api_keys", "daily_point_limit", "INTEGER")
@@ -2694,7 +2734,14 @@ class AutoRegisterIn(BaseModel):
 
 class MaintainIn(BaseModel):
     force_register: bool = False
-    max_register: int = 3
+    max_register: int = Field(default=3, ge=0, le=50)
+
+
+class PoolMaintenanceIn(BaseModel):
+    clean_risk: bool = True
+    supplement: bool = True
+    target_healthy: Optional[int] = Field(default=None, ge=1, le=500)
+    max_register: int = Field(default=10, ge=0, le=50)
 
 
 @dataclass
@@ -5305,6 +5352,471 @@ def recover_interrupted_registration_jobs() -> int:
     count = int(cursor.rowcount or 0)
     conn.close()
     return count
+
+
+POOL_MAINTENANCE_JOB_FIELDS = {
+    "status",
+    "total_accounts",
+    "checked_accounts",
+    "healthy_before",
+    "healthy_after",
+    "risk_found",
+    "invalid_found",
+    "isolated_accounts",
+    "clean_risk",
+    "supplement",
+    "target_healthy",
+    "max_register",
+    "registration_target",
+    "registered",
+    "registration_failed",
+    "current_account_id",
+    "current_email",
+    "current_step",
+    "items_json",
+    "error_message",
+    "finished_at",
+}
+
+
+def pool_maintenance_job_payload(row: sqlite3.Row) -> Dict[str, Any]:
+    item = dict(row)
+    try:
+        results = json.loads(item.pop("items_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        results = []
+    item["items"] = results if isinstance(results, list) else []
+    item["clean_risk"] = bool(item.get("clean_risk"))
+    item["supplement"] = bool(item.get("supplement"))
+    return item
+
+
+def create_pool_maintenance_job(
+    *,
+    clean_risk: bool = True,
+    supplement: bool = True,
+    target_healthy: Optional[int] = None,
+    max_register: int = 10,
+) -> Dict[str, Any]:
+    target = int(
+        target_healthy
+        if target_healthy is not None
+        else CFG.get("pool", {}).get("maintain_target", 5)
+    )
+    register_limit = int(max_register)
+    if target < 1 or target > 500:
+        raise HTTPException(422, "healthy account target must be between 1 and 500")
+    if register_limit < 0 or register_limit > 50:
+        raise HTTPException(422, "max register must be between 0 and 50")
+
+    rows = list_accounts()
+    summary = account_pool_summary(rows)
+    now = time.time()
+    conn = db_conn()
+    try:
+        # Serialize the active-job check and insert. Without the immediate
+        # transaction, two near-simultaneous requests can both observe an
+        # empty queue and create duplicate maintenance workers.
+        conn.execute("BEGIN IMMEDIATE")
+        active = conn.execute(
+            """
+            SELECT id FROM pool_maintenance_jobs
+            WHERE status IN ('queued','running')
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if active:
+            raise HTTPException(409, "已有号池维护任务正在执行")
+        cursor = conn.execute(
+            """
+            INSERT INTO pool_maintenance_jobs(
+                status,total_accounts,checked_accounts,healthy_before,healthy_after,
+                risk_found,invalid_found,isolated_accounts,clean_risk,supplement,
+                target_healthy,max_register,registration_target,registered,
+                registration_failed,current_account_id,current_email,current_step,
+                items_json,error_message,created_at,updated_at
+            )
+            VALUES('queued',?,0,?,?,0,0,0,?,?,?, ?,0,0,0,NULL,'','queued','[]','',?,?)
+            """,
+            (
+                len(rows),
+                summary["healthy"],
+                summary["healthy"],
+                int(bool(clean_risk)),
+                int(bool(supplement)),
+                target,
+                register_limit,
+                now,
+                now,
+            ),
+        )
+        job_id = int(cursor.lastrowid)
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM pool_maintenance_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    if row is None:
+        raise RuntimeError("created pool maintenance job could not be loaded")
+    return pool_maintenance_job_payload(row)
+
+
+def get_pool_maintenance_job(job_id: int) -> Dict[str, Any]:
+    conn = db_conn()
+    row = conn.execute(
+        "SELECT * FROM pool_maintenance_jobs WHERE id=?",
+        (job_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "pool maintenance job not found")
+    return pool_maintenance_job_payload(row)
+
+
+def update_pool_maintenance_job(job_id: int, **fields: Any) -> None:
+    if not fields:
+        return
+    payload = dict(fields)
+    if "items" in payload:
+        payload["items_json"] = json.dumps(
+            payload.pop("items"),
+            ensure_ascii=False,
+        )
+    unknown = set(payload) - POOL_MAINTENANCE_JOB_FIELDS
+    if unknown:
+        raise ValueError(
+            f"unsupported pool maintenance job fields: {', '.join(sorted(unknown))}"
+        )
+    payload["updated_at"] = time.time()
+    assignments = ", ".join(f"{key}=?" for key in payload)
+    conn = db_conn()
+    conn.execute(
+        f"UPDATE pool_maintenance_jobs SET {assignments} WHERE id=?",
+        [*payload.values(), job_id],
+    )
+    conn.commit()
+    conn.close()
+
+
+def account_row_by_id(account_id: int) -> Optional[sqlite3.Row]:
+    conn = db_conn()
+    row = conn.execute(
+        "SELECT * FROM accounts WHERE id=?",
+        (account_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def isolate_account_from_pool(account_id: int, reason: str) -> None:
+    now = time.time()
+    conn = db_conn()
+    conn.execute(
+        """
+        UPDATE accounts
+        SET status='disabled',
+            cooldown_until=NULL,
+            last_error=CASE
+                WHEN COALESCE(last_error, '')='' THEN ?
+                ELSE last_error
+            END,
+            updated_at=?
+        WHERE id=?
+        """,
+        (str(reason or "号池维护任务隔离")[:500], now, account_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def maintenance_account_item(
+    row: sqlite3.Row,
+    *,
+    category: str,
+    action: str,
+    error_code: str = "",
+) -> Dict[str, Any]:
+    return {
+        "account_id": int(row["id"]),
+        "email": str(row["email"] or ""),
+        "category": category,
+        "action": action,
+        "error_code": str(error_code or ""),
+    }
+
+
+def run_pool_maintenance_job(job_id: int) -> None:
+    job = get_pool_maintenance_job(job_id)
+    if job["status"] not in {"queued", "running"}:
+        return
+
+    clean_risk = bool(job["clean_risk"])
+    supplement = bool(job["supplement"])
+    target_healthy = int(job["target_healthy"])
+    max_register = int(job["max_register"])
+    rows = list_accounts()
+    items = list(job.get("items") or [])
+    checked_accounts = 0
+    risk_found = 0
+    invalid_found = 0
+    isolated_accounts = 0
+    check_failures = 0
+
+    update_pool_maintenance_job(
+        job_id,
+        status="running",
+        total_accounts=len(rows),
+        current_step="scanning",
+        error_message="",
+    )
+
+    for account_data in rows:
+        account_id = int(account_data["id"])
+        row = account_row_by_id(account_id)
+        if row is None:
+            checked_accounts += 1
+            continue
+        update_pool_maintenance_job(
+            job_id,
+            current_account_id=account_id,
+            current_email=str(row["email"] or ""),
+            current_step="checking_account",
+        )
+
+        category = ""
+        action = ""
+        code = ""
+        status = str(row["status"] or "")
+        if status == "disabled":
+            checked_accounts += 1
+            update_pool_maintenance_job(
+                job_id,
+                checked_accounts=checked_accounts,
+                risk_found=risk_found,
+                invalid_found=invalid_found,
+                isolated_accounts=isolated_accounts,
+                items=items,
+            )
+            continue
+
+        risk_status = account_risk_status(row)
+        if risk_status == "risk_control":
+            category = "risk_control"
+            risk_found += 1
+        elif status == "invalid":
+            category = "invalid"
+            invalid_found += 1
+        elif status in {"verified", "active"}:
+            try:
+                session = CLIENT.session_from_account(row)
+                detail = CLIENT.fetch_account_point_detail(session, row)
+                update_account_balance_snapshot(account_id, detail)
+            except Exception as exc:
+                check_failures += 1
+                code = upstream_error_code(exc)
+                mark_account_failure(account_id, exc)
+                refreshed = account_row_by_id(account_id)
+                if code == "212361" or (
+                    refreshed is not None
+                    and account_risk_status(refreshed) == "risk_control"
+                ):
+                    category = "risk_control"
+                    risk_found += 1
+                elif code == "200001" or (
+                    refreshed is not None
+                    and str(refreshed["status"] or "") == "invalid"
+                ):
+                    category = "invalid"
+                    invalid_found += 1
+                else:
+                    category = "check_failed"
+                    action = "cooling"
+
+        if category in {"risk_control", "invalid"}:
+            if clean_risk:
+                isolate_account_from_pool(
+                    account_id,
+                    f"号池维护检测到{code or category}",
+                )
+                isolated_accounts += 1
+                action = "isolated"
+            else:
+                action = "detected"
+
+        if category:
+            current = account_row_by_id(account_id) or row
+            items.append(
+                maintenance_account_item(
+                    current,
+                    category=category,
+                    action=action,
+                    error_code=code,
+                )
+            )
+
+        checked_accounts += 1
+        update_pool_maintenance_job(
+            job_id,
+            checked_accounts=checked_accounts,
+            risk_found=risk_found,
+            invalid_found=invalid_found,
+            isolated_accounts=isolated_accounts,
+            items=items,
+        )
+
+    scanned_summary = account_pool_summary(list_accounts())
+    registration_target = (
+        min(max_register, max(0, target_healthy - scanned_summary["healthy"]))
+        if supplement
+        else 0
+    )
+    update_pool_maintenance_job(
+        job_id,
+        healthy_after=scanned_summary["healthy"],
+        registration_target=registration_target,
+        current_account_id=None,
+        current_email="",
+        current_step="supplementing" if registration_target else "finalizing",
+    )
+
+    registered = 0
+    registration_failed = 0
+    for _ in range(registration_target):
+        current_email = ""
+
+        def progress(step: str, email: str = "") -> None:
+            nonlocal current_email
+            if email:
+                current_email = email
+            update_pool_maintenance_job(
+                job_id,
+                current_step=f"register_{step}",
+                current_email=current_email,
+            )
+
+        try:
+            registered_items = auto_register_accounts(1, progress=progress)
+            if not registered_items:
+                raise RuntimeError("registration returned no result")
+            result = public_registration_result(registered_items[0])
+        except Exception:
+            result = {
+                "ok": False,
+                "status": "registration_error",
+                "email": current_email,
+                "error": "账号注册失败",
+            }
+
+        ok = bool(result.get("ok") or result.get("status") == "verified")
+        if ok:
+            registered += 1
+        else:
+            registration_failed += 1
+        items.append(
+            {
+                **result,
+                "category": "registration",
+                "action": "registered" if ok else "registration_failed",
+            }
+        )
+        update_pool_maintenance_job(
+            job_id,
+            registered=registered,
+            registration_failed=registration_failed,
+            current_step="supplementing",
+            current_email=str(result.get("email") or current_email),
+            items=items,
+        )
+
+    final_summary = account_pool_summary(list_accounts())
+    target_unmet = supplement and final_summary["healthy"] < target_healthy
+    final_status = (
+        "completed_with_errors"
+        if check_failures or registration_failed or target_unmet
+        else "completed"
+    )
+    update_pool_maintenance_job(
+        job_id,
+        status=final_status,
+        healthy_after=final_summary["healthy"],
+        checked_accounts=checked_accounts,
+        risk_found=risk_found,
+        invalid_found=invalid_found,
+        isolated_accounts=isolated_accounts,
+        registered=registered,
+        registration_failed=registration_failed,
+        current_account_id=None,
+        current_email="",
+        current_step="completed",
+        items=items,
+        finished_at=time.time(),
+    )
+
+
+def launch_pool_maintenance_job(job_id: int) -> None:
+    with POOL_MAINTENANCE_THREADS_LOCK:
+        existing = POOL_MAINTENANCE_THREADS.get(job_id)
+        if existing is not None and existing.is_alive():
+            return
+
+        def runner() -> None:
+            try:
+                run_pool_maintenance_job(job_id)
+            except Exception as exc:
+                update_pool_maintenance_job(
+                    job_id,
+                    status="failed",
+                    current_step="failed",
+                    error_message=str(exc)[:1000],
+                    finished_at=time.time(),
+                )
+            finally:
+                with POOL_MAINTENANCE_THREADS_LOCK:
+                    POOL_MAINTENANCE_THREADS.pop(job_id, None)
+
+        thread = threading.Thread(
+            target=runner,
+            name=f"pool-maintenance-job-{job_id}",
+            daemon=True,
+        )
+        POOL_MAINTENANCE_THREADS[job_id] = thread
+        thread.start()
+
+
+def recover_interrupted_pool_maintenance_jobs() -> int:
+    now = time.time()
+    conn = db_conn()
+    try:
+        table_exists = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='pool_maintenance_jobs'
+            """
+        ).fetchone()
+        if not table_exists:
+            return 0
+        cursor = conn.execute(
+            """
+            UPDATE pool_maintenance_jobs
+            SET status='failed',
+                current_step='interrupted',
+                error_message='服务重启，号池维护任务已中断，请重新提交',
+                finished_at=?,
+                updated_at=?
+            WHERE status IN ('queued','running')
+            """,
+            (now, now),
+        )
+        conn.commit()
+        return int(cursor.rowcount or 0)
+    finally:
+        conn.close()
 
 
 class OpenAIPathCORSMiddleware:
@@ -8178,6 +8690,7 @@ def on_startup():
             save_config(CFG)
         recover_stale_running_tasks(stale_after_seconds=0.0)
         recover_interrupted_registration_jobs()
+        recover_interrupted_pool_maintenance_jobs()
         ensure_task_worker_started()
     except BaseException:
         APP_LIFECYCLE_STARTED = False
@@ -8406,6 +8919,26 @@ def registration_job_detail(job_id: int, _=Depends(require_admin)):
     return {"job": get_registration_job(job_id)}
 
 
+@app.post("/api/pool/maintenance/jobs", status_code=202)
+def create_pool_maintenance_job_endpoint(
+    body: PoolMaintenanceIn,
+    _=Depends(require_admin),
+):
+    job = create_pool_maintenance_job(
+        clean_risk=body.clean_risk,
+        supplement=body.supplement,
+        target_healthy=body.target_healthy,
+        max_register=body.max_register,
+    )
+    launch_pool_maintenance_job(job["id"])
+    return {"ok": True, "job": job}
+
+
+@app.get("/api/pool/maintenance/jobs/{job_id}")
+def pool_maintenance_job_detail(job_id: int, _=Depends(require_admin)):
+    return {"job": get_pool_maintenance_job(job_id)}
+
+
 @app.post("/api/accounts/import")
 def import_account(body: Dict[str, str], _=Depends(require_admin)):
     email = body.get("email", "").strip()
@@ -8609,15 +9142,20 @@ def mark_task(task_id: int, body: Dict[str, Any], _=Depends(require_admin)):
 @app.post("/api/pool/maintain")
 def pool_maintain(body: MaintainIn, _=Depends(require_admin)):
     accounts = list_accounts()
-    verified = [a for a in accounts if a.get("status") in ("verified", "active")]
+    summary = account_pool_summary(accounts)
     created = []
-    if len(verified) < CFG["pool"].get("min_accounts", 3) or body.force_register:
-        need = max(1, min(body.max_register, CFG["pool"].get("maintain_target", 5) - len(verified)))
+    target = max(0, int_or_default(CFG["pool"].get("maintain_target"), 5))
+    deficit = max(0, target - summary["healthy"])
+    if body.force_register and deficit == 0 and body.max_register > 0:
+        deficit = 1
+    need = min(body.max_register, deficit)
+    if need > 0:
         created = auto_register_accounts(need)
     return {
         "ok": True,
         "accounts_total": len(accounts),
-        "verified_total": len(verified),
+        "verified_total": summary["verified"],
+        "healthy_total": summary["healthy"],
         "created": [public_registration_result(item) for item in created],
     }
 
@@ -8832,10 +9370,11 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
     <div class="col"><label>注册数量</label><input id="reg_count" type="number" min="1" max="50" step="1" value="1"></div>
     <div><button id="reg-one" class="btn-primary" onclick="registerOne()">注册 1 个</button></div>
     <div><button id="reg-batch" class="btn-primary" onclick="registerBatch()">批量注册</button></div>
-    <div><button class="btn-secondary" onclick="maintainPool()">补号</button></div>
+    <div><button id="maintenance-start" class="btn-secondary" onclick="maintainPool()">批量体检并补号</button></div>
     <div><button class="btn-secondary" onclick="toggleImport()">导入账号</button></div>
   </div>
   <div id="registration-progress" class="registration-progress hidden"></div>
+  <div id="maintenance-progress" class="registration-progress hidden"></div>
   <div id="import-area" class="hidden" style="margin-bottom:12px">
     <div class="row">
       <div class="col"><input id="imp-email" placeholder="邮箱"></div>
@@ -9338,7 +9877,7 @@ async function init() {
     showLogin('登录已失效');
     return;
   }
-  const v = state.accounts.filter(a=>a.status==='verified').length;
+  const v = state.accounts.filter(a=>a.health_status==='healthy').length;
   document.getElementById('status-text').textContent = `就绪 — ${v} 可用账号`;
   document.getElementById('gw-url').textContent = location.origin + '/v1/generate';
   document.getElementById('gw-example').textContent =
@@ -9456,7 +9995,7 @@ function listPageSummary(page){
 }
 let state = {
   accounts:[],tasks:[],apikeys:[],clients:[],usage:[],uploads:[],costReport:[],auditLogs:[],
-  accountCredentials:{},revealedAccountPasswords:{},registrationJob:null,
+  accountCredentials:{},revealedAccountPasswords:{},registrationJob:null,maintenanceJob:null,
   settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}},
   lists:{
     tasks:createListPageState(50),
@@ -9617,6 +10156,8 @@ const ADMIN_LABELS=Object.freeze({
     low_balance:'余额不足',
     invalid:'不可用',
     risk_control:'风控限制',
+    disabled:'已隔离',
+    pending:'待验证',
     unknown:'未知',
   }),
   riskStatus:Object.freeze({
@@ -9760,7 +10301,7 @@ function renderAccounts(){
   const tbody=document.getElementById('accounts-tbody');
   tbody.innerHTML = state.accounts.map(a => {
     const sc = a.status==='verified'?'tag-green':a.status==='new'?'tag-blue':'tag-gray';
-    const hc = a.health_status==='healthy'?'tag-green':a.health_status==='cooling'?'tag-blue':a.health_status==='low_balance'?'tag-red':a.health_status==='invalid'?'tag-gray':'tag-blue';
+    const hc = a.health_status==='healthy'?'tag-green':a.health_status==='cooling'?'tag-blue':a.health_status==='low_balance'||a.health_status==='risk_control'?'tag-red':'tag-gray';
     const em = a.email||'';
     const restPoint = a.rest_point ?? '-';
     const balanceUpdatedAt = a.balance_updated_at ? new Date((a.balance_updated_at||0)*1000).toLocaleString() : '-';
@@ -9785,7 +10326,7 @@ function renderAccounts(){
       <td><button class="btn-sm btn-secondary" onclick="generateWith(${a.id})">生成</button> <button class="btn-sm btn-secondary" onclick="refreshAccountBalance(${a.id})">刷新余额</button></td>
     </tr>`;
   }).join('');
-  document.getElementById('pool-count').textContent = state.accounts.filter(a=>a.status==='verified').length;
+  document.getElementById('pool-count').textContent = state.accounts.filter(a=>a.health_status==='healthy').length;
 }
 async function loadAccountCredentials(accountId){
   if(state.accountCredentials[accountId]) return state.accountCredentials[accountId];
@@ -9914,7 +10455,139 @@ async function startRegistration(count){
 }
 async function registerOne(){return startRegistration(1);}
 async function registerBatch(){return startRegistration(Number(document.getElementById('reg_count').value||1));}
-async function maintainPool(){const r=await api('POST','/api/pool/maintain',{force_register:true,max_register:Number(document.getElementById('reg_count').value||1)});await loadAccounts();alert(JSON.stringify(r.created));}
+function maintenanceStepLabel(step){
+  const normalized=String(step||'').toLowerCase();
+  if(normalized.startsWith('register_')){
+    return `补号：${registrationStepLabel(normalized.slice('register_'.length))}`;
+  }
+  return ({
+    queued:'等待开始',
+    scanning:'正在扫描号池',
+    checking_account:'正在检测账号健康状态',
+    supplementing:'正在补充健康账号',
+    finalizing:'正在汇总检测结果',
+    completed:'维护任务已完成',
+    interrupted:'任务已中断',
+    failed:'任务执行失败',
+  })[normalized] || String(step||'处理中');
+}
+function maintenanceStatusLabel(status){
+  return ({
+    queued:'等待中',
+    running:'检测中',
+    completed:'已完成',
+    completed_with_errors:'部分完成',
+    failed:'失败',
+  })[String(status||'').toLowerCase()] || String(status||'');
+}
+function maintenanceItemLabel(item){
+  if(item?.category==='registration'){
+    return `${item?.email||'新账号'} · ${item?.action==='registered'?'补号成功':'补号失败'}`;
+  }
+  const category=({
+    risk_control:'风控账号',
+    invalid:'失效账号',
+    check_failed:'检测异常',
+  })[item?.category] || item?.category || '账号';
+  const action=({
+    isolated:'已隔离',
+    detected:'已发现',
+    cooling:'已进入冷却',
+  })[item?.action] || item?.action || '已处理';
+  return `${item?.email||`账号 #${item?.account_id||'-'}`} · ${category} · ${action}`;
+}
+function renderMaintenanceProgress(job,connectionMessage=''){
+  const panel=document.getElementById('maintenance-progress');
+  if(!panel || !job) return;
+  const total=Math.max(0,Number(job.total_accounts)||0);
+  const checked=Math.max(0,Number(job.checked_accounts)||0);
+  const percent=total===0?100:Math.min(100,Math.round(checked/total*100));
+  const items=(Array.isArray(job.items)?job.items:[]).slice(-30);
+  const itemTags=items.map(item=>{
+    const failed=item?.action==='registration_failed'||item?.category==='check_failed';
+    const isolated=item?.action==='isolated';
+    return `<span class="tag ${failed?'tag-red':isolated?'tag-blue':'tag-green'}">${escapeHtml(maintenanceItemLabel(item))}</span>`;
+  }).join('');
+  panel.classList.remove('hidden');
+  panel.innerHTML=`
+    <div class="registration-progress-head">
+      <span>号池维护 #${escapeHtml(job.id||'-')} · ${escapeHtml(maintenanceStatusLabel(job.status))}</span>
+      <span>已检测 ${checked} / ${total}</span>
+    </div>
+    <div class="registration-track"><div class="registration-fill" style="width:${percent}%"></div></div>
+    <div class="registration-meta">
+      当前步骤：${escapeHtml(maintenanceStepLabel(job.current_step))}
+      ${job.current_email?` · 当前账号：${escapeHtml(job.current_email)}`:''}
+      <br>检测前健康 ${Number(job.healthy_before)||0} 个 · 风控 ${Number(job.risk_found)||0} 个 · 失效 ${Number(job.invalid_found)||0} 个 · 已隔离 ${Number(job.isolated_accounts)||0} 个
+      <br>计划补号 ${Number(job.registration_target)||0} 个 · 成功 ${Number(job.registered)||0} 个 · 失败 ${Number(job.registration_failed)||0} 个 · 当前健康 ${Number(job.healthy_after)||0} 个
+      ${connectionMessage?`<br>${escapeHtml(connectionMessage)}`:''}
+      ${job.error_message?`<br><span style="color:#c62828">${escapeHtml(job.error_message)}</span>`:''}
+    </div>
+    ${itemTags?`<div class="registration-results">${itemTags}</div>`:''}`;
+}
+function setMaintenanceButtonDisabled(disabled){
+  const button=document.getElementById('maintenance-start');
+  if(button) button.disabled=disabled;
+}
+async function pollMaintenanceJob(jobId){
+  const terminal=new Set(['completed','completed_with_errors','failed']);
+  while(true){
+    await new Promise(resolve=>setTimeout(resolve,1000));
+    let response;
+    try{
+      response=await api('GET',`/api/pool/maintenance/jobs/${jobId}`);
+    }catch(error){
+      renderMaintenanceProgress(state.maintenanceJob,'连接暂时中断，正在重试维护进度…');
+      continue;
+    }
+    const job=response.job;
+    state.maintenanceJob=job;
+    renderMaintenanceProgress(job);
+    if(terminal.has(String(job.status||'').toLowerCase())){
+      setMaintenanceButtonDisabled(false);
+      await loadAccounts();
+      await loadCapabilities();
+      document.getElementById('status-text').textContent=`维护完成 — 健康 ${job.healthy_after||0}，隔离 ${job.isolated_accounts||0}，补号 ${job.registered||0}`;
+      const prefix=job.status==='completed'
+        ?'号池维护完成'
+        :job.status==='failed'
+          ?'号池维护失败'
+          :'号池维护部分完成';
+      alert(`${prefix}：健康账号 ${job.healthy_after||0} 个，隔离风险/失效账号 ${job.isolated_accounts||0} 个，补号成功 ${job.registered||0} 个，失败 ${job.registration_failed||0} 个`);
+      return job;
+    }
+  }
+}
+async function maintainPool(){
+  if(state.maintenanceJob && ['queued','running'].includes(String(state.maintenanceJob.status||'').toLowerCase())){
+    alert('已有号池维护任务正在执行');
+    return null;
+  }
+  if(!confirm('将批量检测全部账号，风险和失效账号会被隔离，并按健康账号缺口自动补号。是否继续？')) return null;
+  const configuredTarget=Number(state.settings?.pool?.maintain_target);
+  const target=Number.isSafeInteger(configuredTarget)&&configuredTarget>0?configuredTarget:5;
+  const requestedMax=Number(document.getElementById('reg_count').value||1);
+  const maxRegister=Number.isSafeInteger(requestedMax)&&requestedMax>=0&&requestedMax<=50?requestedMax:1;
+  setMaintenanceButtonDisabled(true);
+  document.getElementById('status-text').textContent='正在创建号池维护任务…';
+  try{
+    const response=await api('POST','/api/pool/maintenance/jobs',{
+      clean_risk:true,
+      supplement:true,
+      target_healthy:target,
+      max_register:maxRegister,
+    });
+    state.maintenanceJob=response.job;
+    renderMaintenanceProgress(response.job);
+    document.getElementById('status-text').textContent='正在批量检测账号…';
+    return await pollMaintenanceJob(response.job.id);
+  }catch(error){
+    setMaintenanceButtonDisabled(false);
+    document.getElementById('status-text').textContent='号池维护任务创建失败';
+    alert(`号池维护失败：${error?.message||String(error)}`);
+    return null;
+  }
+}
 function toggleImport(){document.getElementById('import-area').classList.toggle('hidden');}
 async function doImport(){const r=await api('POST','/api/accounts/import',{email:document.getElementById('imp-email').value,password:document.getElementById('imp-pwd').value});await loadAccounts();alert(r.ok?'✅ 导入成功':'❌ 失败');}
 function generateWith(aid){switchTab('generate');document.getElementById('g-account').value=aid;}
@@ -10814,7 +11487,7 @@ async function changeCredentials(){
 function updateStats(){
   const a=state.accounts||[];
   document.getElementById('st-total').textContent=a.length;
-  document.getElementById('st-verified').textContent=a.filter(x=>x.status==='verified').length;
+  document.getElementById('st-verified').textContent=a.filter(x=>x.health_status==='healthy').length;
   document.getElementById('st-tasks').textContent=state.lists.tasks.total;
   document.getElementById('st-apikeys').textContent=(state.apikeys||[]).length;
 }

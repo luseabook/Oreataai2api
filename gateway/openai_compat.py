@@ -21,6 +21,23 @@ IMAGE_SIZE_RATIOS: Dict[str, Optional[str]] = {
     "1024x1536": "2:3",
 }
 
+IMAGE_ASPECT_RATIOS = (
+    ("21:9", 21 / 9),
+    ("16:9", 16 / 9),
+    ("3:2", 3 / 2),
+    ("4:3", 4 / 3),
+    ("5:4", 5 / 4),
+    ("1:1", 1.0),
+    ("4:5", 4 / 5),
+    ("3:4", 3 / 4),
+    ("2:3", 2 / 3),
+    ("9:16", 9 / 16),
+)
+IMAGE_ASPECT_RATIO_TOLERANCE = 0.02
+IMAGE_DIMENSION_MIN = 64
+IMAGE_DIMENSION_MAX = 8192
+IMAGE_SIZE_RE = re.compile(r"^([1-9][0-9]*)x([1-9][0-9]*)$")
+
 VIDEO_SIZE_RATIOS: Dict[str, Optional[str]] = {
     "auto": None,
     "1024x1024": "1:1",
@@ -125,7 +142,31 @@ def _size_to_ratio(
 
 
 def image_size_to_ratio(size: Optional[str]) -> Optional[str]:
-    return _size_to_ratio(size, IMAGE_SIZE_RATIOS, media_kind="image")
+    normalized = str(size or "auto").strip().lower()
+    if normalized in IMAGE_SIZE_RATIOS:
+        return IMAGE_SIZE_RATIOS[normalized]
+
+    match = IMAGE_SIZE_RE.fullmatch(normalized)
+    if match:
+        width, height = (int(value) for value in match.groups())
+        if (
+            IMAGE_DIMENSION_MIN <= width <= IMAGE_DIMENSION_MAX
+            and IMAGE_DIMENSION_MIN <= height <= IMAGE_DIMENSION_MAX
+        ):
+            requested_ratio = width / height
+            ratio_name, ratio_value = min(
+                IMAGE_ASPECT_RATIOS,
+                key=lambda item: abs(requested_ratio - item[1]) / item[1],
+            )
+            relative_error = abs(requested_ratio - ratio_value) / ratio_value
+            if relative_error <= IMAGE_ASPECT_RATIO_TOLERANCE:
+                return ratio_name
+
+    raise OpenAICompatError(
+        f"unsupported image size: {size}",
+        param="size",
+        code="invalid_size",
+    )
 
 
 def video_size_to_ratio(size: Optional[str]) -> Optional[str]:

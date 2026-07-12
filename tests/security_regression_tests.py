@@ -1639,6 +1639,245 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertEqual(failed["current_step"], "failed")
         self.assertIn("unexpected registration worker failure", failed["error_message"])
 
+    def test_pool_maintenance_isolates_risk_accounts_and_supplements_healthy_deficit(self):
+        now = time.time()
+        image_info = json.dumps(self.sample_image_info(), ensure_ascii=False)
+        conn = server.db_conn()
+        conn.executemany(
+            """
+            INSERT INTO accounts(
+                email,password,status,source,ouid,ouss,model_info_json,video_info_json,
+                last_error,rest_point,balance_updated_at,created_at,updated_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            [
+                (
+                    "healthy@example.com",
+                    "password",
+                    "verified",
+                    "manual",
+                    "ouid-healthy",
+                    "ouss-healthy",
+                    image_info,
+                    "{}",
+                    None,
+                    100,
+                    now,
+                    now,
+                    now,
+                ),
+                (
+                    "risk@example.com",
+                    "password",
+                    "verified",
+                    "manual",
+                    "ouid-risk",
+                    "ouss-risk",
+                    image_info,
+                    "{}",
+                    "212361: account risk controlled",
+                    100,
+                    now,
+                    now,
+                    now,
+                ),
+                (
+                    "invalid@example.com",
+                    "password",
+                    "invalid",
+                    "manual",
+                    "ouid-invalid",
+                    "ouss-invalid",
+                    image_info,
+                    "{}",
+                    "200001: session expired",
+                    100,
+                    now,
+                    now,
+                    now,
+                ),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        job = server.create_pool_maintenance_job(
+            clean_risk=True,
+            supplement=True,
+            target_healthy=3,
+            max_register=2,
+        )
+        registration_calls = {"count": 0}
+
+        def fake_register(count, progress=None):
+            self.assertEqual(count, 1)
+            registration_calls["count"] += 1
+            email = f"supplement-{registration_calls['count']}@example.com"
+            if progress:
+                progress("create_mailbox", email)
+            server.save_account(
+                email,
+                "password",
+                server.OreateSession(
+                    email=email,
+                    password="password",
+                    cookies={
+                        "OUID": f"ouid-{registration_calls['count']}",
+                        "ouss": f"ouss-{registration_calls['count']}",
+                    },
+                ),
+                model_info=self.sample_image_info(),
+                video_info={},
+                status="verified",
+                source="auto",
+            )
+            return [{"ok": True, "status": "verified", "email": email, "password": "secret"}]
+
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "fetch_account_point_detail", return_value={"restPoint": 100}),
+            patch.object(server, "auto_register_accounts", side_effect=fake_register),
+        ):
+            server.run_pool_maintenance_job(job["id"])
+
+        completed = server.get_pool_maintenance_job(job["id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["healthy_before"], 1)
+        self.assertEqual(completed["risk_found"], 1)
+        self.assertEqual(completed["invalid_found"], 1)
+        self.assertEqual(completed["isolated_accounts"], 2)
+        self.assertEqual(completed["registration_target"], 2)
+        self.assertEqual(completed["registered"], 2)
+        self.assertEqual(completed["healthy_after"], 3)
+        self.assertNotIn("secret", json.dumps(completed["items"], ensure_ascii=False))
+
+        conn = server.db_conn()
+        isolated = {
+            row["email"]: row["status"]
+            for row in conn.execute(
+                "SELECT email,status FROM accounts WHERE email IN (?,?)",
+                ("risk@example.com", "invalid@example.com"),
+            ).fetchall()
+        }
+        conn.close()
+        self.assertEqual(isolated["risk@example.com"], "disabled")
+        self.assertEqual(isolated["invalid@example.com"], "disabled")
+
+    def test_pool_maintenance_marks_live_risk_response_and_does_not_delete_history(self):
+        account_id = self.seed_account()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET model_info_json=?, rest_point=? WHERE id=?",
+            (json.dumps(self.sample_image_info()), 100, account_id),
+        )
+        conn.commit()
+        conn.close()
+        job = server.create_pool_maintenance_job(
+            clean_risk=True,
+            supplement=False,
+            target_healthy=1,
+            max_register=0,
+        )
+
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(
+                server.CLIENT,
+                "fetch_account_point_detail",
+                side_effect=RuntimeError("getpointdetail failed: status code 212361"),
+            ),
+        ):
+            server.run_pool_maintenance_job(job["id"])
+
+        completed = server.get_pool_maintenance_job(job["id"])
+        self.assertEqual(completed["status"], "completed_with_errors")
+        self.assertEqual(completed["risk_found"], 1)
+        self.assertEqual(completed["isolated_accounts"], 1)
+        conn = server.db_conn()
+        row = conn.execute("SELECT id,status,last_error FROM accounts WHERE id=?", (account_id,)).fetchone()
+        conn.close()
+        self.assertEqual(row["id"], account_id)
+        self.assertEqual(row["status"], "disabled")
+        self.assertIn("212361", row["last_error"])
+
+    def test_pool_maintenance_does_not_reprocess_previously_isolated_accounts(self):
+        account_id = self.seed_account()
+        conn = server.db_conn()
+        conn.execute(
+            """
+            UPDATE accounts
+            SET status='disabled',
+                last_error='212361: previously isolated',
+                model_info_json=?,
+                rest_point=?
+            WHERE id=?
+            """,
+            (json.dumps(self.sample_image_info()), 100, account_id),
+        )
+        conn.commit()
+        conn.close()
+        job = server.create_pool_maintenance_job(
+            clean_risk=True,
+            supplement=False,
+            target_healthy=1,
+            max_register=0,
+        )
+
+        with (
+            patch.object(server.CLIENT, "session_from_account") as session_from_account,
+            patch.object(server.CLIENT, "fetch_account_point_detail") as fetch_point_detail,
+        ):
+            server.run_pool_maintenance_job(job["id"])
+
+        completed = server.get_pool_maintenance_job(job["id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["checked_accounts"], 1)
+        self.assertEqual(completed["risk_found"], 0)
+        self.assertEqual(completed["isolated_accounts"], 0)
+        self.assertEqual(completed["items"], [])
+        session_from_account.assert_not_called()
+        fetch_point_detail.assert_not_called()
+
+    def test_pool_maintenance_job_api_returns_immediately_and_exposes_chinese_progress(self):
+        with patch.object(server, "launch_pool_maintenance_job") as launch:
+            created = self.client.post(
+                "/api/pool/maintenance/jobs",
+                headers=self.admin_headers(),
+                json={
+                    "clean_risk": True,
+                    "supplement": True,
+                    "target_healthy": 5,
+                    "max_register": 3,
+                },
+            )
+
+        self.assertEqual(created.status_code, 202)
+        job = created.json()["job"]
+        self.assertEqual(job["status"], "queued")
+        self.assertEqual(job["current_step"], "queued")
+        launch.assert_called_once_with(job["id"])
+
+        duplicate = self.client.post(
+            "/api/pool/maintenance/jobs",
+            headers=self.admin_headers(),
+            json={
+                "clean_risk": True,
+                "supplement": True,
+                "target_healthy": 5,
+                "max_register": 3,
+            },
+        )
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertIn("正在执行", duplicate.json()["detail"])
+
+        detail = self.client.get(
+            f"/api/pool/maintenance/jobs/{job['id']}",
+            headers=self.admin_headers(),
+        )
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["job"]["target_healthy"], 5)
+
     def test_admin_html_sends_bearer_token_for_api_calls(self):
         html = server.ADMIN_HTML
         self.assertIn("localStorage", html)
@@ -1665,6 +1904,9 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertIn("查看密码", html)
         self.assertIn("复制密码", html)
         self.assertIn("连接暂时中断，正在重试", html)
+        self.assertIn("批量体检并补号", html)
+        self.assertIn("/api/pool/maintenance/jobs", html)
+        self.assertIn('id="maintenance-progress"', html)
         self.assertNotIn("s-admin-pwd", html)
 
     def test_admin_html_escapes_untrusted_usage_account_and_client_values(self):

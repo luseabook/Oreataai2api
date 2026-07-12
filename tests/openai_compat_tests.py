@@ -51,8 +51,11 @@ class OpenAICompatPrimitiveTests(unittest.TestCase):
         self.assertEqual(image_size_to_ratio("1024x1024"), "1:1")
         self.assertEqual(image_size_to_ratio("1536x1024"), "3:2")
         self.assertEqual(image_size_to_ratio("1024x1536"), "2:3")
+        self.assertEqual(image_size_to_ratio("1024x1824"), "9:16")
+        self.assertEqual(image_size_to_ratio("1824x1024"), "16:9")
+        self.assertEqual(image_size_to_ratio("1024x1365"), "3:4")
         with self.assertRaises(OpenAICompatError) as caught:
-            image_size_to_ratio("2048x2048")
+            image_size_to_ratio("1024x2048")
         self.assertEqual(caught.exception.param, "size")
 
     def test_common_video_sizes_map_to_aspect_ratios(self):
@@ -184,7 +187,11 @@ class OpenAICompatEndpointTests(unittest.TestCase):
                                 "modelName": "Provider Image",
                                 "modelDesc": "Image model",
                                 "resolution": ["1K", "2K"],
-                                "size": [{"ratio": "1:1"}, {"ratio": "16:9"}],
+                                "size": [
+                                    {"ratio": "1:1"},
+                                    {"ratio": "16:9"},
+                                    {"ratio": "9:16"},
+                                ],
                                 "pointCost": [{"resolution": "1K", "point": 5}],
                             },
                             {
@@ -557,7 +564,7 @@ class OpenAICompatEndpointTests(unittest.TestCase):
                 json={
                     "model": "gpt-image-1",
                     "prompt": "a canvas integration",
-                    "size": "1024x1024",
+                    "size": "1024x1824",
                     "n": 1,
                     "response_format": "b64_json",
                     "output_format": "png",
@@ -576,6 +583,10 @@ class OpenAICompatEndpointTests(unittest.TestCase):
             ],
         )
         fetch_asset.assert_called_once_with("https://cdn.oreateai.com/aiimage/result.png")
+        conn = server.db_conn()
+        task = conn.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT 1").fetchone()
+        conn.close()
+        self.assertEqual(task["ratio"], "9:16")
 
     def test_image_generation_rejects_unsupported_count_without_creating_task(self):
         response = self.client.post(
