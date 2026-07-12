@@ -1748,12 +1748,12 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
 
         completed = server.get_pool_maintenance_job(job["id"])
         self.assertEqual(completed["status"], "completed")
-        self.assertEqual(completed["healthy_before"], 1)
-        self.assertEqual(completed["risk_found"], 1)
+        self.assertEqual(completed["healthy_before"], 2)
+        self.assertEqual(completed["risk_found"], 0)
         self.assertEqual(completed["invalid_found"], 1)
-        self.assertEqual(completed["isolated_accounts"], 2)
-        self.assertEqual(completed["registration_target"], 2)
-        self.assertEqual(completed["registered"], 2)
+        self.assertEqual(completed["isolated_accounts"], 1)
+        self.assertEqual(completed["registration_target"], 1)
+        self.assertEqual(completed["registered"], 1)
         self.assertEqual(completed["healthy_after"], 3)
         self.assertNotIn("secret", json.dumps(completed["items"], ensure_ascii=False))
 
@@ -1766,10 +1766,10 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
             ).fetchall()
         }
         conn.close()
-        self.assertEqual(isolated["risk@example.com"], "disabled")
+        self.assertEqual(isolated["risk@example.com"], "verified")
         self.assertEqual(isolated["invalid@example.com"], "disabled")
 
-    def test_pool_maintenance_marks_live_risk_response_and_does_not_delete_history(self):
+    def test_pool_maintenance_stops_on_gateway_risk_without_isolating_account(self):
         account_id = self.seed_account()
         conn = server.db_conn()
         conn.execute(
@@ -1797,16 +1797,21 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
 
         completed = server.get_pool_maintenance_job(job["id"])
         self.assertEqual(completed["status"], "completed_with_errors")
-        self.assertEqual(completed["risk_found"], 1)
-        self.assertEqual(completed["isolated_accounts"], 1)
+        self.assertEqual(completed["risk_found"], 0)
+        self.assertEqual(completed["isolated_accounts"], 0)
+        self.assertEqual(completed["current_step"], "gateway_risk")
+        self.assertIn("生成环境", completed["error_message"])
+        self.assertIn("gateway_risk:'生成环境异常，已停止检测'", server.ADMIN_HTML)
+        self.assertIn("gateway_risk:'生成环境异常'", server.ADMIN_HTML)
+        self.assertIn("aborted:'已停止检测'", server.ADMIN_HTML)
         conn = server.db_conn()
         row = conn.execute("SELECT id,status,last_error FROM accounts WHERE id=?", (account_id,)).fetchone()
         conn.close()
         self.assertEqual(row["id"], account_id)
-        self.assertEqual(row["status"], "disabled")
+        self.assertEqual(row["status"], "verified")
         self.assertIn("212361", row["last_error"])
 
-    def test_pool_maintenance_isolates_generation_risk_when_balance_check_succeeds(self):
+    def test_pool_maintenance_does_not_treat_generation_environment_as_account_risk(self):
         account_id = self.seed_account()
         conn = server.db_conn()
         conn.execute(
@@ -1841,8 +1846,9 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
 
         completed = server.get_pool_maintenance_job(job["id"])
         self.assertEqual(completed["status"], "completed_with_errors")
-        self.assertEqual(completed["risk_found"], 1)
-        self.assertEqual(completed["isolated_accounts"], 1)
+        self.assertEqual(completed["risk_found"], 0)
+        self.assertEqual(completed["isolated_accounts"], 0)
+        self.assertEqual(completed["current_step"], "gateway_risk")
         submit_probe.assert_called_once()
 
         conn = server.db_conn()
@@ -1851,8 +1857,77 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
             (account_id,),
         ).fetchone()
         conn.close()
-        self.assertEqual(row["status"], "disabled")
+        self.assertEqual(row["status"], "verified")
         self.assertIn("212361", row["last_error"])
+
+    def test_startup_recovery_restores_accounts_misclassified_by_gateway_risk(self):
+        restored_id = self.seed_account()
+        conn = server.db_conn()
+        now = time.time()
+        conn.execute(
+            """
+            INSERT INTO accounts(
+                email,password,status,source,ouid,ouss,model_info_json,video_info_json,
+                created_at,updated_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "invalid@example.com",
+                "plain-password",
+                "verified",
+                "manual",
+                "ouid-invalid",
+                "ouss-invalid",
+                "{}",
+                "{}",
+                now,
+                now,
+            ),
+        )
+        invalid_id = int(conn.execute(
+            "SELECT id FROM accounts WHERE email='invalid@example.com'"
+        ).fetchone()[0])
+        conn.execute(
+            """
+            UPDATE accounts
+            SET status='disabled', failure_count=4, cooldown_until=?,
+                last_error='212361: spam user', model_info_json=?
+            WHERE id=?
+            """,
+            (time.time() + 3600, json.dumps(self.sample_image_info()), restored_id),
+        )
+        conn.execute(
+            """
+            UPDATE accounts
+            SET status='disabled', failure_count=2,
+                last_error='200001: session expired', model_info_json=?
+            WHERE id=?
+            """,
+            (json.dumps(self.sample_image_info()), invalid_id),
+        )
+        conn.commit()
+        conn.close()
+
+        restored = server.restore_gateway_risk_misclassified_accounts()
+
+        self.assertEqual(restored, 1)
+        conn = server.db_conn()
+        restored_row = conn.execute(
+            "SELECT status,failure_count,cooldown_until,last_error FROM accounts WHERE id=?",
+            (restored_id,),
+        ).fetchone()
+        invalid_row = conn.execute(
+            "SELECT status,last_error FROM accounts WHERE id=?",
+            (invalid_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(restored_row["status"], "verified")
+        self.assertEqual(restored_row["failure_count"], 0)
+        self.assertIsNone(restored_row["cooldown_until"])
+        self.assertIsNone(restored_row["last_error"])
+        self.assertEqual(invalid_row["status"], "disabled")
+        self.assertIn("200001", invalid_row["last_error"])
 
     def test_pool_maintenance_revalidates_and_promotes_pending_registered_account(self):
         account_id = self.seed_account()

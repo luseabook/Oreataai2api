@@ -615,7 +615,7 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertTrue(visit_link.called)
         self.assertTrue(visit_link.call_args.kwargs["verify"])
 
-    def test_registered_account_is_not_activated_when_generation_validation_is_risk_controlled(self):
+    def test_registered_account_validation_is_deferred_when_gateway_environment_is_risk_controlled(self):
         session = server.OreateSession(
             email="risk@example.com",
             password="password",
@@ -646,12 +646,12 @@ class GatewayHardeningTests(unittest.TestCase):
             )
 
         self.assertEqual(account_id, 7)
-        self.assertEqual(status, "risk_control")
+        self.assertEqual(status, "validation_deferred")
         self.assertEqual(save_account.call_args.kwargs["status"], "pending_validation")
         mark_failure.assert_called_once_with(7, risk_error)
-        isolate.assert_called_once()
+        isolate.assert_not_called()
         self.assertEqual(trace[-1]["step"], "generation_validation")
-        self.assertEqual(trace[-1]["status"], "risk_control")
+        self.assertEqual(trace[-1]["status"], "validation_deferred")
 
     def test_upstream_error_code_ignores_numeric_email_domain_and_reads_status_code(self):
         error = RuntimeError(
@@ -3865,7 +3865,7 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertGreater(row["cooldown_until"], time.time())
         self.assertIn("upstream down", row["last_error"])
 
-    def test_risk_control_failure_automatically_switches_account_and_succeeds(self):
+    def test_gateway_risk_failure_does_not_rotate_or_penalize_accounts(self):
         first_account_id = self.seed_account_with_capabilities("failover-first@example.com")
         second_account_id = self.seed_account_with_capabilities("failover-second@example.com")
         self.seed_api_key("automatic-failover-key")
@@ -3873,16 +3873,7 @@ class GatewayHardeningTests(unittest.TestCase):
 
         def submit(account, *_args, **_kwargs):
             attempted_account_ids.append(account["id"])
-            if len(attempted_account_ids) == 1:
-                raise server.UpstreamGenerationError({"code": "212361", "message": "spam user"})
-            return {
-                "payload": {},
-                "response": {"chat": {"chatId": "chat-failover", "focusId": "focus-failover"}},
-                "assets": ["https://cdn.oreateai.com/static/result/failover.jpg"],
-                "stream": {"status": "streamed"},
-                "hydration": {"status": "completed"},
-                "status": "completed",
-            }
+            raise server.UpstreamGenerationError({"code": "212361", "message": "spam user"})
 
         with (
             patch.object(server, "capture_account_balance_snapshot", return_value=None),
@@ -3894,42 +3885,37 @@ class GatewayHardeningTests(unittest.TestCase):
                 json=self.valid_image_request(sync_wait_seconds=1),
             )
 
-        self.assertEqual(response.status_code, 200)
-        task = response.json()["task"]
-        self.assertEqual(task["status"], "completed")
-        self.assertEqual(task["assets"], ["https://cdn.oreateai.com/static/result/failover.jpg"])
-        self.assertEqual(task["attempt_count"], 2)
-        self.assertEqual(len(task["attempts"]), 2)
-        self.assertEqual(task["attempts"][0]["status"], "failed")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "212361")
+        task_id = response.json()["error"]["details"]["task_id"]
+        task = self.client.get(
+            f"/v1/tasks/{task_id}",
+            headers={"Authorization": "Bearer automatic-failover-key"},
+        ).json()["task"]
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["attempt_count"], 1)
+        self.assertEqual(len(task["attempts"]), 1)
         self.assertEqual(task["attempts"][0]["error_code"], "212361")
-        self.assertEqual(task["attempts"][1]["status"], "completed")
-        self.assertEqual(len(set(attempted_account_ids)), 2)
-        self.assertEqual(set(attempted_account_ids), {first_account_id, second_account_id})
-        self.assertEqual(task["account_id"], attempted_account_ids[-1])
+        self.assertEqual(len(attempted_account_ids), 1)
+        self.assertIn(attempted_account_ids[0], {first_account_id, second_account_id})
 
         conn = server.db_conn()
         failed_account = conn.execute(
             "SELECT failure_count,cooldown_until,last_error FROM accounts WHERE id=?",
             (attempted_account_ids[0],),
         ).fetchone()
-        successful_account = conn.execute(
-            "SELECT failure_count,cooldown_until,last_error FROM accounts WHERE id=?",
-            (attempted_account_ids[-1],),
-        ).fetchone()
         usage_rows = conn.execute(
             "SELECT account_id,status,error_code FROM usage_log WHERE task_id=?",
             (task["id"],),
         ).fetchall()
         conn.close()
-        self.assertEqual(failed_account["failure_count"], 1)
-        self.assertGreater(failed_account["cooldown_until"], time.time() + 3500)
+        self.assertEqual(failed_account["failure_count"], 0)
+        self.assertIsNone(failed_account["cooldown_until"])
         self.assertIn("212361", failed_account["last_error"])
-        self.assertEqual(successful_account["failure_count"], 0)
-        self.assertIsNone(successful_account["cooldown_until"])
         self.assertEqual(len(usage_rows), 1)
-        self.assertEqual(usage_rows[0]["account_id"], attempted_account_ids[-1])
-        self.assertEqual(usage_rows[0]["status"], "completed")
-        self.assertEqual(usage_rows[0]["error_code"], "")
+        self.assertEqual(usage_rows[0]["account_id"], attempted_account_ids[0])
+        self.assertEqual(usage_rows[0]["status"], "failed")
+        self.assertEqual(usage_rows[0]["error_code"], "212361")
 
     def test_parameter_error_does_not_rotate_through_account_pool(self):
         self.seed_account_with_capabilities("params-first@example.com")
@@ -3962,7 +3948,7 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(detail["attempt_count"], 1)
         self.assertEqual(len(detail["attempts"]), 1)
 
-    def test_account_failover_stops_at_configured_attempt_limit(self):
+    def test_account_failover_still_applies_to_expired_sessions(self):
         for index in range(3):
             self.seed_account_with_capabilities(f"bounded-failover-{index}@example.com")
         self.seed_api_key("bounded-failover-key")
@@ -3975,7 +3961,7 @@ class GatewayHardeningTests(unittest.TestCase):
 
         def submit(account, *_args, **_kwargs):
             attempted_account_ids.append(account["id"])
-            raise server.UpstreamGenerationError({"code": "212361", "message": "spam user"})
+            raise server.UpstreamGenerationError({"code": "200001", "message": "session expired"})
 
         try:
             with (
@@ -3991,7 +3977,7 @@ class GatewayHardeningTests(unittest.TestCase):
             server.CFG = original_cfg
 
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json()["error"]["code"], "212361")
+        self.assertEqual(response.json()["error"]["code"], "200001")
         self.assertEqual(len(attempted_account_ids), 2)
         self.assertEqual(len(set(attempted_account_ids)), 2)
         task_id = response.json()["error"]["details"]["task_id"]
@@ -4059,7 +4045,7 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertGreater(row["cooldown_until"], time.time())
         self.assertIn("200002", row["last_error"])
 
-    def test_risk_control_error_cools_account_without_invalidating_it(self):
+    def test_gateway_risk_error_records_diagnostic_without_penalizing_account(self):
         account_id = self.seed_account_with_capabilities()
 
         server.mark_account_failure(
@@ -4071,9 +4057,130 @@ class GatewayHardeningTests(unittest.TestCase):
         row = conn.execute("SELECT status,failure_count,cooldown_until,last_error FROM accounts WHERE id=?", (account_id,)).fetchone()
         conn.close()
         self.assertEqual(row["status"], "verified")
-        self.assertEqual(row["failure_count"], 1)
-        self.assertGreater(row["cooldown_until"], time.time())
+        self.assertEqual(row["failure_count"], 0)
+        self.assertIsNone(row["cooldown_until"])
         self.assertIn("212361", row["last_error"])
+
+    def test_browser_generation_worker_receives_secrets_only_via_stdin(self):
+        account_id = self.seed_account_with_capabilities("browser-worker@example.com")
+        account = server.account_row_by_id(account_id)
+        options = {
+            "model_name": "Google Nano Banana 2",
+            "ratio": "1:1",
+            "resolution": "2K",
+        }
+        completed = subprocess.CompletedProcess(
+            args=["node"],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "chat": {"chatId": "browser-chat", "focusId": "browser-focus"},
+                    "stream": {
+                        "events": [{"event": "end"}],
+                        "error": None,
+                        "status": "streamed",
+                        "completion_reason": "end",
+                    },
+                }
+            ),
+            stderr="",
+        )
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "oreate": {
+                    "browser_worker_enabled": True,
+                    "browser_worker_node": "node",
+                    "browser_worker_timeout_seconds": 150,
+                    "chromium_executable": "/usr/bin/chromium-browser",
+                    "browser_worker_node_modules": "/var/lib/oreateai/browser-worker/node_modules",
+                }
+            },
+        )
+        try:
+            with patch.object(server.subprocess, "run", return_value=completed) as run:
+                result = server.run_browser_generation(
+                    account,
+                    "image",
+                    "生成一只小猫",
+                    options,
+                    image_config=server.build_image_config(options),
+                    video_config=None,
+                    attachments=[],
+                )
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(result["chat"]["chatId"], "browser-chat")
+        command = run.call_args.args[0]
+        self.assertNotIn("browser-worker@example.com", " ".join(command))
+        self.assertNotIn("plain-password", " ".join(command))
+        payload = json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(payload["account"]["email"], "browser-worker@example.com")
+        self.assertTrue(payload["account"]["ouid"])
+        self.assertTrue(payload["account"]["ouss"])
+        self.assertEqual(payload["runtime"]["streamWaitMs"], 120_000)
+        self.assertEqual(run.call_args.kwargs["timeout"], 150)
+        self.assertFalse(run.call_args.kwargs.get("shell", False))
+
+    def test_submit_generation_uses_browser_stream_assets_when_hydration_lags(self):
+        account_id = self.seed_account_with_capabilities("browser-submit@example.com")
+        account = server.account_row_by_id(account_id)
+        options = {
+            "model_name": "Google Nano Banana 2",
+            "ratio": "1:1",
+            "resolution": "2K",
+        }
+        asset_url = "https://cdn.oreateai.com/gpt-image/result.png"
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {"oreate": {"browser_worker_enabled": True}},
+        )
+        try:
+            with (
+                patch.object(server.CLIENT, "session_from_account", return_value=object()),
+                patch.object(
+                    server,
+                    "run_browser_generation",
+                    return_value={
+                        "chat": {"chatId": "browser-chat", "focusId": "browser-focus"},
+                        "stream": {
+                            "events": [
+                                {
+                                    "event": "generating",
+                                    "data": {"url": asset_url},
+                                },
+                                {"event": "end"},
+                            ],
+                            "error": None,
+                            "status": "streamed",
+                        },
+                    },
+                ) as run_browser,
+                patch.object(
+                    server.CLIENT,
+                    "hydrate_generation_result",
+                    return_value={"raw": {}, "assets": []},
+                ),
+                patch.object(server.CLIENT, "create_chat_session") as create_chat,
+                patch.object(server.CLIENT, "stream_generation") as stream_generation,
+            ):
+                result = server.submit_generation_for_account(
+                    account,
+                    "image",
+                    "生成一只小猫",
+                    options,
+                )
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["assets"], [asset_url])
+        run_browser.assert_called_once()
+        create_chat.assert_not_called()
+        stream_generation.assert_not_called()
 
     def test_hydration_no_message_error_does_not_penalize_account(self):
         account_id = self.seed_account_with_capabilities()
@@ -4703,7 +4810,7 @@ if (!listPageSummary(page).includes('共 0 条')) throw new Error(`empty summary
         self.assertEqual(items["low@example.com"]["balance_status"], "low")
 
         self.assertEqual(items["risk@example.com"]["health_status"], "invalid")
-        self.assertEqual(items["risk@example.com"]["risk_status"], "risk_control")
+        self.assertEqual(items["risk@example.com"]["risk_status"], "invalid")
 
     def test_gateway_account_status_reports_health_counts(self):
         self.seed_account_with_capabilities("healthy@example.com")
@@ -4728,7 +4835,7 @@ if (!listPageSummary(page).includes('共 0 条')) throw new Error(`empty summary
         self.assertEqual(payload["cooling_accounts"], 1)
         self.assertEqual(payload["low_balance_accounts"], 1)
         self.assertEqual(payload["invalid_accounts"], 1)
-        self.assertEqual(payload["risk_control_accounts"], 1)
+        self.assertEqual(payload["risk_control_accounts"], 0)
 
     def test_healthz_readyz_and_metrics_report_operational_state(self):
         health = self.client.get("/healthz")

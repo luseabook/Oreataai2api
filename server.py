@@ -8,6 +8,7 @@ import os
 import secrets
 import sqlite3
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -87,6 +88,7 @@ REGISTRATION_THREADS_LOCK = threading.Lock()
 REGISTRATION_THREADS: Dict[int, threading.Thread] = {}
 POOL_MAINTENANCE_THREADS_LOCK = threading.Lock()
 POOL_MAINTENANCE_THREADS: Dict[int, threading.Thread] = {}
+GATEWAY_ENVIRONMENT_ERROR_CODES = {"212361"}
 
 DEFAULT_CONFIG = {
     "database": {
@@ -124,6 +126,11 @@ DEFAULT_CONFIG = {
         "video_stream_read_timeout_seconds": 20,
         "video_hydration_timeout_seconds": 600,
         "video_hydration_poll_interval_seconds": 10,
+        "browser_worker_enabled": False,
+        "browser_worker_node": "node",
+        "browser_worker_timeout_seconds": 150,
+        "browser_worker_node_modules": "",
+        "chromium_executable": "",
     },
     "mail": {
         "provider": "yyds",
@@ -147,7 +154,7 @@ DEFAULT_CONFIG = {
         "account_cooldown_seconds": 300,
         "account_risk_quarantine_seconds": 3600,
         "account_failover_max_attempts": 5,
-        "account_failover_error_codes": ["200001", "212361"],
+        "account_failover_error_codes": ["200001"],
         "prompt_max_length": 4000,
         "request_id_max_length": 128,
         "upload_max_bytes": 104857600,
@@ -628,9 +635,7 @@ def account_balance_status(row: sqlite3.Row) -> str:
 def account_risk_status(row: sqlite3.Row) -> str:
     status = str(row["status"] or "")
     if status == "invalid":
-        return "risk_control" if "212361" in str(row["last_error"] or "") else "invalid"
-    if str(row["last_error"] or "").find("212361") >= 0:
-        return "risk_control"
+        return "invalid"
     return "clean"
 
 
@@ -2171,7 +2176,7 @@ def mark_account_failure(account_id: int, error: Exception) -> None:
     last_error = account_failure_message(error, code)[:500]
     conn = db_conn()
     row = conn.execute("SELECT COALESCE(failure_count, 0) as failure_count FROM accounts WHERE id=?", (account_id,)).fetchone()
-    if code == "110012":
+    if code == "110012" or code in GATEWAY_ENVIRONMENT_ERROR_CODES:
         conn.execute(
             "UPDATE accounts SET last_error=?, updated_at=? WHERE id=?",
             (last_error, now, account_id),
@@ -2643,6 +2648,41 @@ def init_db():
     conn.commit()
     apply_sql_migrations(conn)
     conn.close()
+
+
+def restore_gateway_risk_misclassified_accounts() -> int:
+    now = time.time()
+    conn = db_conn()
+    try:
+        table_exists = conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type='table' AND name='accounts'
+            """
+        ).fetchone()
+        if not table_exists:
+            return 0
+        cursor = conn.execute(
+            """
+            UPDATE accounts
+            SET status='verified',
+                failure_count=0,
+                cooldown_until=NULL,
+                last_error=NULL,
+                updated_at=?
+            WHERE status IN ('disabled', 'invalid')
+              AND instr(COALESCE(last_error, ''), '212361') > 0
+              AND COALESCE(ouid, '') <> ''
+              AND COALESCE(ouss, '') <> ''
+              AND COALESCE(model_info_json, '') NOT IN ('', '{}', 'null')
+            """,
+            (now,),
+        )
+        conn.commit()
+        return max(0, int(cursor.rowcount or 0))
+    finally:
+        conn.close()
 
 
 async def broadcast(msg: Dict[str, Any]):
@@ -4082,7 +4122,7 @@ def account_failover_max_attempts() -> int:
 def account_failover_error_codes() -> set[str]:
     configured = gateway_cfg().get(
         "account_failover_error_codes",
-        ["200001", "212361"],
+        ["200001"],
     )
     if isinstance(configured, str):
         values = re.split(r"[,;\s]+", configured)
@@ -4090,7 +4130,12 @@ def account_failover_error_codes() -> set[str]:
         values = configured
     else:
         values = []
-    return {str(value).strip() for value in values if str(value).strip()}
+    return {
+        str(value).strip()
+        for value in values
+        if str(value).strip()
+        and str(value).strip() not in GATEWAY_ENVIRONMENT_ERROR_CODES
+    }
 
 
 def task_generation_attempt_account_ids(task_id: int) -> List[int]:
@@ -4981,6 +5026,121 @@ def refresh_capabilities_from_pool() -> Dict[str, Any]:
     return {"ok": True, "source_account_id": account["id"], **caps}
 
 
+def browser_generation_enabled() -> bool:
+    return bool(CFG.get("oreate", {}).get("browser_worker_enabled", False))
+
+
+def browser_worker_script_path() -> Path:
+    return BASE_DIR / "oreate_browser_worker.js"
+
+
+def run_browser_generation(
+    account: sqlite3.Row,
+    kind: str,
+    prompt: str,
+    options: Dict[str, Any],
+    *,
+    image_config: Optional[Dict[str, Any]],
+    video_config: Optional[Dict[str, Any]],
+    attachments: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    orete_config = CFG.get("oreate", {})
+    script_path = browser_worker_script_path()
+    if not script_path.is_file():
+        raise RuntimeError(f"browser generation worker is missing: {script_path}")
+
+    executable_path = str(orete_config.get("chromium_executable") or "").strip()
+    node_modules_path = str(orete_config.get("browser_worker_node_modules") or "").strip()
+    if not executable_path:
+        raise RuntimeError("browser generation worker requires chromium_executable")
+    if not node_modules_path:
+        raise RuntimeError("browser generation worker requires browser_worker_node_modules")
+
+    timeout_seconds = max(
+        10,
+        int_or_default(
+            orete_config.get("browser_worker_timeout_seconds"),
+            150,
+        ),
+    )
+    # Leave enough time for Chromium startup, navigation and orderly shutdown.
+    # Otherwise the outer subprocess timeout can terminate a healthy image
+    # stream just before the worker returns its final JSON result.
+    stream_wait_budget = max(5, timeout_seconds - 30)
+    stream_wait_seconds = (
+        min(
+            float(orete_config.get("video_stream_wait_seconds") or 60),
+            float(stream_wait_budget),
+        )
+        if kind == "video"
+        else float(stream_wait_budget)
+    )
+    payload = {
+        "baseUrl": str(orete_config.get("base_url") or "https://www.oreateai.com").rstrip("/"),
+        "kind": kind,
+        "chatType": "aiImage" if kind == "image" else "aiVideo",
+        "prompt": prompt,
+        "options": options,
+        "imageConfig": image_config,
+        "videoConfig": video_config,
+        "attachments": attachments,
+        "account": {
+            "email": str(account["email"] or ""),
+            "ouid": decrypt_secret_value(account["ouid"], required=True),
+            "ouss": decrypt_secret_value(account["ouss"], required=True),
+        },
+        "runtime": {
+            "chromiumExecutable": executable_path,
+            "nodeModulesPath": node_modules_path,
+            "streamWaitMs": max(5_000, int(stream_wait_seconds * 1000)),
+            "navigationTimeoutMs": min(max(30_000, timeout_seconds * 1000 // 2), 90_000),
+        },
+    }
+    command = [
+        str(orete_config.get("browser_worker_node") or "node"),
+        str(script_path),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            input=json.dumps(payload, ensure_ascii=False),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"browser generation worker timed out after {timeout_seconds} seconds"
+        ) from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "unknown browser worker failure").strip()
+        raise RuntimeError(f"browser generation worker failed: {detail[:1000]}")
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"browser generation worker returned malformed JSON: {completed.stdout[:500]}"
+        ) from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("browser generation worker returned an invalid result")
+    if isinstance(result.get("error"), dict):
+        raise UpstreamGenerationError(result["error"])
+    chat = result.get("chat")
+    stream = result.get("stream")
+    if not isinstance(chat, dict) or not chat.get("chatId"):
+        raise RuntimeError("browser generation worker did not return a chat id")
+    if not isinstance(stream, dict):
+        raise RuntimeError("browser generation worker did not return a stream result")
+    events = stream.get("events") if isinstance(stream.get("events"), list) else []
+    error = classify_sse_error(events)
+    stream["error"] = error
+    if error:
+        stream["status"] = "failed"
+    return {"chat": chat, "stream": stream}
+
+
 def submit_generation_for_account(
     account: sqlite3.Row,
     kind: str,
@@ -5010,19 +5170,34 @@ def submit_generation_for_account(
         request_payload["messages"][0]["attachments"] = attachments
         request_payload["videoConfig"] = video_config
 
-    chat = CLIENT.create_chat_session(s, chat_type)
-    stream = CLIENT.stream_generation(
-        s,
-        chat_id=chat["chatId"],
-        focus_id=chat.get("focusId") or chat["chatId"],
-        chat_type=chat_type,
-        prompt=prompt,
-        image_config=image_config,
-        video_config=video_config,
-        attachments=attachments,
-        account=account,
-        should_stop=should_stop,
-    )
+    if browser_generation_enabled():
+        if should_stop is not None and should_stop():
+            raise TaskCancelledError("task cancelled before browser generation")
+        browser_result = run_browser_generation(
+            account,
+            kind,
+            prompt,
+            options,
+            image_config=image_config,
+            video_config=video_config,
+            attachments=attachments,
+        )
+        chat = browser_result["chat"]
+        stream = browser_result["stream"]
+    else:
+        chat = CLIENT.create_chat_session(s, chat_type)
+        stream = CLIENT.stream_generation(
+            s,
+            chat_id=chat["chatId"],
+            focus_id=chat.get("focusId") or chat["chatId"],
+            chat_type=chat_type,
+            prompt=prompt,
+            image_config=image_config,
+            video_config=video_config,
+            attachments=attachments,
+            account=account,
+            should_stop=should_stop,
+        )
     if stream.get("error"):
         raise UpstreamGenerationError(stream["error"])
     if stream.get("status") == "cancelled":
@@ -5042,7 +5217,10 @@ def submit_generation_for_account(
         hydration = CLIENT.hydrate_generation_result(s, chat["chatId"])
     if hydration.get("error"):
         raise UpstreamGenerationError(hydration["error"])
-    assets = hydration.get("assets") or []
+    stream_assets = extract_generation_assets(stream.get("events") or [])
+    assets = hydration.get("assets") or stream_assets
+    if assets and not hydration.get("assets"):
+        hydration = {**hydration, "assets": assets, "status": "completed"}
     response = {
         "chat": {"chatId": chat["chatId"], "focusId": chat.get("focusId") or chat["chatId"]},
         "stream": stream,
@@ -5215,14 +5393,14 @@ def save_and_validate_registered_account(
     except Exception as exc:
         code = upstream_error_code(exc)
         mark_account_failure(account_id, exc)
-        if code in {"200001", "212361"}:
+        if code == "200001":
             isolate_account_from_pool(
                 account_id,
                 f"注册后真实生成检测失败：{account_failure_message(exc, code)}",
             )
         status = (
-            "risk_control"
-            if code == "212361"
+            "validation_deferred"
+            if code in GATEWAY_ENVIRONMENT_ERROR_CODES
             else "invalid"
             if code == "200001"
             else "validation_failed"
@@ -5784,11 +5962,8 @@ def record_maintenance_account_failure(
     code = upstream_error_code(exc)
     mark_account_failure(account_id, exc)
     refreshed = account_row_by_id(account_id)
-    if code == "212361" or (
-        refreshed is not None
-        and account_risk_status(refreshed) == "risk_control"
-    ):
-        return "risk_control", code
+    if code in GATEWAY_ENVIRONMENT_ERROR_CODES:
+        return "gateway_risk", code
     if code == "200001" or (
         refreshed is not None
         and str(refreshed["status"] or "") == "invalid"
@@ -5813,6 +5988,8 @@ def run_pool_maintenance_job(job_id: int) -> None:
     invalid_found = 0
     isolated_accounts = 0
     check_failures = 0
+    gateway_risk_detected = False
+    gateway_risk_message = ""
 
     update_pool_maintenance_job(
         job_id,
@@ -5866,9 +6043,7 @@ def run_pool_maintenance_job(job_id: int) -> None:
                     account_id,
                     exc,
                 )
-                if category == "risk_control":
-                    risk_found += 1
-                elif category == "invalid":
+                if category == "invalid":
                     invalid_found += 1
                 action = "cooling" if category == "check_failed" else ""
         elif risk_status == "risk_control":
@@ -5907,11 +6082,38 @@ def run_pool_maintenance_job(job_id: int) -> None:
                         account_id,
                         exc,
                     )
-                    if category == "risk_control":
-                        risk_found += 1
-                    elif category == "invalid":
+                    if category == "invalid":
                         invalid_found += 1
                     action = "cooling" if category == "check_failed" else ""
+
+        if category == "gateway_risk":
+            action = "aborted"
+            gateway_risk_detected = True
+            gateway_risk_message = (
+                "生成环境触发上游风控（212361），已停止批量检测；"
+                "账号未隔离、未冷却，请检查 Chromium 工作节点和出口网络。"
+            )
+            current = account_row_by_id(account_id) or row
+            items.append(
+                maintenance_account_item(
+                    current,
+                    category=category,
+                    action=action,
+                    error_code=code,
+                )
+            )
+            checked_accounts += 1
+            update_pool_maintenance_job(
+                job_id,
+                checked_accounts=checked_accounts,
+                risk_found=risk_found,
+                invalid_found=invalid_found,
+                isolated_accounts=isolated_accounts,
+                current_step="gateway_risk",
+                error_message=gateway_risk_message,
+                items=items,
+            )
+            break
 
         if category in {"risk_control", "invalid"}:
             if clean_risk:
@@ -5948,7 +6150,7 @@ def run_pool_maintenance_job(job_id: int) -> None:
     scanned_summary = account_pool_summary(list_accounts())
     registration_target = (
         min(max_register, max(0, target_healthy - scanned_summary["healthy"]))
-        if supplement
+        if supplement and not gateway_risk_detected
         else 0
     )
     update_pool_maintenance_job(
@@ -5957,7 +6159,14 @@ def run_pool_maintenance_job(job_id: int) -> None:
         registration_target=registration_target,
         current_account_id=None,
         current_email="",
-        current_step="supplementing" if registration_target else "finalizing",
+        current_step=(
+            "gateway_risk"
+            if gateway_risk_detected
+            else "supplementing"
+            if registration_target
+            else "finalizing"
+        ),
+        error_message=gateway_risk_message,
     )
 
     registered = 0
@@ -6013,7 +6222,7 @@ def run_pool_maintenance_job(job_id: int) -> None:
     target_unmet = supplement and final_summary["healthy"] < target_healthy
     final_status = (
         "completed_with_errors"
-        if check_failures or registration_failed or target_unmet
+        if gateway_risk_detected or check_failures or registration_failed or target_unmet
         else "completed"
     )
     update_pool_maintenance_job(
@@ -6028,7 +6237,8 @@ def run_pool_maintenance_job(job_id: int) -> None:
         registration_failed=registration_failed,
         current_account_id=None,
         current_email="",
-        current_step="completed",
+        current_step="gateway_risk" if gateway_risk_detected else "completed",
+        error_message=gateway_risk_message,
         items=items,
         finished_at=time.time(),
     )
@@ -8961,6 +9171,12 @@ def on_startup():
         except HTTPException as exc:
             raise RuntimeError(str(exc.detail)) from exc
         init_db()
+        restored_gateway_risk_accounts = restore_gateway_risk_misclassified_accounts()
+        if restored_gateway_risk_accounts:
+            emit_log(
+                "info",
+                f"已恢复 {restored_gateway_risk_accounts} 个被生成环境风控误判的账号",
+            )
         if not CONFIG_PATH.exists():
             save_config(CFG)
         recover_stale_running_tasks(stale_after_seconds=0.0)
@@ -10743,6 +10959,7 @@ function maintenanceStepLabel(step){
     checking_account:'正在检测账号健康状态',
     checking_generation:'正在验证真实生成能力',
     refreshing_session:'正在刷新账号登录状态',
+    gateway_risk:'生成环境异常，已停止检测',
     supplementing:'正在补充健康账号',
     finalizing:'正在汇总检测结果',
     completed:'维护任务已完成',
@@ -10765,6 +10982,7 @@ function maintenanceItemLabel(item){
   }
   const category=({
     risk_control:'风控账号',
+    gateway_risk:'生成环境异常',
     invalid:'失效账号',
     check_failed:'检测异常',
   })[item?.category] || item?.category || '账号';
@@ -10772,6 +10990,7 @@ function maintenanceItemLabel(item){
     isolated:'已隔离',
     detected:'已发现',
     cooling:'已进入冷却',
+    aborted:'已停止检测',
   })[item?.action] || item?.action || '已处理';
   return `${item?.email||`账号 #${item?.account_id||'-'}`} · ${category} · ${action}`;
 }

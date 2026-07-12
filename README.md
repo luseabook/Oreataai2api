@@ -291,7 +291,7 @@ Content-Type: multipart/form-data
 账号健康分类：
 - `200001`：登录态失效，账号标记为 `invalid`，未指定固定账号时自动换号重试。
 - `200002`：协议参数被拒绝，账号保留但进入冷却。
-- `212361`：上游风控/垃圾用户，账号进入风险隔离，未指定固定账号时自动换号重试。
+- `212361`：生成运行环境触发上游风控。该错误不会增加账号失败次数、不会冷却或隔离账号，也不会自动轮换号池；生产环境应启用真实 Chromium 工作节点。
 - `110012`：历史消息未生成或未持久化，只记录警告，不惩罚账号池。
 
 自动换号在同一个任务内执行，不会新增 API Key 请求计数；每次账号尝试都会写入任务尝试记录。默认最多尝试 5 个不同账号，参数错误等请求级失败不会遍历号池。
@@ -313,7 +313,7 @@ Content-Type: multipart/form-data
     "account_cooldown_seconds": 300,
     "account_risk_quarantine_seconds": 3600,
     "account_failover_max_attempts": 5,
-    "account_failover_error_codes": ["200001", "212361"],
+    "account_failover_error_codes": ["200001"],
     "prompt_max_length": 4000
   },
   "oreate": {
@@ -328,7 +328,21 @@ Content-Type: multipart/form-data
 ## 当前缺口
 - 自动注册：待补 `/passport/api/emailsignupin` + YYDS 收信 + `/passport/api/emailregisterconfirm`
 - 上传类视频高级场景回归：文本转视频和上传图生视频 `text_or_image` 已用真实账号验证成功；`reference`、`frame_based`、`motion` 仍需要单独低成本实测
-- 号池维护：支持批量积分检查、低成本真实图片生成探针、风险/失效账号隔离和健康账号自动补充；新注册账号通过真实生成验证后才会进入可调度号池
+- 号池维护：支持批量积分检查、低成本真实图片生成探针、失效账号隔离和健康账号自动补充；遇到 `212361` 会立即停止批量探测并保留账号，避免把网关环境问题误判为账号问题；新注册账号通过真实生成验证后才会进入可调度号池
+
+生产环境推荐在 `oreate` 配置中启用真实浏览器生成工作节点：
+
+```json
+{
+  "browser_worker_enabled": true,
+  "browser_worker_node": "node",
+  "browser_worker_timeout_seconds": 150,
+  "browser_worker_node_modules": "/var/lib/oreateai/browser-worker/node_modules",
+  "chromium_executable": "/usr/bin/chromium-browser"
+}
+```
+
+工作节点依赖 `puppeteer-core`，账号 Cookie 通过子进程标准输入传递，不会出现在进程命令行中。
 - 网关结果：已支持同步解析 SSE 和历史消息资源 URL，后续可补异步任务轮询、失败任务重试/取消
 
 ## 下一步
