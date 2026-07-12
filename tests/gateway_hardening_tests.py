@@ -709,6 +709,53 @@ class GatewayHardeningTests(unittest.TestCase):
                 update_task.assert_not_called()
                 update_usage.assert_not_called()
 
+    def test_scoped_cancel_supports_legacy_usage_ownership_without_cross_tenant_access(self):
+        owner_key_id = self.seed_api_key("legacy-task-owner")
+        self.seed_api_key("legacy-task-foreign")
+        task_id = self.seed_task(status="queued", kind="image")
+        task = server.fetch_task_row(task_id)
+        self.assertIsNotNone(task)
+        server.log_usage(
+            owner_key_id,
+            task["kind"],
+            task["account_id"],
+            task["prompt"],
+            "queued",
+            task_id=task_id,
+            status_code=202,
+        )
+
+        foreign = self.client.post(
+            f"/v1/tasks/{task_id}/cancel",
+            headers={"Authorization": "Bearer legacy-task-foreign"},
+        )
+
+        self.assertEqual(foreign.status_code, 404)
+        self.assertEqual(foreign.json()["error"]["code"], "TASK_NOT_FOUND")
+
+        cancelled = self.client.post(
+            f"/v1/tasks/{task_id}/cancel",
+            headers={"Authorization": "Bearer legacy-task-owner"},
+        )
+
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.json()["task"]["status"], "cancelled")
+        conn = server.db_conn()
+        task_row = conn.execute(
+            "SELECT api_key_id,status FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        usage_row = conn.execute(
+            "SELECT api_key_id,status,error_code FROM usage_log WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        conn.close()
+        self.assertIsNone(task_row["api_key_id"])
+        self.assertEqual(task_row["status"], "cancelled")
+        self.assertEqual(usage_row["api_key_id"], owner_key_id)
+        self.assertEqual(usage_row["status"], "cancelled")
+        self.assertEqual(usage_row["error_code"], "TASK_CANCELLED")
+
     def test_task_retry_rechecks_api_key_model_scope(self):
         self.seed_account_with_capabilities()
         self.seed_account_with_capabilities("retry-scope-failover@example.com")
@@ -975,6 +1022,103 @@ class GatewayHardeningTests(unittest.TestCase):
             task = detail.json()["task"]
             self.assertEqual(task["status"], "cancelled")
             self.assertEqual(task["assets"], [])
+
+    def test_cancellation_wins_race_after_worker_check_before_final_write(self):
+        self.seed_account_with_capabilities()
+        api_key_id = self.seed_api_key("cancel-finalize-race-key")
+        created = self.client.post(
+            "/v1/generate",
+            headers={"Authorization": "Bearer cancel-finalize-race-key"},
+            json=self.valid_image_request(),
+        )
+        self.assertEqual(created.status_code, 202)
+        task_id = created.json()["task_id"]
+        task = server.claim_next_task()
+        self.assertIsNotNone(task)
+        self.assertEqual(task["id"], task_id)
+        self.assertEqual(task["status"], "running")
+        attempt_id = server.create_task_attempt(task, "generation")
+        checked = threading.Event()
+        release = threading.Event()
+        worker_errors = []
+
+        def stale_cancel_check(_task_id):
+            checked.set()
+            self.assertTrue(release.wait(timeout=2), "finalizer was not released")
+            return False
+
+        result = {
+            "account_id": task["account_id"],
+            "chat_id": "chat-race-lost",
+            "focus_id": "focus-race-lost",
+            "response_json": {
+                "status": "completed",
+                "chat": {"chatId": "chat-race-lost", "focusId": "focus-race-lost"},
+            },
+            "assets": ["https://cdn.oreateai.com/static/result/race-lost.jpg"],
+            "response_summary": "completed",
+            "status_code": 200,
+            "actual_point_cost": 12,
+        }
+
+        def finalize():
+            try:
+                server.finalize_task_attempt(task, attempt_id, "generation", result, "completed")
+            except Exception as exc:
+                worker_errors.append(exc)
+
+        with patch.object(server, "task_cancel_requested", side_effect=stale_cancel_check):
+            worker = threading.Thread(target=finalize)
+            worker.start()
+            self.assertTrue(checked.wait(timeout=2), "worker did not reach the pre-finalization cancellation check")
+
+            cancelled = self.client.post(
+                f"/v1/tasks/{task_id}/cancel",
+                headers={"Authorization": "Bearer cancel-finalize-race-key"},
+            )
+            self.assertEqual(cancelled.status_code, 200)
+            self.assertEqual(cancelled.json()["task"]["status"], "cancelled")
+
+            release.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive(), "worker finalizer did not finish")
+        self.assertEqual(worker_errors, [])
+        conn = server.db_conn()
+        task_row = conn.execute(
+            """
+            SELECT status,assets_json,response_json,chat_id,focus_id,actual_point_cost,error_code
+            FROM tasks WHERE id=?
+            """,
+            (task_id,),
+        ).fetchone()
+        attempt_row = conn.execute(
+            "SELECT status,assets_json,error_code FROM task_attempts WHERE id=?",
+            (attempt_id,),
+        ).fetchone()
+        usage_row = conn.execute(
+            """
+            SELECT status,response_summary,error_code,actual_point_cost,status_code
+            FROM usage_log WHERE task_id=? AND api_key_id=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (task_id, api_key_id),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(task_row["status"], "cancelled")
+        self.assertEqual(json.loads(task_row["assets_json"]), [])
+        self.assertNotEqual(task_row["chat_id"], "chat-race-lost")
+        self.assertNotEqual(task_row["focus_id"], "focus-race-lost")
+        self.assertIsNone(task_row["actual_point_cost"])
+        self.assertEqual(task_row["error_code"], "TASK_CANCELLED")
+        self.assertEqual(attempt_row["status"], "cancelled")
+        self.assertEqual(json.loads(attempt_row["assets_json"]), [])
+        self.assertEqual(attempt_row["error_code"], "TASK_CANCELLED")
+        self.assertEqual(usage_row["status"], "cancelled")
+        self.assertEqual(usage_row["response_summary"], "cancelled")
+        self.assertEqual(usage_row["error_code"], "TASK_CANCELLED")
+        self.assertIsNone(usage_row["actual_point_cost"])
+        self.assertEqual(usage_row["status_code"], 499)
 
     def test_submitted_task_expires_after_hydration_deadline(self):
         original_cfg = server.CFG

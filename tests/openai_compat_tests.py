@@ -832,6 +832,52 @@ class OpenAICompatEndpointTests(unittest.TestCase):
         self.assertEqual(completed.status_code, 409)
         self.assertEqual(completed.json()["error"]["code"], "video_not_cancellable")
 
+    def test_video_delete_cancels_legacy_active_job_owned_through_usage_log(self):
+        owner_key_id = self.api_key_id("openai-video-key")
+        task_id = self.seed_video_task(status="running")
+        conn = server.db_conn()
+        conn.execute("UPDATE tasks SET api_key_id=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        conn.close()
+        server.log_usage(
+            owner_key_id,
+            "video",
+            1,
+            "video prompt",
+            "running",
+            task_id=task_id,
+            status_code=202,
+        )
+
+        foreign = self.client.delete(
+            f"/v1/videos/video_{task_id}",
+            headers={"Authorization": "Bearer openai-model-key"},
+        )
+        self.assertEqual(foreign.status_code, 404)
+
+        cancelled = self.client.delete(
+            f"/v1/videos/video_{task_id}",
+            headers={"Authorization": "Bearer openai-video-key"},
+        )
+
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.json()["status"], "cancelled")
+        conn = server.db_conn()
+        task_row = conn.execute(
+            "SELECT api_key_id,status FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        usage_row = conn.execute(
+            "SELECT api_key_id,status,error_code FROM usage_log WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        conn.close()
+        self.assertIsNone(task_row["api_key_id"])
+        self.assertEqual(task_row["status"], "cancelled")
+        self.assertEqual(usage_row["api_key_id"], owner_key_id)
+        self.assertEqual(usage_row["status"], "cancelled")
+        self.assertEqual(usage_row["error_code"], "TASK_CANCELLED")
+
 
 if __name__ == "__main__":
     unittest.main()

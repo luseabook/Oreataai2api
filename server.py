@@ -3872,31 +3872,63 @@ def task_next_attempt_at(task: Dict[str, Any], phase: str, status: str) -> Optio
 
 def cancel_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "task cancelled") -> None:
     now = time.time()
-    update_task_attempt(
-        attempt_id,
-        status="cancelled",
-        error_code="TASK_CANCELLED",
-        error_message=message,
-        assets_json=[],
-        finished_at=now,
-    )
-    update_task_record(
-        task["id"],
-        status="cancelled",
-        error_code="TASK_CANCELLED",
-        error_message=message,
-        finished_at=now,
-        next_attempt_at=None,
-    )
-    if task.get("api_key_id"):
-        update_usage_log_for_task(
-            task["id"],
-            task.get("api_key_id"),
-            status="cancelled",
-            response_summary="cancelled",
-            error_code="TASK_CANCELLED",
-            status_code=499,
+    task_id = int(task["id"])
+    expected_status = str(task.get("status") or "")
+    conn = db_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT status,cancel_requested_at FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        task_is_cancelled = bool(
+            current
+            and (
+                str(current["status"] or "") == "cancelled"
+                or current["cancel_requested_at"] is not None
+            )
         )
+        if current and expected_status in {"running", "hydrating"}:
+            result = conn.execute(
+                """
+                UPDATE tasks
+                SET status='cancelled', error_code='TASK_CANCELLED', error_message=?,
+                    cancel_requested_at=COALESCE(cancel_requested_at, ?),
+                    finished_at=?, next_attempt_at=NULL, updated_at=?
+                WHERE id=? AND status=?
+                """,
+                (message, now, now, now, task_id, expected_status),
+            )
+            task_is_cancelled = task_is_cancelled or result.rowcount == 1
+        conn.execute(
+            """
+            UPDATE task_attempts
+            SET status='cancelled', error_code='TASK_CANCELLED', error_message=?,
+                assets_json=?, finished_at=?
+            WHERE id=? AND task_id=?
+            """,
+            (message, encode_json_value([]), now, attempt_id, task_id),
+        )
+        if task_is_cancelled and task.get("api_key_id"):
+            conn.execute(
+                """
+                UPDATE usage_log
+                SET status='cancelled', response_summary='cancelled',
+                    error_code='TASK_CANCELLED', status_code=499
+                WHERE id=(
+                    SELECT id FROM usage_log
+                    WHERE task_id=? AND api_key_id=?
+                    ORDER BY id DESC LIMIT 1
+                )
+                """,
+                (task_id, task.get("api_key_id")),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def expire_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "task expired while waiting for upstream assets") -> None:
@@ -4031,48 +4063,139 @@ def finalize_task_attempt(task: sqlite3.Row, attempt_id: int, phase: str, result
         cancel_task_attempt(task, attempt_id, result.get("error_message") or "task cancelled")
         return
     next_attempt_at = task_next_attempt_at(task, phase, status)
-    update_task_attempt(
-        attempt_id,
-        status=status,
-        error_code=result.get("error_code") or "",
-        error_message=result.get("error_message") or "",
-        stream_summary_json=result.get("stream_summary"),
-        hydration_summary_json=result.get("hydration_summary"),
-        assets_json=result.get("assets") or [],
-        finished_at=now,
-    )
-    update_task_record(
-        task["id"],
-        status=status,
-        account_id=result.get("account_id", task.get("account_id")),
-        chat_id=result.get("chat_id", task.get("chat_id") or ""),
-        focus_id=result.get("focus_id", task.get("focus_id") or ""),
-        response_json=result.get("response_json"),
-        assets_json=result.get("assets") or [],
-        error_code=result.get("error_code") or "",
-        error_message=result.get("error_message") or "",
-        actual_point_cost=result.get("actual_point_cost"),
-        balance_before_json=result.get("balance_before_json"),
-        balance_after_json=result.get("balance_after_json"),
-        balance_before_rest_point=result.get("balance_before_rest_point"),
-        balance_before_daily_point=result.get("balance_before_daily_point"),
-        balance_before_bonus_point=result.get("balance_before_bonus_point"),
-        balance_after_rest_point=result.get("balance_after_rest_point"),
-        balance_after_daily_point=result.get("balance_after_daily_point"),
-        balance_after_bonus_point=result.get("balance_after_bonus_point"),
-        next_attempt_at=next_attempt_at,
-        finished_at=now if status in TASK_TERMINAL_STATUSES else None,
-    )
-    if task.get("api_key_id"):
-        update_usage_log_for_task(
-            task["id"],
-            task.get("api_key_id"),
-            status=status,
-            response_summary=result.get("response_summary") or status,
-            error_code=result.get("error_code") or "",
-            actual_point_cost=result.get("actual_point_cost"),
-            status_code=result.get("status_code") or (200 if status == "completed" else 202 if status in {"queued", "submitted", "hydrating"} else 503),
+    expected_status = {"generation": "running", "hydration": "hydrating"}.get(phase)
+    if expected_status is None:
+        raise ValueError(f"unsupported task attempt phase: {phase}")
+    task_id = int(task["id"])
+    task_fields = {
+        "status": status,
+        "account_id": result.get("account_id", task.get("account_id")),
+        "chat_id": result.get("chat_id", task.get("chat_id") or ""),
+        "focus_id": result.get("focus_id", task.get("focus_id") or ""),
+        "response_json": result.get("response_json"),
+        "assets_json": result.get("assets") or [],
+        "error_code": result.get("error_code") or "",
+        "error_message": result.get("error_message") or "",
+        "actual_point_cost": result.get("actual_point_cost"),
+        "balance_before_json": result.get("balance_before_json"),
+        "balance_after_json": result.get("balance_after_json"),
+        "balance_before_rest_point": result.get("balance_before_rest_point"),
+        "balance_before_daily_point": result.get("balance_before_daily_point"),
+        "balance_before_bonus_point": result.get("balance_before_bonus_point"),
+        "balance_after_rest_point": result.get("balance_after_rest_point"),
+        "balance_after_daily_point": result.get("balance_after_daily_point"),
+        "balance_after_bonus_point": result.get("balance_after_bonus_point"),
+        "next_attempt_at": next_attempt_at,
+        "finished_at": now if status in TASK_TERMINAL_STATUSES else None,
+        "updated_at": now,
+    }
+    for key in ("response_json", "assets_json", "balance_before_json", "balance_after_json"):
+        task_fields[key] = encode_json_value(task_fields[key])
+    task_assignments = ", ".join(f"{key}=?" for key in task_fields)
+    conn = db_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        task_update = conn.execute(
+            f"""
+            UPDATE tasks
+            SET {task_assignments}
+            WHERE id=? AND status=? AND cancel_requested_at IS NULL
+            """,
+            tuple(task_fields.values()) + (task_id, expected_status),
         )
+        if task_update.rowcount != 1:
+            current = conn.execute(
+                "SELECT status,cancel_requested_at FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            cancelled = bool(
+                current
+                and (
+                    str(current["status"] or "") == "cancelled"
+                    or current["cancel_requested_at"] is not None
+                )
+            )
+            discarded_status = "cancelled" if cancelled else "expired"
+            discarded_code = "TASK_CANCELLED" if cancelled else "TASK_ATTEMPT_STALE"
+            discarded_message = (
+                result.get("error_message") or "task cancelled"
+                if cancelled
+                else "task state changed before the attempt result could be finalized"
+            )
+            conn.execute(
+                """
+                UPDATE task_attempts
+                SET status=?, error_code=?, error_message=?, assets_json=?, finished_at=?
+                WHERE id=? AND task_id=?
+                """,
+                (
+                    discarded_status,
+                    discarded_code,
+                    discarded_message,
+                    encode_json_value([]),
+                    now,
+                    attempt_id,
+                    task_id,
+                ),
+            )
+            conn.commit()
+            return
+        attempt_update = conn.execute(
+            """
+            UPDATE task_attempts
+            SET status=?, error_code=?, error_message=?, stream_summary_json=?,
+                hydration_summary_json=?, assets_json=?, finished_at=?
+            WHERE id=? AND task_id=? AND status='running'
+            """,
+            (
+                status,
+                result.get("error_code") or "",
+                result.get("error_message") or "",
+                encode_json_value(result.get("stream_summary")),
+                encode_json_value(result.get("hydration_summary")),
+                encode_json_value(result.get("assets") or []),
+                now,
+                attempt_id,
+                task_id,
+            ),
+        )
+        if attempt_update.rowcount != 1:
+            raise RuntimeError("task attempt state changed before finalization")
+        if task.get("api_key_id"):
+            usage_status_code = result.get("status_code") or (
+                200
+                if status == "completed"
+                else 202
+                if status in {"queued", "submitted", "hydrating"}
+                else 503
+            )
+            conn.execute(
+                """
+                UPDATE usage_log
+                SET status=?, response_summary=?, error_code=?,
+                    actual_point_cost=?, status_code=?
+                WHERE id=(
+                    SELECT id FROM usage_log
+                    WHERE task_id=? AND api_key_id=?
+                    ORDER BY id DESC LIMIT 1
+                )
+                """,
+                (
+                    status,
+                    str(result.get("response_summary") or status)[:200],
+                    result.get("error_code") or "",
+                    result.get("actual_point_cost"),
+                    usage_status_code,
+                    task_id,
+                    task.get("api_key_id"),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def execute_task(task: sqlite3.Row) -> bool:
@@ -6926,17 +7049,23 @@ def cancel_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[s
     conn = db_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        where = ["id=?"]
-        params: List[Any] = [task_id]
-        if api_key_id is not None:
-            where.append("api_key_id=?")
-            params.append(api_key_id)
         current = conn.execute(
-            f"SELECT status,api_key_id FROM tasks WHERE {' AND '.join(where)}",
-            tuple(params),
+            "SELECT status,api_key_id FROM tasks WHERE id=?",
+            (task_id,),
         ).fetchone()
         if not current:
             raise GatewayAPIError(404, "TASK_NOT_FOUND", "task not found")
+        current_api_key_id = current["api_key_id"]
+        if api_key_id is not None:
+            if current_api_key_id is None:
+                legacy_owner = conn.execute(
+                    "SELECT 1 FROM usage_log WHERE task_id=? AND api_key_id=? LIMIT 1",
+                    (task_id, api_key_id),
+                ).fetchone()
+                if not legacy_owner:
+                    raise GatewayAPIError(404, "TASK_NOT_FOUND", "task not found")
+            elif int(current_api_key_id) != int(api_key_id):
+                raise GatewayAPIError(404, "TASK_NOT_FOUND", "task not found")
         current_status = str(current["status"] or "")
         if current_status == "cancelled":
             conn.rollback()
@@ -6956,10 +7085,10 @@ def cancel_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[s
             UPDATE tasks
             SET status='cancelled', error_code='TASK_CANCELLED', error_message='task cancelled',
                 cancel_requested_at=?, next_attempt_at=NULL, finished_at=?, updated_at=?
-            WHERE {' AND '.join(where)}
+            WHERE id=?
               AND status IN ('queued', 'running', 'submitted', 'hydrating')
             """,
-            tuple([now, now, now] + params),
+            (now, now, now, task_id),
         )
         if result.rowcount != 1:
             raise GatewayAPIError(
@@ -6968,7 +7097,7 @@ def cancel_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[s
                 "task state changed before cancellation could be reserved",
                 {"status": current_status},
             )
-        tenant_api_key_id = current["api_key_id"]
+        tenant_api_key_id = current_api_key_id or api_key_id
         conn.commit()
     except Exception:
         if conn.in_transaction:
