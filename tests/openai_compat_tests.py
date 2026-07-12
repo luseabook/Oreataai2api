@@ -280,6 +280,25 @@ class OpenAICompatEndpointTests(unittest.TestCase):
         conn.execute(
             """
             INSERT INTO api_keys(
+                key,name,enabled,created_at,allowed_kinds,allowed_models,
+                allowed_resolutions,allow_uploads,allow_experimental
+            ) VALUES(?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "openai-image-upload-key",
+                "OpenAI image upload key",
+                1,
+                now,
+                json.dumps(["image"]),
+                json.dumps(["Provider Image"]),
+                json.dumps(["1K"]),
+                1,
+                0,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO api_keys(
                 key,name,enabled,created_at,allowed_kinds,allowed_models,allowed_scenes,
                 allowed_resolutions,allowed_durations,allow_uploads,allow_experimental
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
@@ -354,11 +373,13 @@ class OpenAICompatEndpointTests(unittest.TestCase):
         )
 
     def test_models_endpoint_uses_openai_error_envelope_for_authentication(self):
-        response = self.client.get("/v1/models")
+        for path in ("/v1/models", "/v1/models/gpt-image-1"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
 
-        self.assertEqual(response.status_code, 401)
-        self.assertEqual(set(response.json()), {"error"})
-        self.assertEqual(response.json()["error"]["type"], "authentication_error")
+                self.assertEqual(response.status_code, 401)
+                self.assertEqual(set(response.json()), {"error"})
+                self.assertEqual(response.json()["error"]["type"], "authentication_error")
 
     def test_compatibility_routes_use_openai_envelope_for_request_validation(self):
         for path in ("/v1/images/generations", "/v1/videos"):
@@ -391,6 +412,32 @@ class OpenAICompatEndpointTests(unittest.TestCase):
         self.assertNotIn("sora-2", model_ids)
         for item in payload["data"]:
             self.assertEqual(set(item), {"id", "object", "created", "owned_by"})
+
+    def test_models_endpoint_retrieves_visible_model_and_hides_inaccessible_model(self):
+        visible = self.client.get(
+            "/v1/models/gpt-image-1",
+            headers={"Authorization": "Bearer openai-model-key"},
+        )
+
+        self.assertEqual(visible.status_code, 200)
+        self.assertEqual(
+            visible.json(),
+            {
+                "id": "gpt-image-1",
+                "object": "model",
+                "created": 0,
+                "owned_by": "oreateai-gateway",
+            },
+        )
+
+        hidden = self.client.get(
+            "/v1/models/sora-2",
+            headers={"Authorization": "Bearer openai-model-key"},
+        )
+
+        self.assertEqual(hidden.status_code, 404)
+        self.assertEqual(hidden.json()["error"]["param"], "model")
+        self.assertEqual(hidden.json()["error"]["code"], "model_not_found")
 
     def test_canvas_origin_can_preflight_and_fetch_models(self):
         preflight = self.client.options(
@@ -544,6 +591,118 @@ class OpenAICompatEndpointTests(unittest.TestCase):
         task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         conn.close()
         self.assertEqual(task_count, 0)
+
+    def test_image_generation_rejects_streaming_without_creating_task(self):
+        response = self.client.post(
+            "/v1/images/generations",
+            headers={"Authorization": "Bearer openai-model-key"},
+            json={
+                "model": "gpt-image-1",
+                "prompt": "stream this image",
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["param"], "stream")
+        self.assertEqual(response.json()["error"]["code"], "unsupported_stream")
+        conn = server.db_conn()
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        conn.close()
+        self.assertEqual(task_count, 0)
+
+    def test_image_edits_accepts_sub2api_multipart_request_and_uses_uploaded_reference(self):
+        uploaded = {
+            "object": "uploads/reference.png",
+            "fileName": "reference.png",
+            "fileExt": "png",
+            "contentType": "image/png",
+            "originSize": 7,
+        }
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "upload_file_bytes", return_value=uploaded) as upload_file,
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-edit", "focusId": "focus-edit"}),
+            patch.object(
+                server.CLIENT,
+                "stream_generation",
+                return_value={"events": [{"event": "end"}], "error": None, "status": "streamed"},
+            ),
+            patch.object(
+                server.CLIENT,
+                "hydrate_generation_result",
+                return_value={"raw": {}, "assets": ["https://cdn.oreateai.com/aiimage/edited.png"]},
+            ),
+        ):
+            response = self.client.post(
+                "/v1/images/edits",
+                headers={"Authorization": "Bearer openai-image-upload-key"},
+                data={
+                    "model": "gpt-image-1",
+                    "prompt": "replace the background",
+                    "size": "1024x1024",
+                    "n": "1",
+                    "response_format": "url",
+                },
+                files={"image": ("reference.png", b"pngdata", "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["data"],
+            [
+                {
+                    "url": "https://cdn.oreateai.com/aiimage/edited.png",
+                    "revised_prompt": "replace the background",
+                }
+            ],
+        )
+        upload_file.assert_called_once()
+        conn = server.db_conn()
+        task = conn.execute("SELECT account_id,payload_json FROM tasks ORDER BY id DESC LIMIT 1").fetchone()
+        upload = conn.execute(
+            "SELECT object_path,attachment_json,status FROM uploaded_media ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        payload = json.loads(task["payload_json"])
+        self.assertEqual(payload["reference_images"], [uploaded])
+        self.assertEqual(task["account_id"], 1)
+        self.assertEqual(upload["object_path"], "uploads/reference.png")
+        self.assertEqual(server.upload_media_kind(json.loads(upload["attachment_json"])), "image")
+        self.assertEqual(upload["status"], "completed")
+
+    def test_image_edits_rejects_masks_before_upload_or_task_creation(self):
+        with patch.object(server.CLIENT, "upload_file_bytes") as upload_file:
+            response = self.client.post(
+                "/v1/images/edits",
+                headers={"Authorization": "Bearer openai-image-upload-key"},
+                data={"model": "gpt-image-1", "prompt": "masked edit"},
+                files={
+                    "image": ("reference.png", b"pngdata", "image/png"),
+                    "mask": ("mask.png", b"maskdata", "image/png"),
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["param"], "mask")
+        self.assertEqual(response.json()["error"]["code"], "unsupported_mask")
+        upload_file.assert_not_called()
+        conn = server.db_conn()
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        upload_count = conn.execute("SELECT COUNT(*) FROM uploaded_media").fetchone()[0]
+        conn.close()
+        self.assertEqual(task_count, 0)
+        self.assertEqual(upload_count, 0)
+
+    def test_admin_docs_explain_new_api_and_sub2api_base_url_rules(self):
+        html = server.ADMIN_HTML
+
+        self.assertIn("new-api 接入", html)
+        self.assertIn("sub2api 接入", html)
+        self.assertIn('id="api-doc-new-api-base"', html)
+        self.assertIn('id="api-doc-sub2api-base"', html)
+        self.assertIn("图片生成", html)
+        self.assertIn("不支持 stream=true", html)
 
     def test_image_generation_timeout_returns_openai_error_and_keeps_single_task(self):
         original = server.CFG["gateway"].get("enable_background_worker")

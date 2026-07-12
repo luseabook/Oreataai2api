@@ -170,6 +170,23 @@ Authorization: Bearer <API Key>
 
 后台“生成”页会使用这些能力填充模型、分辨率、比例、时长和场景下拉项；后台“设置 -> 模型能力”可手动刷新账号缓存。
 
+### new-api / sub2api 媒体上游兼容
+
+本项目可作为图片、图片编辑和视频生成上游，不提供虚假的聊天补全响应。可用的 OpenAI 兼容接口包括：
+
+- `GET /v1/models`：返回当前 Key 有权使用的模型。
+- `GET /v1/models/{model}`：查询单个可用模型。
+- `POST /v1/images/generations`：图片生成。
+- `POST /v1/images/edits`：`multipart/form-data` 图片编辑，上传字段为 `image`、`image[]` 或 `image[0]`。
+- `POST /v1/videos` 与 `POST /v1/videos/generations`：视频生成。
+
+接入地址规则不同，不能混填：
+
+- **new-api**：渠道类型选 OpenAI，基础地址填写站点根地址，例如 `https://example.com`。new-api 会自行请求 `/v1/models` 和媒体路径；渠道测试请选择“图片生成”，不要使用默认聊天测试。
+- **sub2api**：OpenAI API Key 上游的 `base_url` 填写到 `/v1`，例如 `https://example.com/v1`。sub2api 会在其后追加 `/images/generations`、`/images/edits` 或 `/videos/generations`。
+
+当前明确边界：图片接口仅支持 `n=1`，不支持 `stream=true`；图片编辑暂不支持 `mask` 蒙版。所有不支持的参数都会在创建任务或上传素材前返回 OpenAI 风格错误。
+
 ### 网关生成
 `POST /v1/generate`
 

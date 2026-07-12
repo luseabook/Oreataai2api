@@ -5377,7 +5377,7 @@ class GatewayAPIError(Exception):
 
 
 def is_openai_compat_path(path: str) -> bool:
-    return path == "/v1/models" or path.startswith("/v1/images/") or path == "/v1/videos" or path.startswith("/v1/videos/")
+    return path == "/v1/models" or path.startswith("/v1/models/") or path.startswith("/v1/images/") or path == "/v1/videos" or path.startswith("/v1/videos/")
 
 
 def openai_error_response(
@@ -6737,6 +6737,7 @@ class OpenAIImageGenerationIn(BaseModel):
     ratio: Optional[str] = None
     resolution: Optional[str] = None
     timeout: Optional[float] = None
+    stream: bool = False
 
 
 class OpenAIVideoGenerationIn(BaseModel):
@@ -6990,17 +6991,18 @@ def json_response_content(response: JSONResponse) -> Dict[str, Any]:
     return body if isinstance(body, dict) else {}
 
 
-@app.post("/v1/images/generations")
-def gateway_openai_image_generation(
-    body: OpenAIImageGenerationIn,
-    request: Request,
-    api_key_id: int = Depends(require_api_key),
-):
+def validate_openai_image_request(body: OpenAIImageGenerationIn) -> str:
     if body.n != 1:
         raise OpenAICompatError(
             "only n=1 is supported",
             param="n",
             code="unsupported_n",
+        )
+    if body.stream:
+        raise OpenAICompatError(
+            "stream=true is not supported for image generation",
+            param="stream",
+            code="unsupported_stream",
         )
     response_format = str(body.response_format or "url").lower()
     if response_format not in {"url", "b64_json"}:
@@ -7009,7 +7011,15 @@ def gateway_openai_image_generation(
             param="response_format",
             code="unsupported_response_format",
         )
+    return response_format
 
+
+def openai_image_body_from_request(
+    body: OpenAIImageGenerationIn,
+    *,
+    reference_images: Optional[List[Dict[str, Any]]] = None,
+    account_id: Optional[int] = None,
+) -> GatewayGenerateIn:
     provider_model = resolve_openai_model("image", body.model, CFG)
     mapped_ratio = image_size_to_ratio(body.size)
     compat = openai_compat_cfg()
@@ -7025,8 +7035,20 @@ def gateway_openai_image_generation(
         model_name=provider_model,
         ratio=body.ratio or mapped_ratio or CFG["oreate"]["default_image_ratio"],
         resolution=body.resolution or CFG["oreate"]["default_image_resolution"],
+        reference_images=reference_images or None,
+        account_id=account_id,
         sync_wait_seconds=sync_timeout,
     )
+    return native_body
+
+
+def execute_openai_image_request(
+    body: OpenAIImageGenerationIn,
+    native_body: GatewayGenerateIn,
+    request: Request,
+    api_key_id: int,
+    response_format: str,
+):
     native_response = gateway_generate(native_body, request, api_key_id)
     content = json_response_content(native_response)
     if native_response.status_code >= 400:
@@ -7081,6 +7103,17 @@ def gateway_openai_image_generation(
     }
 
 
+@app.post("/v1/images/generations")
+def gateway_openai_image_generation(
+    body: OpenAIImageGenerationIn,
+    request: Request,
+    api_key_id: int = Depends(require_api_key),
+):
+    response_format = validate_openai_image_request(body)
+    native_body = openai_image_body_from_request(body)
+    return execute_openai_image_request(body, native_body, request, api_key_id, response_format)
+
+
 def openai_video_task(task_id: int, api_key_id: int) -> Dict[str, Any]:
     row = fetch_task_row(task_id, api_key_id)
     if not row or str(row["kind"] or "") != "video":
@@ -7098,11 +7131,20 @@ async def upload_openai_input_reference_files(
     api_key_id: int,
     account: sqlite3.Row,
     request_id: str,
+    *,
+    allowed_extensions: Optional[Iterable[str]] = None,
+    error_param: str = "input_reference",
+    error_code: str = "invalid_input_reference",
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     if not files:
         return [], []
     max_bytes = max(1, int_or_default(gateway_cfg().get("upload_max_bytes"), 104857600))
     chunk_bytes = max(1, int_or_default(gateway_cfg().get("upload_read_chunk_bytes"), 1048576))
+    accepted_extensions = {
+        normalized_file_extension(item)
+        for item in (allowed_extensions or MEDIA_UPLOAD_EXTENSIONS)
+        if normalized_file_extension(item)
+    }
     attachments: List[Dict[str, Any]] = []
     try:
         session = CLIENT.session_from_account(account)
@@ -7110,11 +7152,11 @@ async def upload_openai_input_reference_files(
             try:
                 filename = Path(file.filename or "upload.bin").name
                 extension = normalized_file_extension(Path(filename).suffix)
-                if extension not in MEDIA_UPLOAD_EXTENSIONS:
+                if extension not in accepted_extensions:
                     raise OpenAICompatError(
-                        "input_reference contains an unsupported media type",
-                        param="input_reference",
-                        code="invalid_input_reference",
+                        f"{error_param} contains an unsupported media type",
+                        param=error_param,
+                        code=error_code,
                     )
                 chunks: List[bytes] = []
                 total_bytes = 0
@@ -7125,18 +7167,18 @@ async def upload_openai_input_reference_files(
                     total_bytes += len(chunk)
                     if total_bytes > max_bytes:
                         raise OpenAICompatError(
-                            "input_reference file exceeds the configured size limit",
-                            param="input_reference",
-                            code="invalid_input_reference",
+                            f"{error_param} file exceeds the configured size limit",
+                            param=error_param,
+                            code=error_code,
                             status_code=413,
                         )
                     chunks.append(chunk)
                 data = b"".join(chunks)
                 if not data:
                     raise OpenAICompatError(
-                        "input_reference file is empty",
-                        param="input_reference",
-                        code="invalid_input_reference",
+                        f"{error_param} file is empty",
+                        param=error_param,
+                        code=error_code,
                     )
                 attachment = CLIENT.upload_file_bytes(
                     session,
@@ -7160,6 +7202,109 @@ async def upload_openai_input_reference_files(
         ) from exc
     mark_account_success(account["id"])
     return split_input_reference_attachments(attachments)
+
+
+def openai_image_generation_payload_from_form(form: Any) -> Dict[str, Any]:
+    payload = {
+        "model": form.get("model"),
+        "prompt": form.get("prompt"),
+        "n": form.get("n"),
+        "size": form.get("size"),
+        "quality": form.get("quality"),
+        "response_format": form.get("response_format"),
+        "output_format": form.get("output_format"),
+        "user": form.get("user"),
+        "ratio": form.get("ratio"),
+        "resolution": form.get("resolution"),
+        "timeout": form.get("timeout"),
+        "stream": form.get("stream"),
+    }
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def multipart_upload_files(form: Any, field: str) -> List[UploadFile]:
+    field_pattern = re.compile(rf"^{re.escape(field)}(?:\[\d*\])?$")
+    return [
+        item
+        for field_name, item in form.multi_items()
+        if field_pattern.fullmatch(str(field_name))
+        and hasattr(item, "read")
+        and hasattr(item, "filename")
+    ]
+
+
+def multipart_field_present(form: Any, field: str) -> bool:
+    field_pattern = re.compile(rf"^{re.escape(field)}(?:\[\d*\])?$")
+    return any(field_pattern.fullmatch(str(field_name)) for field_name, _ in form.multi_items())
+
+
+@app.post("/v1/images/edits")
+async def gateway_openai_image_edit(
+    request: Request,
+    api_key_id: int = Depends(require_api_key),
+):
+    content_type = str(request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" not in content_type:
+        raise OpenAICompatError(
+            "image edits require multipart/form-data",
+            param="image",
+            code="unsupported_content_type",
+            status_code=415,
+        )
+
+    request_id = gateway_request_id(request)
+    async with request.form() as form:
+        if multipart_field_present(form, "mask"):
+            raise OpenAICompatError(
+                "mask is not supported for image edits",
+                param="mask",
+                code="unsupported_mask",
+            )
+        image_files = multipart_upload_files(form, "image")
+        if not image_files:
+            raise OpenAICompatError(
+                "image is required",
+                param="image",
+                code="missing_image",
+            )
+        try:
+            body = OpenAIImageGenerationIn(**openai_image_generation_payload_from_form(form))
+        except ValidationError as exc:
+            raise RequestValidationError(exc.errors()) from exc
+
+        response_format = validate_openai_image_request(body)
+        preflight_body = openai_image_body_from_request(body)
+        policy = resolve_api_key_policy(get_api_key_record(api_key_id))
+        if not policy.get("allow_uploads", True):
+            raise GatewayAPIError(
+                403,
+                "API_KEY_UPLOAD_FORBIDDEN",
+                "API key is not allowed to upload files",
+                request_id=request_id,
+            )
+        account, caps, options, _ = select_generation_account(preflight_body, request_id=request_id)
+        enforce_api_key_scope(policy, "image", options, caps, request_id)
+        reference_images, reference_videos = await upload_openai_input_reference_files(
+            image_files,
+            api_key_id,
+            account,
+            request_id,
+            allowed_extensions=IMAGE_UPLOAD_EXTENSIONS,
+            error_param="image",
+            error_code="invalid_image",
+        )
+        if reference_videos or not reference_images:
+            raise OpenAICompatError(
+                "image must contain a supported image file",
+                param="image",
+                code="invalid_image",
+            )
+        native_body = openai_image_body_from_request(
+            body,
+            reference_images=reference_images,
+            account_id=int(account["id"]),
+        )
+        return execute_openai_image_request(body, native_body, request, api_key_id, response_format)
 
 
 def openai_video_body_from_request(
@@ -7653,11 +7798,29 @@ def gateway_capabilities(api_key_id: int = Depends(require_api_key)):
     return load_capabilities_from_pool(policy)
 
 
-@app.get("/v1/models")
-def gateway_openai_models(api_key_id: int = Depends(require_api_key)):
+def openai_models_for_api_key(api_key_id: int) -> Dict[str, Any]:
     policy = resolve_api_key_policy(get_api_key_record(api_key_id))
     capabilities = load_capabilities_from_pool(policy)
     return openai_model_list(capabilities, CFG)
+
+
+@app.get("/v1/models")
+def gateway_openai_models(api_key_id: int = Depends(require_api_key)):
+    return openai_models_for_api_key(api_key_id)
+
+
+@app.get("/v1/models/{model_id}")
+def gateway_openai_model_detail(model_id: str, api_key_id: int = Depends(require_api_key)):
+    model_list = openai_models_for_api_key(api_key_id)
+    for model in model_list.get("data") or []:
+        if str(model.get("id") or "") == model_id:
+            return model
+    raise OpenAICompatError(
+        f"The model '{model_id}' does not exist or you do not have access to it.",
+        param="model",
+        code="model_not_found",
+        status_code=404,
+    )
 
 
 def gateway_task_detail_payload(task_id: int, api_key_id: Optional[int] = None) -> Dict[str, Any]:
@@ -8930,6 +9093,27 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
   </div>
   <div class="docs-grid">
     <div class="docs-card">
+      <h3>new-api 接入</h3>
+      <p>在 new-api 中新增 <strong>OpenAI</strong> 渠道，用于模型同步与图片生成分发。</p>
+      <ul>
+        <li>渠道基础地址：<code id="api-doc-new-api-base"></code>（填写站点根地址，不要追加 <code>/v1</code>）</li>
+        <li>密钥：填写本系统“API Keys”页面创建的完整 Key</li>
+        <li>先执行“拉取模型”，再按需勾选图片模型</li>
+        <li>渠道测试请选择“图片生成”；默认聊天测试不适用于媒体上游</li>
+      </ul>
+    </div>
+    <div class="docs-card">
+      <h3>sub2api 接入</h3>
+      <p>在 sub2api 中按 OpenAI API Key 上游配置，图片和视频请求会转发到本系统。</p>
+      <ul>
+        <li>上游基础地址：<code id="api-doc-sub2api-base"></code>（必须以 <code>/v1</code> 结尾）</li>
+        <li>密钥：填写本系统“API Keys”页面创建的完整 Key</li>
+        <li>图片生成：<code>/images/generations</code>；图片编辑：<code>/images/edits</code></li>
+        <li>视频生成：<code>/videos/generations</code></li>
+        <li>当前图片接口不支持 stream=true，图片编辑暂不支持 mask 蒙版</li>
+      </ul>
+    </div>
+    <div class="docs-card">
       <h3>统一生成接口</h3>
       <p><code>POST /v1/generate</code> 同时支持图片和视频。接口立即返回任务 ID，不需要让调用端长时间保持连接。</p>
       <div class="docs-code-head"><strong>图片生成（curl）</strong><button class="copy-btn" onclick="copyDocCode('api-doc-image-curl')">复制</button></div>
@@ -8958,9 +9142,11 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
       <h3>可用接口</h3>
       <ul>
         <li><code>GET /v1/models</code>：模型列表</li>
+        <li><code>GET /v1/models/{model}</code>：查询单个可用模型</li>
         <li><code>GET /v1/capabilities</code>：模型、比例、分辨率、时长与场景能力</li>
         <li><code>POST /v1/images/generations</code>：OpenAI 风格图片接口</li>
-        <li><code>POST /v1/videos</code>：视频接口</li>
+        <li><code>POST /v1/images/edits</code>：OpenAI multipart 图片编辑接口</li>
+        <li><code>POST /v1/videos</code> / <code>/v1/videos/generations</code>：视频接口</li>
         <li><code>POST /v1/uploads</code>：上传参考图片或视频</li>
         <li><code>POST /v1/tasks/{task_id}/retry</code>：重试失败任务</li>
         <li><code>POST /v1/tasks/{task_id}/cancel</code>：取消任务</li>
@@ -9165,6 +9351,10 @@ function populateApiDocs(){
   const origin=location.origin;
   const base=document.getElementById('api-doc-base');
   if(base) base.textContent=origin;
+  const newApiBase=document.getElementById('api-doc-new-api-base');
+  if(newApiBase) newApiBase.textContent=origin;
+  const sub2apiBase=document.getElementById('api-doc-sub2api-base');
+  if(sub2apiBase) sub2apiBase.textContent=origin + '/v1';
   const imageCurl=`curl -X POST "${origin}/v1/generate" \\
   -H "Authorization: Bearer <API_KEY>" \\
   -H "Content-Type: application/json" \\
