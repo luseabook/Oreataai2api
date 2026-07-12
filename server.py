@@ -17,7 +17,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Annotated, Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
 import re
@@ -28,7 +28,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Web
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from banti_token_generator import generate_banti_artifacts, generate_jt_token
 from gateway.openai_compat import (
@@ -2487,11 +2487,26 @@ def emit_log(level: str, message: str):
         pass
 
 
+class ServerSettingsIn(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    port: Optional[Annotated[int, Field(strict=True, ge=1, le=65535)]] = None
+
+
+class PoolSettingsIn(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    min_accounts: Optional[Annotated[int, Field(strict=True, ge=0)]] = None
+    maintain_target: Optional[Annotated[int, Field(strict=True, ge=0)]] = None
+
+
 class SettingsIn(BaseModel):
-    server: Optional[Dict[str, Any]] = None
+    model_config = ConfigDict(extra="allow")
+
+    server: Optional[ServerSettingsIn] = None
     oreate: Optional[Dict[str, Any]] = None
     mail: Optional[Dict[str, Any]] = None
-    pool: Optional[Dict[str, Any]] = None
+    pool: Optional[PoolSettingsIn] = None
 
 
 class AdminCredentialsIn(BaseModel):
@@ -7055,9 +7070,30 @@ def get_settings(_=Depends(require_admin)):
 def put_settings(body: SettingsIn, _=Depends(require_admin)):
     global CFG
     data = clean_settings_update(model_data(body))
-    CFG = deep_merge(CFG, data)
-    save_config(CFG)
-    return {"ok": True, "config": public_config(CFG)}
+    candidate = deep_merge(CFG, data)
+    pool_cfg = candidate.get("pool", {})
+    min_accounts = pool_cfg.get("min_accounts", 0)
+    maintain_target = pool_cfg.get("maintain_target", 0)
+    if maintain_target < min_accounts:
+        raise HTTPException(
+            status_code=422,
+            detail=[
+                {
+                    "type": "value_error",
+                    "loc": ["body", "pool", "maintain_target"],
+                    "msg": "Value error, maintain_target must be greater than or equal to min_accounts",
+                    "input": maintain_target,
+                }
+            ],
+        )
+    restart_required = candidate.get("server", {}).get("port") != CFG.get("server", {}).get("port")
+    save_config(candidate)
+    CFG = candidate
+    return {
+        "ok": True,
+        "config": public_config(CFG),
+        "restart_required": restart_required,
+    }
 
 
 @app.get("/api/accounts")
@@ -7557,7 +7593,7 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
 <div id="tab-settings" class="section hidden">
   <h2>⚙️ 系统设置</h2>
   <div class="row">
-    <div class="col"><label>服务端口</label><input id="s-port" value="8894"></div>
+    <div class="col"><label>服务端口</label><input id="s-port" type="number" min="1" max="65535" step="1" value="8894"></div>
   </div>
   <div class="row" style="margin-top:12px">
     <div class="col"><label>OreateAI 基础 URL</label><input id="s-base" value="https://www.oreateai.com"></div>
@@ -7574,8 +7610,8 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
   </div>
   <h3 style="margin-top:20px;font-size:14px">📦 号池配置</h3>
   <div class="row" style="margin-top:8px">
-    <div class="col"><label>最低账号数</label><input id="s-min" value="3"></div>
-    <div class="col"><label>维护目标数</label><input id="s-target" value="5"></div>
+    <div class="col"><label>最低账号数</label><input id="s-min" type="number" min="0" step="1" value="3"></div>
+    <div class="col"><label>维护目标数</label><input id="s-target" type="number" min="0" step="1" value="5"></div>
   </div>
   <div style="margin-top:16px"><button class="btn-primary" onclick="saveSettings()">保存设置</button></div>
   <pre id="settings-raw" style="margin-top:12px"></pre>
@@ -7728,13 +7764,24 @@ function copyExample() { copyText(document.getElementById('gw-example').textCont
 
 // === Accounts ===
 let state = {accounts:[],tasks:[],apikeys:[],clients:[],usage:[],uploads:[],costReport:[],auditLogs:[],settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}}};
+function formatApiError(detail){
+  if(Array.isArray(detail)){
+    return detail.map(item => {
+      const location=Array.isArray(item?.loc) ? item.loc.filter(part => part !== 'body').join('.') : '';
+      const message=item?.msg || String(item);
+      return location ? `${location}: ${message}` : message;
+    }).join('\n');
+  }
+  if(detail && typeof detail === 'object') return detail.message || JSON.stringify(detail);
+  return String(detail || 'request failed');
+}
 async function api(m,u,b){
   const o={method:m,headers:authHeaders()};
   if(b) o.body=JSON.stringify(b);
   const r = await fetch(BASE+u,o);
   const data = await r.json().catch(()=>({}));
-  if (r.status === 401) throw new Error(data.detail || 'unauthorized');
-  if (!r.ok) throw new Error(data.detail || 'request failed');
+  if (r.status === 401) throw new Error(formatApiError(data.detail || 'unauthorized'));
+  if (!r.ok) throw new Error(formatApiError(data.detail || 'request failed'));
   return data;
 }
 function escapeHtml(value){
@@ -8181,12 +8228,12 @@ function renderAuditLogs(){
 async function loadSettings(){
   state.settings=await api('GET','/api/admin/settings');
   const s=state.settings;
-  document.getElementById('s-port').value=s.server?.port||8894;
+  document.getElementById('s-port').value=s.server?.port??8894;
   document.getElementById('s-base').value=s.oreate?.base_url||'';
   document.getElementById('s-img-model').value=s.oreate?.default_image_model||'';
   document.getElementById('s-vid-model').value=s.oreate?.default_video_model||'';
-  document.getElementById('s-min').value=s.pool?.min_accounts||3;
-  document.getElementById('s-target').value=s.pool?.maintain_target||5;
+  document.getElementById('s-min').value=s.pool?.min_accounts??3;
+  document.getElementById('s-target').value=s.pool?.maintain_target??5;
   document.getElementById('s-mail-url').value=s.mail?.base_url||'';
   document.getElementById('s-mail-key').value='';
   document.getElementById('s-mail-key').placeholder=s.mail?.api_key==='__redacted__'?'留空不修改':'mail api key';
@@ -8194,28 +8241,46 @@ async function loadSettings(){
   document.getElementById('cred-user').value=s.server?.admin_username||'';
   document.getElementById('settings-raw').textContent=JSON.stringify(s,null,2);
 }
+function requiredIntegerValue(id,label,min,max=null){
+  const raw=document.getElementById(id).value.trim();
+  if(!raw || !/^-?[0-9]+$/.test(raw)) throw new Error(`${label}必须是整数`);
+  const value=Number(raw);
+  if(!Number.isSafeInteger(value)) throw new Error(`${label}超出安全整数范围`);
+  if(value < min) throw new Error(`${label}不能小于 ${min}`);
+  if(max !== null && value > max) throw new Error(`${label}不能大于 ${max}`);
+  return value;
+}
 async function saveSettings(){
-  const doms = document.getElementById('s-mail-domains').value.split(',').map(s=>s.trim()).filter(Boolean);
-  const body={
-    server:{port:Number(document.getElementById('s-port').value)},
-    oreate:{
-      base_url:document.getElementById('s-base').value,
-      default_image_model:document.getElementById('s-img-model').value,
-      default_video_model:document.getElementById('s-vid-model').value,
-    },
-    mail:{
-      base_url:document.getElementById('s-mail-url').value,
-      preferred_domains:doms,
-    },
-    pool:{
-      min_accounts:Number(document.getElementById('s-min').value),
-      maintain_target:Number(document.getElementById('s-target').value),
-    },
-  };
-  const mailKey=document.getElementById('s-mail-key').value;
-  if(mailKey) body.mail.api_key=mailKey;
-  const r=await api('PUT','/api/admin/settings',body);
-  if(r.ok){await loadSettings();alert('✅ 已保存');} else alert('❌ 保存失败');
+  try{
+    const port=requiredIntegerValue('s-port','服务端口',1,65535);
+    const minAccounts=requiredIntegerValue('s-min','最低账号数',0);
+    const maintainTarget=requiredIntegerValue('s-target','维护目标数',0);
+    if(maintainTarget < minAccounts) throw new Error('维护目标数不能小于最低账号数');
+    const doms = document.getElementById('s-mail-domains').value.split(',').map(s=>s.trim()).filter(Boolean);
+    const body={
+      server:{port},
+      oreate:{
+        base_url:document.getElementById('s-base').value,
+        default_image_model:document.getElementById('s-img-model').value,
+        default_video_model:document.getElementById('s-vid-model').value,
+      },
+      mail:{
+        base_url:document.getElementById('s-mail-url').value,
+        preferred_domains:doms,
+      },
+      pool:{
+        min_accounts:minAccounts,
+        maintain_target:maintainTarget,
+      },
+    };
+    const mailKey=document.getElementById('s-mail-key').value;
+    if(mailKey) body.mail.api_key=mailKey;
+    const r=await api('PUT','/api/admin/settings',body);
+    await loadSettings();
+    alert(r.restart_required ? '✅ 已保存，服务端口变更需重启后生效' : '✅ 已保存');
+  }catch(error){
+    alert('❌ 保存失败：'+(error?.message || String(error)));
+  }
 }
 async function changeCredentials(){
   const body={

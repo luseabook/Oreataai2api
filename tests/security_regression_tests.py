@@ -599,6 +599,104 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertEqual(server.CFG["server"]["admin_username"], "admin")
         self.assertEqual(server.CFG["server"]["admin_password"], "test-admin-password")
 
+    def test_admin_settings_reject_invalid_numeric_values(self):
+        headers = self.admin_headers()
+        baseline_cfg = json.loads(json.dumps(server.CFG))
+        invalid_updates = [
+            {"server": {"port": 0}},
+            {"server": {"port": 65536}},
+            {"server": {"port": 8890.5}},
+            {"server": {"port": "8890"}},
+            {"pool": {"min_accounts": -1}},
+            {"pool": {"maintain_target": -1}},
+        ]
+
+        for update in invalid_updates:
+            with self.subTest(update=update):
+                server.CFG = json.loads(json.dumps(baseline_cfg))
+                server.save_config(server.CFG)
+                saved_before = self.config_path.read_bytes()
+
+                response = self.client.put(
+                    "/api/admin/settings",
+                    headers=headers,
+                    json=update,
+                )
+
+                self.assertEqual(response.status_code, 422)
+                self.assertEqual(server.CFG, baseline_cfg)
+                self.assertEqual(self.config_path.read_bytes(), saved_before)
+
+    def test_admin_settings_reject_inconsistent_pool_targets(self):
+        headers = self.admin_headers()
+        baseline_cfg = json.loads(json.dumps(server.CFG))
+
+        for update in (
+            {"pool": {"min_accounts": baseline_cfg["pool"]["maintain_target"] + 1}},
+            {"pool": {"maintain_target": baseline_cfg["pool"]["min_accounts"] - 1}},
+        ):
+            with self.subTest(update=update):
+                server.CFG = json.loads(json.dumps(baseline_cfg))
+                server.save_config(server.CFG)
+                saved_before = self.config_path.read_bytes()
+
+                response = self.client.put(
+                    "/api/admin/settings",
+                    headers=headers,
+                    json=update,
+                )
+
+                self.assertEqual(response.status_code, 422)
+                self.assertEqual(server.CFG, baseline_cfg)
+                self.assertEqual(self.config_path.read_bytes(), saved_before)
+
+    def test_admin_settings_reports_restart_requirement(self):
+        headers = self.admin_headers()
+        current_port = server.CFG["server"]["port"]
+
+        port_response = self.client.put(
+            "/api/admin/settings",
+            headers=headers,
+            json={
+                "server": {"port": current_port + 1, "custom_server_option": "kept"},
+                "custom_section": {"enabled": True},
+            },
+        )
+
+        self.assertEqual(port_response.status_code, 200)
+        self.assertTrue(port_response.json()["restart_required"])
+        self.assertEqual(server.CFG["server"]["custom_server_option"], "kept")
+        self.assertEqual(server.CFG["custom_section"], {"enabled": True})
+
+        pool_response = self.client.put(
+            "/api/admin/settings",
+            headers=headers,
+            json={
+                "pool": {
+                    "min_accounts": 4,
+                    "maintain_target": 6,
+                    "custom_pool_option": "kept",
+                }
+            },
+        )
+
+        self.assertEqual(pool_response.status_code, 200)
+        self.assertFalse(pool_response.json()["restart_required"])
+        self.assertEqual(server.CFG["pool"]["custom_pool_option"], "kept")
+
+    def test_admin_html_validates_numeric_settings_and_formats_api_errors(self):
+        html = server.ADMIN_HTML
+
+        self.assertIn('<input id="s-port" type="number" min="1" max="65535" step="1"', html)
+        self.assertIn('<input id="s-min" type="number" min="0" step="1"', html)
+        self.assertIn('<input id="s-target" type="number" min="0" step="1"', html)
+        self.assertIn("function requiredIntegerValue", html)
+        self.assertIn("function formatApiError", html)
+        self.assertIn("restart_required", html)
+        self.assertIn("maintainTarget < minAccounts", html)
+        self.assertIn("s.pool?.min_accounts??3", html)
+        self.assertIn("s.pool?.maintain_target??5", html)
+
     def test_admin_settings_response_redacts_secrets(self):
         original_cfg = server.CFG
         server.CFG = server.deep_merge(
