@@ -1,4 +1,3 @@
-import base64
 import json
 import hashlib
 import io
@@ -1203,7 +1202,7 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertEqual(response.json()["status"], "queued")
         self.assertNotIn("task", response.json())
 
-    def test_admin_demo_generation_completes_locally_with_safe_svg_asset(self):
+    def test_admin_generate_ignores_legacy_demo_generation_flag(self):
         account_id = self.seed_account()
         conn = server.db_conn()
         conn.execute(
@@ -1229,7 +1228,7 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
                 headers=self.admin_headers(),
                 json={
                     "kind": "image",
-                    "prompt": "<script>alert('x')</script>\u0001 一只小猫",
+                    "prompt": "一个中国古风美女",
                     "model_name": "Google Nano Banana 2",
                     "ratio": "16:9",
                     "resolution": "4K",
@@ -1241,40 +1240,17 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["status"], "completed")
-        self.assertEqual(payload["task"]["status"], "completed")
-        self.assertEqual(payload["task"]["actual_point_cost"], 0)
-        self.assertEqual(len(payload["task"]["attempts"]), 1)
-        self.assertEqual(payload["task"]["attempts"][0]["status"], "completed")
-        self.assertEqual(len(payload["task"]["assets"]), 1)
-        asset = payload["task"]["assets"][0]
-        self.assertTrue(asset.startswith("data:image/svg+xml;base64,"))
-        svg = base64.b64decode(asset.split(",", 1)[1]).decode("utf-8")
-        self.assertIn("本地演示生成", svg)
-        self.assertIn("&lt;script&gt;", svg)
-        self.assertNotIn("<script>", svg)
-        self.assertNotIn("\u0001", svg)
+        self.assertEqual(payload["status"], "queued")
+        self.assertNotIn("task", payload)
 
         task = self.client.get(
             f"/api/tasks/{payload['task_id']}",
             headers=self.admin_headers(),
         )
         self.assertEqual(task.status_code, 200)
-        self.assertEqual(task.json()["task"]["status"], "completed")
-
-    def test_admin_demo_generation_is_restricted_to_loopback(self):
-        original_cfg = server.CFG
-        server.CFG = server.deep_merge(
-            original_cfg,
-            {
-                "server": {"host": "0.0.0.0"},
-                "gateway": {"demo_generation_enabled": True},
-            },
-        )
-        try:
-            self.assertFalse(server.demo_generation_enabled())
-        finally:
-            server.CFG = original_cfg
+        self.assertEqual(task.json()["task"]["status"], "queued")
+        self.assertEqual(task.json()["task"]["attempts"], [])
+        self.assertEqual(task.json()["task"]["assets"], [])
 
     def test_delete_api_key_soft_deletes_without_dropping_usage_log(self):
         account_id = self.seed_account()

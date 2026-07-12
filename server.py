@@ -2,7 +2,6 @@ import asyncio
 import io
 import base64
 import hashlib
-import html
 import json
 import math
 import os
@@ -143,7 +142,6 @@ DEFAULT_CONFIG = {
         "sync_wait_seconds": 0,
         "sync_wait_max_seconds": 120,
         "enable_background_worker": True,
-        "demo_generation_enabled": False,
         "task_worker_poll_interval_seconds": 1,
         "worker_shutdown_timeout_seconds": 30,
         "running_task_stale_seconds": 300,
@@ -499,6 +497,15 @@ def public_registration_result(item: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def point_bucket_amount(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    for key in ("amount", "point", "points", "balance", "value"):
+        if value.get(key) not in (None, ""):
+            return value.get(key)
+    return None
+
+
 def normalize_account_point_detail(raw: Any) -> Dict[str, Any]:
     source = raw.get("data") if isinstance(raw, dict) and isinstance(raw.get("data"), dict) else raw
     source = source if isinstance(source, dict) else {}
@@ -512,16 +519,26 @@ def normalize_account_point_detail(raw: Any) -> Dict[str, Any]:
         bonus = source.get("bonusPoint")
     if bonus in (None, ""):
         bonus = source.get("bonus_point")
+    pro = source.get("pro")
+    if pro in (None, ""):
+        pro = source.get("proPoint")
+    if pro in (None, ""):
+        pro = source.get("pro_point")
     rest = source.get("restPoint")
     if rest in (None, ""):
         rest = source.get("rest_point")
     if rest in (None, ""):
         rest = source.get("restpoint")
-    if rest in (None, "") and (daily not in (None, "") or bonus not in (None, "")):
-        rest = int_or_default(daily, 0) + int_or_default(bonus, 0)
+    daily = point_bucket_amount(daily)
+    pro = point_bucket_amount(pro)
+    bonus = point_bucket_amount(bonus)
+    rest = point_bucket_amount(rest)
+    if rest in (None, "") and any(value not in (None, "") for value in (daily, pro, bonus)):
+        rest = sum(int_or_default(value, 0) for value in (daily, pro, bonus))
     return {
         "point_balance_json": {
             "daily_point": None if daily in (None, "") else int_or_default(daily, 0),
+            "pro_point": None if pro in (None, "") else int_or_default(pro, 0),
             "bonus_point": None if bonus in (None, "") else int_or_default(bonus, 0),
             "rest_point": None if rest in (None, "") else int_or_default(rest, 0),
         },
@@ -1999,6 +2016,8 @@ def candidate_accounts_for_generation(kind: str, requested_account_id: Optional[
         f"""
         SELECT a.* FROM accounts AS a
         WHERE a.status IN ('verified', 'active')
+          AND a.ouid IS NOT NULL AND a.ouid != ''
+          AND a.ouss IS NOT NULL AND a.ouss != ''
           AND ({capability_clause})
           AND (a.cooldown_until IS NULL OR a.cooldown_until <= ?)
           {account_clause}
@@ -6110,171 +6129,6 @@ def request_body_from_generation(body: GatewayGenerateIn) -> Dict[str, Any]:
     return data
 
 
-def demo_generation_enabled() -> bool:
-    if not bool(gateway_cfg().get("demo_generation_enabled", False)):
-        return False
-    host = str(CFG.get("server", {}).get("host") or "").strip().lower()
-    return host in {"127.0.0.1", "localhost", "::1"}
-
-
-def demo_generation_canvas_size(ratio: Optional[str]) -> Tuple[int, int]:
-    ratio_text = str(ratio or "").strip()
-    match = re.fullmatch(r"(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)", ratio_text)
-    if not match:
-        return 1200, 675
-    width_ratio = float(match.group(1))
-    height_ratio = float(match.group(2))
-    if width_ratio <= 0 or height_ratio <= 0:
-        return 1200, 675
-    if width_ratio >= height_ratio:
-        width = 1200
-        height = max(480, min(1200, round(width * height_ratio / width_ratio)))
-    else:
-        height = 1200
-        width = max(480, min(1200, round(height * width_ratio / height_ratio)))
-    return width, height
-
-
-def demo_generation_xml_text(value: Any, limit: int) -> str:
-    normalized = re.sub(r"\s+", " ", str(value or "")).strip()
-    xml_safe = "".join(
-        char
-        for char in normalized
-        if char in {"\t", "\n", "\r"}
-        or 0x20 <= ord(char) <= 0xD7FF
-        or 0xE000 <= ord(char) <= 0xFFFD
-        or 0x10000 <= ord(char) <= 0x10FFFF
-    )
-    return html.escape(xml_safe[:limit], quote=False)
-
-
-def demo_generation_svg_data_uri(task_id: int, body: GatewayGenerateIn) -> str:
-    width, height = demo_generation_canvas_size(body.ratio)
-    prompt = demo_generation_xml_text(body.prompt, 180)
-    kind_label = "图片" if body.kind == "image" else "视频"
-    metadata = demo_generation_xml_text(
-        f"{body.model_name or '默认模型'} · {body.ratio or '默认比例'} · {body.resolution or '默认分辨率'}",
-        140,
-    )
-    center_x = width / 2
-    center_y = height / 2
-    cat_scale = min(width, height) / 720
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
-<defs>
-  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-    <stop offset="0" stop-color="#111827"/>
-    <stop offset="0.52" stop-color="#312e81"/>
-    <stop offset="1" stop-color="#7c3aed"/>
-  </linearGradient>
-  <radialGradient id="glow" cx="50%" cy="42%" r="55%">
-    <stop offset="0" stop-color="#f5d0fe" stop-opacity=".55"/>
-    <stop offset="1" stop-color="#c4b5fd" stop-opacity="0"/>
-  </radialGradient>
-  <filter id="shadow"><feDropShadow dx="0" dy="18" stdDeviation="22" flood-opacity=".3"/></filter>
-</defs>
-<rect width="100%" height="100%" fill="url(#bg)"/>
-<rect width="100%" height="100%" fill="url(#glow)"/>
-<g opacity=".24" fill="#fff">
-  <circle cx="{width * .12:.1f}" cy="{height * .18:.1f}" r="{8 * cat_scale:.1f}"/>
-  <circle cx="{width * .84:.1f}" cy="{height * .22:.1f}" r="{5 * cat_scale:.1f}"/>
-  <circle cx="{width * .78:.1f}" cy="{height * .72:.1f}" r="{10 * cat_scale:.1f}"/>
-</g>
-<g transform="translate({center_x:.1f} {center_y - 34 * cat_scale:.1f}) scale({cat_scale:.4f})" filter="url(#shadow)">
-  <path d="M-184-80 L-132-198 L-58-124 Q0-146 58-124 L132-198 L184-80 Q218-14 190 70 Q152 174 0 182 Q-152 174-190 70 Q-218-14-184-80Z" fill="#fff7ed"/>
-  <path d="M-148-102 L-124-158 L-88-118Z M148-102 L124-158 L88-118Z" fill="#f9a8d4"/>
-  <ellipse cx="-70" cy="8" rx="18" ry="25" fill="#312e81"/>
-  <ellipse cx="70" cy="8" rx="18" ry="25" fill="#312e81"/>
-  <circle cx="-64" cy="0" r="6" fill="#fff"/>
-  <circle cx="76" cy="0" r="6" fill="#fff"/>
-  <path d="M-15 56 Q0 68 15 56 Q10 82 0 86 Q-10 82-15 56Z" fill="#fb7185"/>
-  <path d="M0 84 Q-22 106-48 88 M0 84 Q22 106 48 88" fill="none" stroke="#7c2d12" stroke-width="7" stroke-linecap="round"/>
-  <path d="M-54 70 L-166 54 M-54 88 L-174 92 M54 70 L166 54 M54 88 L174 92" stroke="#fff7ed" stroke-width="10" stroke-linecap="round"/>
-</g>
-<g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif" text-anchor="middle">
-  <text x="{center_x:.1f}" y="{height - 116:.1f}" fill="#fff" font-size="{max(22, round(34 * cat_scale))}" font-weight="700">{prompt or '本地演示作品'}</text>
-  <text x="{center_x:.1f}" y="{height - 72:.1f}" fill="#ddd6fe" font-size="{max(15, round(20 * cat_scale))}">任务 #{task_id} · {kind_label} · 本地演示生成</text>
-  <text x="{center_x:.1f}" y="{height - 38:.1f}" fill="#c4b5fd" font-size="{max(12, round(15 * cat_scale))}">{metadata}</text>
-</g>
-</svg>"""
-    encoded = base64.b64encode(svg.encode("utf-8")).decode("ascii")
-    return f"data:image/svg+xml;base64,{encoded}"
-
-
-def complete_demo_generation_task(task_id: int, body: GatewayGenerateIn) -> Dict[str, Any]:
-    asset = demo_generation_svg_data_uri(task_id, body)
-    now = time.time()
-    response = {
-        "status": "completed",
-        "demo": True,
-        "message": "本地演示生成完成",
-        "assets": [asset],
-    }
-    conn = db_conn()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-        if not task:
-            raise RuntimeError("demo task not found")
-        if task["status"] != "queued":
-            raise RuntimeError("demo task is no longer queued")
-        attempt_no_row = conn.execute(
-            "SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_no FROM task_attempts WHERE task_id=?",
-            (task_id,),
-        ).fetchone()
-        attempt_no = int(attempt_no_row["next_no"] or 1)
-        conn.execute(
-            """
-            INSERT INTO task_attempts(
-                task_id, attempt_no, phase, account_id, status, error_code, error_message,
-                request_payload_json, stream_summary_json, hydration_summary_json, assets_json,
-                started_at, finished_at
-            )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                task_id,
-                attempt_no,
-                "generation",
-                task["account_id"],
-                "completed",
-                "",
-                "",
-                task["payload_json"],
-                encode_json_value({"mode": "local_demo"}),
-                None,
-                encode_json_value([asset]),
-                now,
-                now,
-            ),
-        )
-        updated = conn.execute(
-            """
-            UPDATE tasks
-            SET status='completed', response_json=?, assets_json=?, actual_point_cost=0,
-                error_code='', error_message='', attempt_count=attempt_count+1,
-                started_at=COALESCE(started_at, ?), finished_at=?, next_attempt_at=NULL, updated_at=?
-            WHERE id=? AND status='queued'
-            """,
-            (
-                encode_json_value(response),
-                encode_json_value([asset]),
-                now,
-                now,
-                now,
-                task_id,
-            ),
-        )
-        if updated.rowcount != 1:
-            raise RuntimeError("demo task state changed before completion")
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-    return gateway_task_detail_payload(task_id)["task"]
-
-
 def queue_generation_task(
     api_key_id: Optional[int],
     request_id: str,
@@ -7715,16 +7569,6 @@ def generate_media(body: MediaTaskIn, request: Request, _=Depends(require_admin)
     except GatewayAPIError as exc:
         raise HTTPException(exc.status_code, exc.message)
     task_id = queue_generation_task(None, gateway_request_id(request), account, gateway_body, options, estimated_point_cost)
-    if demo_generation_enabled():
-        task = complete_demo_generation_task(task_id, gateway_body)
-        return {
-            "ok": True,
-            "task_id": task_id,
-            "status": task["status"],
-            "account_id": account["id"],
-            "estimated_point_cost": estimated_point_cost,
-            "task": task,
-        }
     return {"ok": True, "task_id": task_id, "status": "queued", "account_id": account["id"], "estimated_point_cost": estimated_point_cost}
 
 

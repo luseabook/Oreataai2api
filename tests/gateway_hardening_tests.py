@@ -3629,6 +3629,37 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(set(selected_account_ids), {first_account_id, second_account_id})
         self.assertNotEqual(selected_account_ids[0], selected_account_ids[1])
 
+    def test_scheduler_skips_verified_account_without_session_credentials(self):
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute(
+            """
+            INSERT INTO accounts(
+                email,password,status,source,ouid,ouss,
+                model_info_json,video_info_json,created_at,updated_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "missing-session@example.com",
+                "",
+                "verified",
+                "manual",
+                "",
+                "",
+                json.dumps(self.sample_image_info()),
+                json.dumps(self.sample_video_info()),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        candidates = server.candidate_accounts_for_generation("image")
+
+        self.assertEqual(candidates, [])
+
     def test_scheduler_skips_account_in_cooldown(self):
         cooling_id = self.seed_account_with_capabilities("cooling@example.com")
         ready_id = self.seed_account_with_capabilities("ready@example.com")
@@ -3725,6 +3756,20 @@ class GatewayHardeningTests(unittest.TestCase):
         accounts = self.client.get("/api/accounts", headers=self.admin_headers()).json()["items"]
         self.assertEqual(accounts[0]["rest_point"], 127)
         self.assertNotIn("point_balance_json", accounts[0])
+
+    def test_normalize_account_point_detail_supports_current_amount_objects(self):
+        snapshot = server.normalize_account_point_detail(
+            {
+                "daily": {"amount": 46, "endTime": 1783915200},
+                "pro": {"amount": 12, "endTime": 1783915200},
+                "bonus": {"amount": 100, "endTime": 2414290578},
+            }
+        )
+
+        self.assertEqual(snapshot["daily_point"], 46)
+        self.assertEqual(snapshot["bonus_point"], 100)
+        self.assertEqual(snapshot["rest_point"], 158)
+        self.assertEqual(snapshot["point_balance_json"]["pro_point"], 12)
 
     def test_upstream_failure_marks_account_cooldown(self):
         account_id = self.seed_account_with_capabilities()

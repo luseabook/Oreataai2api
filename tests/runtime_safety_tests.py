@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -9,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import server
+import banti_token_generator
 from gateway.runtime import (
     SingleWorkerLock,
     validate_single_worker_configuration,
@@ -17,6 +19,32 @@ from gateway.runtime import (
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+class BantiHelperRuntimeTests(unittest.TestCase):
+    def test_helper_retries_with_system_ca_when_default_node_tls_fails(self):
+        helper_output = json.dumps(
+            {
+                "jt": "31$live-token",
+                "cookies": {"__bid_n": "live-bid"},
+                "version": "1.14.3.1",
+            }
+        )
+        failure = subprocess.CalledProcessError(1, ["node", "banti_jt_helper.js"])
+
+        with patch.object(
+            banti_token_generator.subprocess,
+            "check_output",
+            side_effect=[failure, helper_output],
+        ) as check_output:
+            result = banti_token_generator.generate_banti_artifacts_from_helper()
+
+        first_command = check_output.call_args_list[0].args[0]
+        retry_command = check_output.call_args_list[1].args[0]
+        self.assertEqual(first_command[0], "node")
+        self.assertNotIn("--use-system-ca", first_command)
+        self.assertEqual(retry_command[:2], ["node", "--use-system-ca"])
+        self.assertEqual(result["cookies"]["__bid_n"], "live-bid")
 
 
 class SingleWorkerLockTests(unittest.TestCase):

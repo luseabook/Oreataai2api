@@ -55,13 +55,28 @@ def generate_banti_artifacts_from_helper(timeout_sec=10):
     helper = Path(__file__).resolve().parent / "banti_jt_helper.js"
     if not helper.exists():
         raise RuntimeError("banti_jt_helper.js is missing")
-    raw = subprocess.check_output(
+    commands = (
         ["node", str(helper)],
-        cwd=str(helper.parent),
-        text=True,
-        timeout=timeout_sec,
-        stderr=subprocess.DEVNULL,
+        ["node", "--use-system-ca", str(helper)],
+        ["node", "--use-system-ca", str(helper)],
+        ["node", "--use-system-ca", str(helper)],
     )
+    raw = None
+    last_error = None
+    for command in commands:
+        try:
+            raw = subprocess.check_output(
+                command,
+                cwd=str(helper.parent),
+                text=True,
+                timeout=timeout_sec,
+                stderr=subprocess.DEVNULL,
+            )
+            break
+        except (OSError, subprocess.SubprocessError) as exc:
+            last_error = exc
+    if raw is None:
+        raise RuntimeError("banti helper failed with default and system CA trust") from last_error
     body = json.loads(raw)
     token = body.get("jt")
     if not isinstance(token, str) or not token.startswith("31$"):
