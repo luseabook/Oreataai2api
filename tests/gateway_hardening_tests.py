@@ -4124,6 +4124,66 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], 150)
         self.assertFalse(run.call_args.kwargs.get("shell", False))
 
+    def test_browser_generation_worker_allows_slow_video_page_readiness(self):
+        account_id = self.seed_account_with_capabilities("slow-video-page@example.com")
+        account = server.account_row_by_id(account_id)
+        options = {
+            "model_name": "Seedance 2.0 Mini",
+            "ratio": "16:9",
+            "resolution": "480",
+            "duration": 5,
+            "scene_id": "text_or_image",
+        }
+        completed = subprocess.CompletedProcess(
+            args=["node"],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "chat": {"chatId": "video-chat", "focusId": "video-focus"},
+                    "stream": {
+                        "events": [{"event": "end"}],
+                        "error": None,
+                        "status": "streamed",
+                        "completion_reason": "end",
+                    },
+                }
+            ),
+            stderr="",
+        )
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "oreate": {
+                    "browser_worker_enabled": True,
+                    "browser_worker_node": "node",
+                    "browser_worker_timeout_seconds": 180,
+                    "browser_worker_readiness_timeout_seconds": 60,
+                    "chromium_executable": "/usr/bin/chromium-browser",
+                    "browser_worker_node_modules": "/var/lib/oreateai/browser-worker/node_modules",
+                }
+            },
+        )
+        try:
+            with patch.object(server.subprocess, "run", return_value=completed) as run:
+                server.run_browser_generation(
+                    account,
+                    "video",
+                    "生成一只小猫行走的视频",
+                    options,
+                    image_config=None,
+                    video_config=server.build_video_config(options),
+                    attachments=[],
+                )
+        finally:
+            server.CFG = original_cfg
+
+        payload = json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(payload["runtime"].get("readinessTimeoutMs"), 60_000)
+        worker_source = server.browser_worker_script_path().read_text(encoding="utf-8")
+        self.assertIn("runtime.readinessTimeoutMs", worker_source)
+        self.assertNotIn("{timeout: 30000}", worker_source)
+
     def test_submit_generation_uses_browser_stream_assets_when_hydration_lags(self):
         account_id = self.seed_account_with_capabilities("browser-submit@example.com")
         account = server.account_row_by_id(account_id)

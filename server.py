@@ -129,6 +129,7 @@ DEFAULT_CONFIG = {
         "browser_worker_enabled": False,
         "browser_worker_node": "node",
         "browser_worker_timeout_seconds": 150,
+        "browser_worker_readiness_timeout_seconds": 60,
         "browser_worker_node_modules": "",
         "chromium_executable": "",
     },
@@ -5063,6 +5064,16 @@ def run_browser_generation(
             150,
         ),
     )
+    readiness_timeout_seconds = max(
+        5,
+        min(
+            int_or_default(
+                orete_config.get("browser_worker_readiness_timeout_seconds"),
+                60,
+            ),
+            max(5, timeout_seconds - 30),
+        ),
+    )
     # Leave enough time for Chromium startup, navigation and orderly shutdown.
     # Otherwise the outer subprocess timeout can terminate a healthy image
     # stream just before the worker returns its final JSON result.
@@ -5094,6 +5105,7 @@ def run_browser_generation(
             "nodeModulesPath": node_modules_path,
             "streamWaitMs": max(5_000, int(stream_wait_seconds * 1000)),
             "navigationTimeoutMs": min(max(30_000, timeout_seconds * 1000 // 2), 90_000),
+            "readinessTimeoutMs": int(readiness_timeout_seconds * 1000),
         },
     }
     command = [

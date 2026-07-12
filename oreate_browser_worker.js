@@ -77,9 +77,14 @@ async function run() {
     } catch (error) {
       if (!String(page.url()).includes('oreateai.com')) throw error;
     }
+    const requestedReadinessTimeoutMs = Number(runtime.readinessTimeoutMs);
+    const readinessTimeoutMs = Number.isFinite(requestedReadinessTimeoutMs)
+      && requestedReadinessTimeoutMs >= 5000
+      ? requestedReadinessTimeoutMs
+      : 60000;
     await page.waitForFunction(
       () => window.ParisFactory && typeof window.ParisFactory.create === 'function',
-      {timeout: 30000},
+      {timeout: readinessTimeoutMs},
     );
 
     return await page.evaluate(async (request) => {

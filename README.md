@@ -337,6 +337,7 @@ Content-Type: multipart/form-data
   "browser_worker_enabled": true,
   "browser_worker_node": "node",
   "browser_worker_timeout_seconds": 150,
+  "browser_worker_readiness_timeout_seconds": 60,
   "browser_worker_node_modules": "/var/lib/oreateai/browser-worker/node_modules",
   "chromium_executable": "/usr/bin/chromium-browser"
 }
