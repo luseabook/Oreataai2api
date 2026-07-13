@@ -59,6 +59,17 @@
     "account_failover_error_codes": [
       "200001"
     ],
+    "account_daily_point_gain": 30,
+    "capacity_point_tiers": [
+      30,
+      50,
+      100,
+      150,
+      300,
+      455,
+      600,
+      1000
+    ],
     "prompt_max_length": 4000,
     "request_id_max_length": 128,
     "upload_max_bytes": 104857600,

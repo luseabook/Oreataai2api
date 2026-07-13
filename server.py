@@ -158,6 +158,8 @@ DEFAULT_CONFIG = {
         "account_risk_quarantine_seconds": 3600,
         "account_failover_max_attempts": 5,
         "account_failover_error_codes": ["200001"],
+        "account_daily_point_gain": 30,
+        "capacity_point_tiers": [30, 50, 100, 150, 300, 455, 600, 1000],
         "prompt_max_length": 4000,
         "request_id_max_length": 128,
         "upload_max_bytes": 104857600,
@@ -429,6 +431,9 @@ def public_account(row: sqlite3.Row) -> Dict[str, Any]:
     item["balance_status"] = account_balance_status(item)
     item["risk_status"] = account_risk_status(item)
     item["health_status"] = account_health_status(item, now)
+    item["active_reserved_points"] = account_active_reserved_points(item)
+    item["available_points"] = account_available_points(item)
+    item["unprotected_spendable_points"] = account_spendable_points(item, 1)
     return item
 
 
@@ -598,6 +603,34 @@ def account_balance_value(row: sqlite3.Row) -> Optional[int]:
     return None
 
 
+def account_active_reserved_points(row: sqlite3.Row) -> int:
+    item = dict(row)
+    return max(0, int_or_default(item.get("active_reserved_points"), 0))
+
+
+def account_reserve_target_points(row: sqlite3.Row) -> int:
+    item = dict(row)
+    return max(0, int_or_default(item.get("reserve_target_points"), 0))
+
+
+def account_available_points(row: sqlite3.Row) -> Optional[int]:
+    balance = account_balance_value(row)
+    if balance is None:
+        return None
+    return max(0, balance - account_active_reserved_points(row))
+
+
+def account_spendable_points(row: sqlite3.Row, estimated_point_cost: Optional[int]) -> Optional[int]:
+    available = account_available_points(row)
+    if available is None:
+        return None
+    cost = max(0, int_or_default(estimated_point_cost, 0))
+    reserve_target = account_reserve_target_points(row)
+    if reserve_target > 0 and cost < reserve_target:
+        return max(0, available - reserve_target)
+    return available
+
+
 def account_has_sufficient_balance(row: sqlite3.Row, estimated_point_cost: Optional[int]) -> bool:
     if estimated_point_cost in (None, ""):
         return True
@@ -607,10 +640,8 @@ def account_has_sufficient_balance(row: sqlite3.Row, estimated_point_cost: Optio
         return True
     if cost <= 0:
         return True
-    balance = account_balance_value(row)
-    if balance is None:
-        return True
-    return balance >= cost
+    spendable = account_spendable_points(row, cost)
+    return spendable is not None and spendable >= cost
 
 
 def account_cooldown_remaining_seconds(row: sqlite3.Row, now: Optional[float] = None) -> float:
@@ -1809,6 +1840,20 @@ def reserve_idempotency_record(
     cutoff = current - (ttl_hours * 3600.0)
     conn = db_conn()
     try:
+        row = conn.execute(
+            "SELECT * FROM idempotency_keys WHERE api_key_id=? AND idempotency_key=?",
+            (api_key_id, idempotency_key),
+        ).fetchone()
+        if row and (ttl_hours <= 0 or float_or_default(row["created_at"], 0) >= cutoff):
+            record = dict(row)
+            if record.get("request_hash") != request_hash:
+                state = "conflict"
+            elif int(record.get("status_code") or 0) > 0:
+                state = "replay"
+            else:
+                state = "pending"
+            return {"state": state, "record": record}
+
         conn.execute("BEGIN IMMEDIATE")
         if ttl_hours > 0:
             conn.execute(
@@ -1999,10 +2044,18 @@ def day_start_timestamp(now: float) -> float:
     return start.timestamp()
 
 
-def check_daily_quota(api_key_id: int, estimated_point_cost: Optional[int], policy: Dict[str, int], now: float, request_id: str) -> None:
+def check_daily_quota(
+    api_key_id: int,
+    estimated_point_cost: Optional[int],
+    policy: Dict[str, int],
+    now: float,
+    request_id: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
     start = day_start_timestamp(now)
-    conn = db_conn()
-    row = conn.execute(
+    owns_connection = conn is None
+    connection = conn or db_conn()
+    row = connection.execute(
         """
         SELECT COUNT(*) as request_count, COALESCE(SUM(estimated_point_cost), 0) as point_count
         FROM usage_log
@@ -2010,7 +2063,8 @@ def check_daily_quota(api_key_id: int, estimated_point_cost: Optional[int], poli
         """,
         (api_key_id, start),
     ).fetchone()
-    conn.close()
+    if owns_connection:
+        connection.close()
     daily_request_limit = policy.get("daily_request_limit") or 0
     if daily_request_limit > 0 and row["request_count"] >= daily_request_limit:
         raise GatewayAPIError(
@@ -2036,6 +2090,7 @@ def candidate_accounts_for_generation(
     kind: str,
     requested_account_id: Optional[int] = None,
     excluded_account_ids: Optional[Iterable[int]] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> List[sqlite3.Row]:
     now = time.time()
     capability_clause = "a.model_info_json IS NOT NULL AND a.model_info_json != ''" if kind == "image" else "a.video_info_json IS NOT NULL AND a.video_info_json != ''"
@@ -2055,10 +2110,25 @@ def candidate_accounts_for_generation(
     if excluded_ids:
         exclusion_clause = f"AND a.id NOT IN ({','.join('?' for _ in excluded_ids)})"
         params.extend(excluded_ids)
-    conn = db_conn()
-    rows = conn.execute(
+    owns_connection = conn is None
+    connection = conn or db_conn()
+    rows = connection.execute(
         f"""
-        SELECT a.* FROM accounts AS a
+        SELECT
+            a.*,
+            (
+                SELECT COUNT(*)
+                FROM tasks AS active_tasks
+                WHERE active_tasks.account_id=a.id
+                  AND active_tasks.status IN ('queued', 'running', 'submitted', 'hydrating')
+            ) AS active_task_count,
+            (
+                SELECT COALESCE(SUM(COALESCE(active_reservations.estimated_point_cost, 0)), 0)
+                FROM tasks AS active_reservations
+                WHERE active_reservations.account_id=a.id
+                  AND active_reservations.status IN ('queued', 'running', 'submitted', 'hydrating')
+            ) AS active_reserved_points
+        FROM accounts AS a
         WHERE a.status IN ('verified', 'active')
           AND a.ouid IS NOT NULL AND a.ouid != ''
           AND a.ouss IS NOT NULL AND a.ouss != ''
@@ -2066,12 +2136,7 @@ def candidate_accounts_for_generation(
           AND (a.cooldown_until IS NULL OR a.cooldown_until <= ?)
           {account_clause}
           {exclusion_clause}
-        ORDER BY (
-            SELECT COUNT(*)
-            FROM tasks AS t
-            WHERE t.account_id=a.id
-              AND t.status IN ('queued', 'running', 'submitted', 'hydrating')
-        ) ASC,
+        ORDER BY active_task_count ASC,
         CASE WHEN a.last_used_at IS NULL THEN 1 ELSE 0 END ASC,
         COALESCE(a.failure_count, 0) ASC,
         COALESCE(a.last_used_at, 0) ASC,
@@ -2080,7 +2145,8 @@ def candidate_accounts_for_generation(
         """,
         tuple(params),
     ).fetchall()
-    conn.close()
+    if owns_connection:
+        connection.close()
     return list(rows)
 
 
@@ -2097,15 +2163,18 @@ def select_generation_account(
     body: Any,
     request_id: str = "",
     excluded_account_ids: Optional[Iterable[int]] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> Tuple[sqlite3.Row, Dict[str, Any], Dict[str, Any], Optional[int]]:
     candidates = candidate_accounts_for_generation(
         body.kind,
         getattr(body, "account_id", None),
         excluded_account_ids,
+        conn,
     )
     last_validation_error: Optional[GatewayAPIError] = None
-    had_balance_miss = False
-    for account in candidates:
+    balance_misses: List[Dict[str, Any]] = []
+    eligible: List[Tuple[int, int, int, sqlite3.Row, Dict[str, Any], Dict[str, Any], Optional[int]]] = []
+    for candidate_index, account in enumerate(candidates):
         caps = capabilities_from_account(account)
         try:
             options = effective_generation_options(body, caps)
@@ -2115,13 +2184,61 @@ def select_generation_account(
             continue
         estimated_point_cost = estimate_point_cost(body.kind, options, caps)
         if not account_has_sufficient_balance(account, estimated_point_cost):
-            had_balance_miss = True
+            balance_misses.append(
+                {
+                    "required_points": max(0, int_or_default(estimated_point_cost, 0)),
+                    "available_points": account_spendable_points(account, estimated_point_cost),
+                    "reserved_points": account_active_reserved_points(account),
+                    "balance_known": account_balance_value(account) is not None,
+                }
+            )
             continue
+        spendable = account_spendable_points(account, estimated_point_cost)
+        leftover = max(0, int_or_default(spendable, 0) - max(0, int_or_default(estimated_point_cost, 0)))
+        active_task_count = max(0, int_or_default(dict(account).get("active_task_count"), 0))
+        eligible.append((active_task_count, leftover, candidate_index, account, caps, options, estimated_point_cost))
+    if eligible:
+        _, _, _, account, caps, options, estimated_point_cost = min(
+            eligible,
+            key=lambda item: (item[0], item[1], item[2]),
+        )
         return account, caps, options, estimated_point_cost
-    if last_validation_error is not None and not had_balance_miss and candidates:
+    if last_validation_error is not None and not balance_misses and candidates:
         if request_id:
             last_validation_error.request_id = request_id
         raise last_validation_error
+    if balance_misses:
+        required_points = min(
+            (item["required_points"] for item in balance_misses if item["required_points"] > 0),
+            default=0,
+        )
+        known_balances = [
+            max(0, int_or_default(item.get("available_points"), 0))
+            for item in balance_misses
+            if item.get("balance_known")
+        ]
+        max_available_points = max(known_balances, default=0)
+        daily_gain = max(0, int_or_default(gateway_cfg().get("account_daily_point_gain"), 30))
+        estimated_ready_days = None
+        if required_points > max_available_points and daily_gain > 0 and known_balances:
+            estimated_ready_days = min(
+                math.ceil(max(0, required_points - available_points) / daily_gain)
+                for available_points in known_balances
+            )
+        raise GatewayAPIError(
+            503,
+            "INSUFFICIENT_POOL_CAPACITY",
+            "account pool does not have enough available points",
+            {
+                "required_points": required_points,
+                "max_available_points": max_available_points,
+                "known_balance_accounts": len(known_balances),
+                "candidate_accounts": len(candidates),
+                "reserved_points": sum(int_or_default(item.get("reserved_points"), 0) for item in balance_misses),
+                "estimated_ready_days": estimated_ready_days,
+            },
+            request_id=request_id,
+        )
     raise GatewayAPIError(
         503,
         "NO_ACCOUNT_AVAILABLE",
@@ -2312,6 +2429,7 @@ def init_db():
             rest_point INTEGER,
             daily_point INTEGER,
             bonus_point INTEGER,
+            reserve_target_points INTEGER NOT NULL DEFAULT 0,
             balance_updated_at REAL,
             last_error TEXT,
             created_at REAL NOT NULL,
@@ -2590,6 +2708,7 @@ def init_db():
     add_column_if_missing(conn, "accounts", "rest_point", "INTEGER")
     add_column_if_missing(conn, "accounts", "daily_point", "INTEGER")
     add_column_if_missing(conn, "accounts", "bonus_point", "INTEGER")
+    add_column_if_missing(conn, "accounts", "reserve_target_points", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "accounts", "balance_updated_at", "REAL")
     add_column_if_missing(conn, "tasks", "model_name", "TEXT")
     add_column_if_missing(conn, "tasks", "scene_id", "TEXT")
@@ -2805,6 +2924,10 @@ class PoolMaintenanceIn(BaseModel):
     supplement: bool = True
     target_healthy: Optional[int] = Field(default=None, ge=1, le=500)
     max_register: int = Field(default=10, ge=0, le=50)
+
+
+class AccountReserveTargetIn(BaseModel):
+    reserve_target_points: Annotated[int, Field(strict=True, ge=0, le=1000000)]
 
 
 @dataclass
@@ -3576,9 +3699,122 @@ def save_account(email: str, password: str, session: OreateSession, model_info=N
 
 def list_accounts() -> List[Dict[str, Any]]:
     conn = db_conn()
-    rows = conn.execute("SELECT * FROM accounts ORDER BY id DESC").fetchall()
+    rows = conn.execute(
+        """
+        SELECT
+            a.*,
+            (
+                SELECT COUNT(*)
+                FROM tasks AS active_tasks
+                WHERE active_tasks.account_id=a.id
+                  AND active_tasks.status IN ('queued', 'running', 'submitted', 'hydrating')
+            ) AS active_task_count,
+            (
+                SELECT COALESCE(SUM(COALESCE(active_reservations.estimated_point_cost, 0)), 0)
+                FROM tasks AS active_reservations
+                WHERE active_reservations.account_id=a.id
+                  AND active_reservations.status IN ('queued', 'running', 'submitted', 'hydrating')
+            ) AS active_reserved_points
+        FROM accounts AS a
+        ORDER BY a.id DESC
+        """
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def pool_capacity_rows() -> List[sqlite3.Row]:
+    now = time.time()
+    conn = db_conn()
+    rows = conn.execute(
+        """
+        SELECT
+            a.*,
+            (
+                SELECT COUNT(*)
+                FROM tasks AS active_tasks
+                WHERE active_tasks.account_id=a.id
+                  AND active_tasks.status IN ('queued', 'running', 'submitted', 'hydrating')
+            ) AS active_task_count,
+            (
+                SELECT COALESCE(SUM(COALESCE(active_reservations.estimated_point_cost, 0)), 0)
+                FROM tasks AS active_reservations
+                WHERE active_reservations.account_id=a.id
+                  AND active_reservations.status IN ('queued', 'running', 'submitted', 'hydrating')
+            ) AS active_reserved_points
+        FROM accounts AS a
+        WHERE a.status IN ('verified', 'active')
+          AND a.ouid IS NOT NULL AND a.ouid != ''
+          AND a.ouss IS NOT NULL AND a.ouss != ''
+          AND (a.cooldown_until IS NULL OR a.cooldown_until <= ?)
+        ORDER BY a.id ASC
+        """,
+        (now,),
+    ).fetchall()
+    conn.close()
+    return list(rows)
+
+
+def capacity_point_tiers() -> List[int]:
+    configured = gateway_cfg().get("capacity_point_tiers")
+    values = configured if isinstance(configured, list) else []
+    tiers = {
+        int_or_default(value, 0)
+        for value in values
+        if int_or_default(value, 0) > 0
+    }
+    return sorted(tiers or {30, 50, 100, 150, 300, 455, 600, 1000})
+
+
+def build_pool_capacity_snapshot() -> Dict[str, Any]:
+    rows = pool_capacity_rows()
+    known_rows = [row for row in rows if account_balance_value(row) is not None]
+    daily_gain = max(0, int_or_default(gateway_cfg().get("account_daily_point_gain"), 30))
+    total_points = sum(max(0, int_or_default(account_balance_value(row), 0)) for row in known_rows)
+    reserved_points = sum(account_active_reserved_points(row) for row in known_rows)
+    available_values = [max(0, int_or_default(account_available_points(row), 0)) for row in known_rows]
+    tiers = []
+    for point_cost in capacity_point_tiers():
+        spendable_values = [
+            max(0, int_or_default(account_spendable_points(row, point_cost), 0))
+            for row in known_rows
+        ]
+        task_capacity = sum(value // point_cost for value in spendable_values)
+        next_day_task_capacity = sum(
+            (value + daily_gain) // point_cost
+            for value in spendable_values
+        )
+        estimated_ready_days = None
+        if spendable_values:
+            estimated_ready_days = 0
+            if not any(value >= point_cost for value in spendable_values):
+                if daily_gain > 0:
+                    estimated_ready_days = min(
+                        math.ceil(max(0, point_cost - value) / daily_gain)
+                        for value in spendable_values
+                    )
+                else:
+                    estimated_ready_days = None
+        tiers.append(
+            {
+                "point_cost": point_cost,
+                "ready_accounts": sum(1 for value in spendable_values if value >= point_cost),
+                "task_capacity": task_capacity,
+                "daily_task_capacity": max(0, next_day_task_capacity - task_capacity),
+                "estimated_ready_days": estimated_ready_days,
+            }
+        )
+    return {
+        "account_count": len(rows),
+        "known_balance_accounts": len(known_rows),
+        "total_points": total_points,
+        "reserved_points": reserved_points,
+        "available_points": sum(available_values),
+        "max_available_points": max(available_values, default=0),
+        "daily_point_gain_per_account": daily_gain,
+        "daily_point_gain_total": len(rows) * daily_gain,
+        "tiers": tiers,
+    }
 
 
 TASK_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "expired"}
@@ -3976,14 +4212,16 @@ def save_task(
     next_attempt_at: Optional[float] = None,
     started_at: Optional[float] = None,
     finished_at: Optional[float] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> int:
     now = time.time()
     if next_attempt_at is None and status in {"submitted", "hydrating"}:
         next_attempt_at = now
     chat = task_response_chat(response)
     assets = task_response_assets(response)
-    conn = db_conn()
-    conn.execute(
+    owns_connection = conn is None
+    connection = conn or db_conn()
+    cursor = connection.execute(
         """
         INSERT INTO tasks(
             api_key_id, account_id, kind, prompt, model_name, scene_id, resolution, ratio, duration,
@@ -4024,10 +4262,10 @@ def save_task(
             now,
         ),
     )
-    conn.commit()
-    row = conn.execute("SELECT last_insert_rowid()").fetchone()
-    task_id = row[0]
-    conn.close()
+    task_id = int(cursor.lastrowid)
+    if owns_connection:
+        connection.commit()
+        connection.close()
     return task_id
 
 
@@ -6723,23 +6961,47 @@ def handle_request_validation_error(request: Request, exc: RequestValidationErro
 # === API Key Auth ===
 security = HTTPBearer(auto_error=False)
 
+API_KEY_LAST_USED_TOUCH_INTERVAL_SECONDS = 60.0
+
+
+def touch_api_key_last_used(conn: sqlite3.Connection, api_key_id: int, now: float) -> None:
+    """Best-effort activity timestamp update that must never delay authentication."""
+    try:
+        conn.execute("PRAGMA busy_timeout=0")
+        conn.execute(
+            """
+            UPDATE api_keys
+            SET last_used_at=?
+            WHERE id=? AND (last_used_at IS NULL OR last_used_at<?)
+            """,
+            (now, api_key_id, now - API_KEY_LAST_USED_TOUCH_INTERVAL_SECONDS),
+        )
+        conn.commit()
+    except sqlite3.OperationalError as exc:
+        conn.rollback()
+        if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+            raise
+
+
 def get_api_key(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Optional[int]:
     if credentials is None:
         return None
     conn = db_conn()
     row = conn.execute(
-        "SELECT id, enabled, deleted_at, expires_at FROM api_keys WHERE key=?",
+        "SELECT id, enabled, deleted_at, expires_at, last_used_at FROM api_keys WHERE key=?",
         (credentials.credentials,),
     ).fetchone()
-    if row and row["enabled"] and row["deleted_at"] is None and (
-        row["expires_at"] is None or float_or_default(row["expires_at"], 0) > time.time()
-    ):
-        conn.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (time.time(), row["id"]))
-        conn.commit()
+    try:
+        now = time.time()
+        if row and row["enabled"] and row["deleted_at"] is None and (
+            row["expires_at"] is None or float_or_default(row["expires_at"], 0) > now
+        ):
+            if now - float_or_default(row["last_used_at"], 0) >= API_KEY_LAST_USED_TOUCH_INTERVAL_SECONDS:
+                touch_api_key_last_used(conn, row["id"], now)
+            return row["id"]
+        return None
+    finally:
         conn.close()
-        return row["id"]
-    conn.close()
-    return None
 
 def require_api_key(request: Request, api_key_id: Optional[int] = Depends(get_api_key)):
     if api_key_id is None:
@@ -7985,6 +8247,7 @@ def queue_generation_task(
     body: GatewayGenerateIn,
     options: Dict[str, Any],
     estimated_point_cost: Optional[int],
+    conn: Optional[sqlite3.Connection] = None,
 ) -> int:
     payload = request_body_from_generation(body)
     response = {"status": "queued"}
@@ -8003,27 +8266,80 @@ def queue_generation_task(
         ratio=options.get("ratio") or "",
         duration=options.get("duration"),
         estimated_point_cost=estimated_point_cost,
+        conn=conn,
     )
     if api_key_id is not None:
-        log_usage(
+        usage_args = (
             api_key_id,
             body.kind,
             account["id"],
             body.prompt,
             "queued",
-            task_id=task_id,
-            request_id=request_id,
-            model_name=options.get("model_name") or "",
-            resolution=options.get("resolution") or "",
-            ratio=options.get("ratio") or "",
-            duration=options.get("duration"),
-            scene_id=options.get("scene_id") or "",
-            estimated_point_cost=estimated_point_cost,
-            status_code=202,
         )
-    if task_worker_enabled():
+        usage_kwargs = {
+            "task_id": task_id,
+            "request_id": request_id,
+            "model_name": options.get("model_name") or "",
+            "resolution": options.get("resolution") or "",
+            "ratio": options.get("ratio") or "",
+            "duration": options.get("duration"),
+            "scene_id": options.get("scene_id") or "",
+            "estimated_point_cost": estimated_point_cost,
+            "status_code": 202,
+        }
+        if conn is not None:
+            insert_usage_log(conn, *usage_args, **usage_kwargs)
+        else:
+            log_usage(*usage_args, **usage_kwargs)
+    if conn is None and task_worker_enabled():
         TASK_WORKER_WAKE.set()
     return task_id
+
+
+def admit_generation_task(
+    api_key_id: Optional[int],
+    request_id: str,
+    body: GatewayGenerateIn,
+    policy: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, sqlite3.Row, Dict[str, Any], Dict[str, Any], Optional[int]]:
+    """Atomically reserve account capacity and persist the queued task."""
+    conn = db_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        account, caps, options, estimated_point_cost = select_generation_account(
+            body,
+            request_id=request_id,
+            conn=conn,
+        )
+        if api_key_id is not None:
+            effective_policy = policy or resolve_api_key_policy(get_api_key_record(api_key_id))
+            enforce_api_key_scope(effective_policy, body.kind, options, caps, request_id)
+            check_daily_quota(
+                api_key_id,
+                estimated_point_cost,
+                effective_policy,
+                time.time(),
+                request_id,
+                conn=conn,
+            )
+        task_id = queue_generation_task(
+            api_key_id,
+            request_id,
+            account,
+            body,
+            options,
+            estimated_point_cost,
+            conn=conn,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    if task_worker_enabled():
+        TASK_WORKER_WAKE.set()
+    return task_id, account, caps, options, estimated_point_cost
 
 
 def wait_for_task_snapshot(task_id: int, api_key_id: int, timeout_sec: Optional[float]) -> Dict[str, Any]:
@@ -8088,10 +8404,12 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
             check_rate_limit(api_key_id, policy, now, request_id)
             if body.kind not in ("image", "video"):
                 raise GatewayAPIError(400, "UNSUPPORTED_KIND", f"unsupported kind: {body.kind}", {"field": "kind"}, request_id=request_id)
-            account, caps, options, estimated_point_cost = select_generation_account(body, request_id=request_id)
-            enforce_api_key_scope(policy, body.kind, options, caps, request_id)
-            check_daily_quota(api_key_id, estimated_point_cost, policy, now, request_id)
-            task_id = queue_generation_task(api_key_id, request_id, account, body, options, estimated_point_cost)
+            task_id, account, caps, options, estimated_point_cost = admit_generation_task(
+                api_key_id,
+                request_id,
+                body,
+                policy,
+            )
     except Exception:
         if idempotency_reserved:
             release_idempotency_reservation(api_key_id, idempotency_key, request_hash)
@@ -9065,32 +9383,34 @@ def retry_task_record(
             policy = resolve_api_key_policy(api_key_row)
             check_rate_limit(tenant_api_key_id, policy, now, retry_request_id)
 
-        account, caps, options, estimated_point_cost = select_generation_account(
-            body,
-            request_id=retry_request_id,
-        )
-        if tenant_api_key_id is not None and policy is not None:
-            enforce_api_key_scope(policy, body.kind, options, caps, retry_request_id)
-            check_daily_quota(
-                tenant_api_key_id,
-                estimated_point_cost,
-                policy,
-                now,
-                retry_request_id,
-            )
-
-        queued_response = {
-            "ok": True,
-            "task_id": task_id,
-            "account_id": account["id"],
-            "request_id": retry_request_id,
-            "idempotent_replay": False,
-            "estimated_point_cost": estimated_point_cost,
-            "status": "queued",
-        }
         conn = db_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            account, caps, options, estimated_point_cost = select_generation_account(
+                body,
+                request_id=retry_request_id,
+                conn=conn,
+            )
+            if tenant_api_key_id is not None and policy is not None:
+                enforce_api_key_scope(policy, body.kind, options, caps, retry_request_id)
+                check_daily_quota(
+                    tenant_api_key_id,
+                    estimated_point_cost,
+                    policy,
+                    now,
+                    retry_request_id,
+                    conn=conn,
+                )
+
+            queued_response = {
+                "ok": True,
+                "task_id": task_id,
+                "account_id": account["id"],
+                "request_id": retry_request_id,
+                "idempotent_replay": False,
+                "estimated_point_cost": estimated_point_cost,
+                "status": "queued",
+            }
             source_usage = conn.execute(
                 "SELECT idempotency_key FROM usage_log WHERE task_id=? ORDER BY id DESC LIMIT 1",
                 (task_id,),
@@ -9575,6 +9895,37 @@ def api_accounts(_=Depends(require_admin)):
     return {"items": [public_account(row) for row in list_accounts()]}
 
 
+@app.get("/api/pool/capacity")
+def pool_capacity(_=Depends(require_admin)):
+    return build_pool_capacity_snapshot()
+
+
+@app.put("/api/accounts/{account_id}/reserve-target")
+def update_account_reserve_target(
+    account_id: int,
+    body: AccountReserveTargetIn,
+    _=Depends(require_admin),
+):
+    conn = db_conn()
+    cursor = conn.execute(
+        """
+        UPDATE accounts
+        SET reserve_target_points=?, updated_at=?
+        WHERE id=?
+        """,
+        (body.reserve_target_points, time.time(), account_id),
+    )
+    updated_count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    if updated_count != 1:
+        raise HTTPException(404, "account not found")
+    row = next((item for item in list_accounts() if int(item["id"]) == account_id), None)
+    if row is None:
+        raise HTTPException(404, "account not found")
+    return {"ok": True, "item": public_account(row)}
+
+
 @app.get("/api/accounts/{account_id}/credentials")
 def account_credentials(account_id: int, _=Depends(require_admin)):
     conn = db_conn()
@@ -9709,11 +10060,11 @@ def generate_media(body: MediaTaskIn, request: Request, _=Depends(require_admin)
         is_audio=body.is_audio,
         ai_type=body.ai_type,
     )
-    try:
-        account, caps, options, estimated_point_cost = select_generation_account(gateway_body)
-    except GatewayAPIError as exc:
-        raise HTTPException(exc.status_code, exc.message)
-    task_id = queue_generation_task(None, gateway_request_id(request), account, gateway_body, options, estimated_point_cost)
+    task_id, account, _, _, estimated_point_cost = admit_generation_task(
+        None,
+        gateway_request_id(request),
+        gateway_body,
+    )
     return {"ok": True, "task_id": task_id, "status": "queued", "account_id": account["id"], "estimated_point_cost": estimated_point_cost}
 
 
@@ -9926,6 +10277,13 @@ tr:hover td{background:#fafafa}
 .stat-card{background:#f5f5f7;border-radius:12px;padding:16px;text-align:center}
 .stat-card .num{font-size:28px;font-weight:700;letter-spacing:-.5px}
 .stat-card .label{font-size:12px;color:#86868b;margin-top:2px}
+.pool-capacity-panel{border:1px solid #e5e5e5;background:#fafafa;border-radius:12px;padding:14px;margin-bottom:16px}
+.pool-capacity-panel .stats{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.pool-capacity-note{font-size:12px;color:#6e6e73;line-height:1.65;margin-top:10px}
+.reserve-target-editor{display:flex;align-items:center;gap:6px;min-width:150px}
+.reserve-target-editor input{width:86px;padding:6px 8px;font-size:12px}
+.point-value{font-variant-numeric:tabular-nums;white-space:nowrap}
+.point-value small{display:block;color:#86868b;font-size:11px;margin-top:3px}
 .endpoint-box{background:#f5f5f7;border-radius:10px;padding:12px 16px;margin-bottom:12px;font-family:monospace;font-size:13px}
 .endpoint-box .url{font-weight:600;color:#1d1d1f}
 .endpoint-box .desc{font-size:12px;color:#86868b;margin-top:2px}
@@ -10068,6 +10426,15 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
 <!-- Tab: 号池 -->
 <div id="tab-pool" class="section">
   <h2>📋 号池管理</h2>
+  <div class="pool-capacity-panel">
+    <div class="stats">
+      <div class="stat-card"><div class="num" id="capacity-total-points">-</div><div class="label">已知总积分</div></div>
+      <div class="stat-card"><div class="num" id="capacity-reserved-points">-</div><div class="label">活动任务预留</div></div>
+      <div class="stat-card"><div class="num" id="capacity-max-available">-</div><div class="label">单号最高可用</div></div>
+      <div class="stat-card"><div class="num" id="capacity-tier-455">-</div><div class="label">455 点任务容量</div></div>
+    </div>
+    <div id="pool-capacity-note" class="pool-capacity-note">正在加载积分容量…</div>
+  </div>
   <div class="row" style="margin-bottom:16px">
     <div class="col"><label>注册数量</label><input id="reg_count" type="number" min="1" max="50" step="1" value="1"></div>
     <div><button id="reg-one" class="btn-primary" onclick="registerOne()">注册 1 个</button></div>
@@ -10088,7 +10455,7 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:10px;ove
   <div class="table-wrap">
     <table>
       <thead><tr>
-        <th>ID</th><th>邮箱</th><th>密码</th><th>状态</th><th>健康</th><th>来源</th><th>OUID</th><th>余额</th><th>更新时间</th><th>创建时间</th><th>操作</th>
+        <th>ID</th><th>邮箱</th><th>密码</th><th>状态</th><th>健康</th><th>来源</th><th>OUID</th><th>余额 / 可用</th><th>活动任务预留</th><th>储备目标</th><th>更新时间</th><th>创建时间</th><th>操作</th>
       </tr></thead>
       <tbody id="accounts-tbody"></tbody>
     </table>
@@ -10698,6 +11065,7 @@ function listPageSummary(page){
 let state = {
   accounts:[],tasks:[],apikeys:[],clients:[],usage:[],uploads:[],costReport:[],auditLogs:[],
   accountCredentials:{},revealedAccountPasswords:{},registrationJob:null,maintenanceJob:null,
+  capacity:null,
   settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}},
   lists:{
     tasks:createListPageState(50),
@@ -10983,8 +11351,15 @@ function setCapabilityState(payload){
   };
 }
 async function loadAccounts(){
-  const r=await api('GET','/api/accounts');
-  state.accounts=r.items||[]; renderAccounts(); updateStats();
+  const [accountsResponse,capacityResponse]=await Promise.all([
+    api('GET','/api/accounts'),
+    api('GET','/api/pool/capacity'),
+  ]);
+  state.accounts=accountsResponse.items||[];
+  state.capacity=capacityResponse||null;
+  renderPoolCapacity();
+  renderAccounts();
+  updateStats();
 }
 async function loadClients(){
   const r=await api('GET','/api/admin/clients');
@@ -11000,6 +11375,31 @@ function renderClientSelect(){
     '未绑定'
   );
 }
+function renderPoolCapacity(){
+  const capacity=state.capacity||{};
+  const tier455=(capacity.tiers||[]).find(tier => Number(tier.point_cost)===455)||{};
+  const setText=(id,value) => {
+    const element=document.getElementById(id);
+    if(element) element.textContent=value;
+  };
+  setText('capacity-total-points',Number(capacity.total_points||0).toLocaleString());
+  setText('capacity-reserved-points',Number(capacity.reserved_points||0).toLocaleString());
+  setText('capacity-max-available',Number(capacity.max_available_points||0).toLocaleString());
+  setText('capacity-tier-455',Number(tier455.task_capacity||0).toLocaleString());
+  const note=document.getElementById('pool-capacity-note');
+  if(!note) return;
+  const known=Number(capacity.known_balance_accounts||0);
+  const total=Number(capacity.account_count||0);
+  const dailyGain=Number(capacity.daily_point_gain_total||0);
+  const ready455=Number(tier455.ready_accounts||0);
+  const estimatedReadyDays=Number(tier455.estimated_ready_days);
+  const base=`${known} / ${total} 个账号已知积分；预计每日签到补充 ${dailyGain.toLocaleString()} 点。`;
+  note.textContent=ready455>0
+    ? `${base} 当前有 ${ready455} 个账号可直接承接 455 点任务。`
+    : Number.isFinite(estimatedReadyDays) && estimatedReadyDays>0
+      ? `${base} 当前没有单个账号可承接 455 点任务，最快预计还需 ${estimatedReadyDays} 天签到累积。`
+      : `${base} 当前没有单个账号可承接 455 点任务，需要刷新余额或补充高积分账号。`;
+}
 function renderAccounts(){
   const tbody=document.getElementById('accounts-tbody');
   tbody.innerHTML = state.accounts.map(a => {
@@ -11007,6 +11407,9 @@ function renderAccounts(){
     const hc = a.health_status==='healthy'?'tag-green':a.health_status==='cooling'?'tag-blue':a.health_status==='low_balance'||a.health_status==='risk_control'?'tag-red':'tag-gray';
     const em = a.email||'';
     const restPoint = a.rest_point ?? '-';
+    const availablePoints = a.available_points ?? '-';
+    const activeReservedPoints = Number(a.active_reserved_points||0);
+    const reserveTargetPoints = Number(a.reserve_target_points||0);
     const balanceUpdatedAt = a.balance_updated_at ? new Date((a.balance_updated_at||0)*1000).toLocaleString() : '-';
     const healthMeta = `${adminLabel('riskStatus',a.risk_status||'clean')}${a.cooling ? ` · 剩余 ${a.cooldown_remaining_seconds || 0} 秒` : ''}`;
     const credential=state.accountCredentials[a.id];
@@ -11023,13 +11426,38 @@ function renderAccounts(){
       <td><span class="tag ${hc}">${escapeHtml(adminLabel('healthStatus',a.health_status))}</span><div style="font-size:11px;color:#86868b">${escapeHtml(healthMeta)}</div></td>
       <td>${escapeHtml(adminLabel('source',a.source))}</td>
       <td style="font-family:monospace;font-size:11px">${escapeHtml(a.ouid_preview||'')}</td>
-      <td>${restPoint}</td>
+      <td class="point-value">${restPoint}<small>可用 ${availablePoints}</small></td>
+      <td class="point-value">${activeReservedPoints}</td>
+      <td>
+        <div class="reserve-target-editor">
+          <input id="reserve-target-${a.id}" type="number" min="0" max="1000000" step="1" value="${reserveTargetPoints}" aria-label="账号 ${a.id} 储备目标">
+          <button class="btn-sm btn-secondary" onclick="saveReserveTarget(${a.id})">保存</button>
+        </div>
+      </td>
       <td style="font-size:11px">${balanceUpdatedAt}</td>
       <td style="font-size:11px">${new Date((a.created_at||0)*1000).toLocaleString()}</td>
       <td><button class="btn-sm btn-secondary" onclick="generateWith(${a.id})">生成</button> <button class="btn-sm btn-secondary" onclick="refreshAccountBalance(${a.id})">刷新余额</button></td>
     </tr>`;
   }).join('');
   document.getElementById('pool-count').textContent = state.accounts.filter(a=>a.health_status==='healthy').length;
+}
+async function saveReserveTarget(accountId){
+  const input=document.getElementById(`reserve-target-${accountId}`);
+  const reserveTarget=Number(input?.value);
+  if(!Number.isInteger(reserveTarget) || reserveTarget<0){
+    alert('储备目标必须是大于或等于 0 的整数');
+    return;
+  }
+  const status=document.getElementById('status-text');
+  try{
+    if(status) status.textContent='正在保存储备目标…';
+    await api('PUT',`/api/accounts/${accountId}/reserve-target`,{reserve_target_points:reserveTarget});
+    await loadAccounts();
+    if(status) status.textContent=`账号 #${accountId} 储备目标已更新`;
+  }catch(error){
+    if(status) status.textContent='储备目标保存失败';
+    alert(`储备目标保存失败：${error?.message || String(error)}`);
+  }
 }
 async function loadAccountCredentials(accountId){
   if(state.accountCredentials[accountId]) return state.accountCredentials[accountId];

@@ -153,8 +153,11 @@ class GatewayHardeningTests(unittest.TestCase):
         conn = server.db_conn()
         conn.execute(
             """
-            INSERT INTO accounts(email,password,status,source,ouid,ouss,model_info_json,video_info_json,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO accounts(
+                email,password,status,source,ouid,ouss,model_info_json,video_info_json,
+                rest_point,daily_point,bonus_point,balance_updated_at,created_at,updated_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 email,
@@ -165,6 +168,10 @@ class GatewayHardeningTests(unittest.TestCase):
                 server.encrypt_secret_value("ouss-secret"),
                 json.dumps(self.sample_image_info()),
                 json.dumps(self.sample_video_info()),
+                1000,
+                0,
+                1000,
+                now,
                 now,
                 now,
             ),
@@ -471,6 +478,7 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("actual_point_cost", task_cols)
         self.assertIn("actual_point_cost", usage_cols)
         self.assertIn("client_id", api_key_cols)
+        self.assertIn("reserve_target_points", account_cols)
         self.assertIsNotNone(client_table)
 
     def test_database_connections_enable_production_pragmas_and_indexes(self):
@@ -501,6 +509,7 @@ class GatewayHardeningTests(unittest.TestCase):
                 "idx_usage_task_lookup",
                 "idx_idempotency_task_lookup",
                 "idx_accounts_scheduler",
+                "idx_tasks_account_reservations",
                 "idx_task_attempts_task",
             }.issubset(index_names)
         )
@@ -3782,6 +3791,268 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(set(selected_account_ids), {first_account_id, second_account_id})
         self.assertNotEqual(selected_account_ids[0], selected_account_ids[1])
 
+    def test_scheduler_uses_best_fit_balance_instead_of_draining_large_account(self):
+        low_balance_id = self.seed_account_with_capabilities("best-fit-low@example.com")
+        high_balance_id = self.seed_account_with_capabilities("best-fit-high@example.com")
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET rest_point=?, daily_point=0, bonus_point=?, updated_at=? WHERE id=?",
+            (20, 20, now, low_balance_id),
+        )
+        conn.execute(
+            "UPDATE accounts SET rest_point=?, daily_point=0, bonus_point=?, updated_at=? WHERE id=?",
+            (100, 100, now + 100, high_balance_id),
+        )
+        conn.commit()
+        conn.close()
+
+        account, _, _, estimated_point_cost = server.select_generation_account(
+            server.GatewayGenerateIn(**self.valid_image_request())
+        )
+
+        self.assertEqual(estimated_point_cost, 12)
+        self.assertEqual(account["id"], low_balance_id)
+
+    def test_scheduler_preserves_reserve_target_for_lower_cost_tasks(self):
+        protected_id = self.seed_account_with_capabilities("protected@example.com")
+        spendable_id = self.seed_account_with_capabilities("spendable@example.com")
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute(
+            """
+            UPDATE accounts
+            SET rest_point=?, daily_point=0, bonus_point=?, reserve_target_points=?, updated_at=?
+            WHERE id=?
+            """,
+            (55, 55, 50, now + 100, protected_id),
+        )
+        conn.execute(
+            """
+            UPDATE accounts
+            SET rest_point=?, daily_point=0, bonus_point=?, reserve_target_points=0, updated_at=?
+            WHERE id=?
+            """,
+            (20, 20, now, spendable_id),
+        )
+        conn.commit()
+        conn.close()
+
+        account, _, _, estimated_point_cost = server.select_generation_account(
+            server.GatewayGenerateIn(**self.valid_image_request())
+        )
+
+        self.assertEqual(estimated_point_cost, 12)
+        self.assertEqual(account["id"], spendable_id)
+
+    def test_active_task_point_reservation_prevents_overselling_account_balance(self):
+        account_id = self.seed_account_with_capabilities("reservation@example.com")
+        self.seed_api_key("reservation-key")
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET rest_point=20, daily_point=0, bonus_point=20 WHERE id=?",
+            (account_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        first = self.client.post(
+            "/v1/generate",
+            headers={"Authorization": "Bearer reservation-key"},
+            json=self.valid_image_request(),
+        )
+        second_request = self.valid_image_request()
+        second_request["prompt"] = "second request should not oversell"
+        second = self.client.post(
+            "/v1/generate",
+            headers={"Authorization": "Bearer reservation-key"},
+            json=second_request,
+        )
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 503)
+        self.assertEqual(second.json()["error"]["code"], "INSUFFICIENT_POOL_CAPACITY")
+        conn = server.db_conn()
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks WHERE account_id=?", (account_id,)).fetchone()[0]
+        reserved_points = conn.execute(
+            """
+            SELECT COALESCE(SUM(estimated_point_cost), 0)
+            FROM tasks
+            WHERE account_id=? AND status IN ('queued','running','submitted','hydrating')
+            """,
+            (account_id,),
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(task_count, 1)
+        self.assertEqual(reserved_points, 12)
+
+    def test_atomic_admission_allows_only_one_task_for_same_limited_balance(self):
+        account_id = self.seed_account_with_capabilities("atomic-reservation@example.com")
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET rest_point=20, daily_point=0, bonus_point=20 WHERE id=?",
+            (account_id,),
+        )
+        conn.commit()
+        conn.close()
+        start = threading.Barrier(2)
+        admitted = []
+        errors = []
+        result_lock = threading.Lock()
+
+        def admit(index):
+            body = server.GatewayGenerateIn(**self.valid_image_request())
+            body.prompt = f"atomic request {index}"
+            try:
+                start.wait(timeout=5)
+                result = server.admit_generation_task(None, f"atomic-{index}", body)
+                with result_lock:
+                    admitted.append(result)
+            except Exception as exc:
+                with result_lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=admit, args=(index,)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], server.GatewayAPIError)
+        self.assertEqual(errors[0].code, "INSUFFICIENT_POOL_CAPACITY")
+        conn = server.db_conn()
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks WHERE account_id=?", (account_id,)).fetchone()[0]
+        conn.close()
+        self.assertEqual(task_count, 1)
+
+    def test_admin_can_update_account_reserve_target(self):
+        account_id = self.seed_account_with_capabilities("reserve-target@example.com")
+        headers = self.admin_headers()
+
+        response = self.client.put(
+            f"/api/accounts/{account_id}/reserve-target",
+            headers=headers,
+            json={"reserve_target_points": 455},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["item"]["reserve_target_points"], 455)
+        invalid = self.client.put(
+            f"/api/accounts/{account_id}/reserve-target",
+            headers=headers,
+            json={"reserve_target_points": -1},
+        )
+        self.assertEqual(invalid.status_code, 422)
+
+    def test_pool_capacity_reports_reservations_and_cost_tier_capacity(self):
+        reserved_account_id = self.seed_account_with_capabilities("capacity-reserved@example.com")
+        flexible_account_id = self.seed_account_with_capabilities("capacity-flexible@example.com")
+        conn = server.db_conn()
+        conn.execute(
+            """
+            UPDATE accounts
+            SET rest_point=500, daily_point=0, bonus_point=500, reserve_target_points=455
+            WHERE id=?
+            """,
+            (reserved_account_id,),
+        )
+        conn.execute(
+            """
+            UPDATE accounts
+            SET rest_point=100, daily_point=0, bonus_point=100, reserve_target_points=0
+            WHERE id=?
+            """,
+            (flexible_account_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO tasks(
+                account_id, kind, prompt, status, estimated_point_cost,
+                payload_json, response_json, assets_json, created_at, updated_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                reserved_account_id,
+                "image",
+                "reserved capacity",
+                "queued",
+                30,
+                "{}",
+                "{}",
+                "[]",
+                time.time(),
+                time.time(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        response = self.client.get("/api/pool/capacity", headers=self.admin_headers())
+
+        self.assertEqual(response.status_code, 200)
+        capacity = response.json()
+        self.assertEqual(capacity["account_count"], 2)
+        self.assertEqual(capacity["known_balance_accounts"], 2)
+        self.assertEqual(capacity["total_points"], 600)
+        self.assertEqual(capacity["reserved_points"], 30)
+        self.assertEqual(capacity["available_points"], 570)
+        self.assertEqual(capacity["max_available_points"], 470)
+        tiers = {item["point_cost"]: item for item in capacity["tiers"]}
+        self.assertEqual(tiers[30]["ready_accounts"], 1)
+        self.assertEqual(tiers[30]["task_capacity"], 3)
+        self.assertEqual(tiers[455]["ready_accounts"], 1)
+        self.assertEqual(tiers[455]["task_capacity"], 1)
+
+    def test_pool_capacity_does_not_merge_daily_points_across_accounts(self):
+        for index in range(16):
+            self.seed_account_with_capabilities(f"capacity-daily-{index}@example.com")
+        conn = server.db_conn()
+        conn.execute(
+            """
+            UPDATE accounts
+            SET rest_point=0, daily_point=0, bonus_point=0, reserve_target_points=0
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        response = self.client.get("/api/pool/capacity", headers=self.admin_headers())
+
+        self.assertEqual(response.status_code, 200)
+        tiers = {item["point_cost"]: item for item in response.json()["tiers"]}
+        self.assertEqual(tiers[455]["task_capacity"], 0)
+        self.assertEqual(tiers[455]["daily_task_capacity"], 0)
+        self.assertEqual(tiers[455]["estimated_ready_days"], 16)
+
+    def test_capacity_error_explains_required_points_and_recovery_days(self):
+        account_id = self.seed_account_with_capabilities("capacity-error@example.com")
+        self.seed_api_key("capacity-error-key")
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET rest_point=10, daily_point=0, bonus_point=10 WHERE id=?",
+            (account_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        response = self.client.post(
+            "/v1/generate",
+            headers={"Authorization": "Bearer capacity-error-key"},
+            json=self.valid_image_request(),
+        )
+
+        self.assertEqual(response.status_code, 503)
+        error = response.json()["error"]
+        self.assertEqual(error["code"], "INSUFFICIENT_POOL_CAPACITY")
+        self.assertEqual(error["details"]["required_points"], 12)
+        self.assertEqual(error["details"]["max_available_points"], 10)
+        self.assertEqual(error["details"]["known_balance_accounts"], 1)
+        self.assertEqual(error["details"]["estimated_ready_days"], 1)
+
     def test_scheduler_prefers_previously_successful_account_over_untested_account(self):
         proven_account_id = self.seed_account_with_capabilities("proven@example.com")
         untested_account_id = self.seed_account_with_capabilities("untested@example.com")
@@ -4939,6 +5210,15 @@ if (!listPageSummary(page).includes('共 0 条')) throw new Error(`empty summary
         self.assertIn("刷新余额", html)
         self.assertIn("health_status", html)
 
+    def test_admin_html_contains_capacity_dashboard_and_reserve_controls(self):
+        html = server.ADMIN_HTML
+        self.assertIn("/api/pool/capacity", html)
+        self.assertIn("saveReserveTarget", html)
+        self.assertIn("活动任务预留", html)
+        self.assertIn("455 点任务", html)
+        self.assertIn("储备目标", html)
+        self.assertIn("最快预计还需", html)
+
     def test_accounts_response_includes_health_summary_fields(self):
         healthy_id = self.seed_account_with_capabilities("healthy@example.com")
         cooling_id = self.seed_account_with_capabilities("cooling@example.com")
@@ -4961,6 +5241,9 @@ if (!listPageSummary(page).includes('共 0 条')) throw new Error(`empty summary
         self.assertEqual(items["healthy@example.com"]["risk_status"], "clean")
         self.assertEqual(items["healthy@example.com"]["balance_status"], "ok")
         self.assertFalse(items["healthy@example.com"]["cooling"])
+        self.assertEqual(items["healthy@example.com"]["active_reserved_points"], 0)
+        self.assertEqual(items["healthy@example.com"]["available_points"], 127)
+        self.assertEqual(items["healthy@example.com"]["unprotected_spendable_points"], 127)
 
         self.assertEqual(items["cooling@example.com"]["health_status"], "cooling")
         self.assertTrue(items["cooling@example.com"]["cooling"])

@@ -285,6 +285,7 @@ Content-Type: multipart/form-data
 - `UPLOAD_FAILED`：BOS 上传协议失败，账号会按上游错误类型分类处理。
 - `IDEMPOTENCY_KEY_CONFLICT`：同一个 `Idempotency-Key` 被不同请求体复用。
 - `RATE_LIMITED` / `DAILY_REQUEST_LIMIT_EXCEEDED` / `DAILY_POINT_LIMIT_EXCEEDED`：API Key 策略限制触发。
+- `INSUFFICIENT_POOL_CAPACITY`：号池没有单个账号具备足够的可用积分；响应会给出所需积分、单号最高可用积分、活动任务预留积分和预计等待天数。
 - `UPSTREAM_ERROR`：Oreate 上游调用失败，账号会按错误类型进入冷却或失效。
 - 上游 `200002 params error`：`/oreate/sse/stream` 参数合同未通过，不是额度不足；通常不会扣点。已确认关键原因包括缺少网页 `ZCe` 用户镜像字段（`vip/reg_ts`）或 Banti `__bid_n`。
 
@@ -295,6 +296,18 @@ Content-Type: multipart/form-data
 - `110012`：历史消息未生成或未持久化，只记录警告，不惩罚账号池。
 
 自动换号在同一个任务内执行，不会新增 API Key 请求计数；每次账号尝试都会写入任务尝试记录。默认最多尝试 5 个不同账号，参数错误等请求级失败不会遍历号池。
+
+### 积分容量调度
+
+网关按“单账号积分容量”而不是“号池总积分”接单。任务入队与失败任务重试都会在同一个 SQLite 写事务中完成选号、额度检查和任务预留，避免并发请求重复消费同一份积分。
+
+- `可用积分 = 账号余额 - 活动任务预留`，活动状态包括 `queued`、`running`、`submitted`、`hydrating`。
+- 调度优先选择活动任务较少、执行后剩余积分更接近零的账号，减少积分碎片。
+- 账号可设置 `reserve_target_points`。例如设置为 `455` 后，低于 455 点的任务不能侵占这部分储备，但 455 点及以上任务仍可使用。
+- 管理后台“号池管理”显示已知总积分、活动任务预留、单号最高可用积分和 455 点任务容量。
+- 管理接口 `GET /api/pool/capacity` 返回各积分档位的即时容量；`PUT /api/accounts/{account_id}/reserve-target` 更新单账号储备目标。
+
+每日签到只能增加未来容量，不能把多个账号的积分合并给一个高成本任务。若单个账号当前最高可用积分低于 455，则 455 点视频必须等待某个账号累积到足额，或补充合法持有足够积分的账号。
 
 ### API Key 策略
 后台 API Keys 页面可配置：
@@ -314,6 +327,8 @@ Content-Type: multipart/form-data
     "account_risk_quarantine_seconds": 3600,
     "account_failover_max_attempts": 5,
     "account_failover_error_codes": ["200001"],
+    "account_daily_point_gain": 30,
+    "capacity_point_tiers": [30, 50, 100, 150, 300, 455, 600, 1000],
     "prompt_max_length": 4000
   },
   "oreate": {

@@ -1385,8 +1385,18 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         account_id = self.seed_account()
         conn = server.db_conn()
         conn.execute(
-            "UPDATE accounts SET model_info_json=?, video_info_json=? WHERE id=?",
-            (json.dumps(self.sample_image_info()), json.dumps(self.sample_video_info()), account_id),
+            """
+            UPDATE accounts
+            SET model_info_json=?, video_info_json=?, rest_point=1000,
+                daily_point=0, bonus_point=1000, balance_updated_at=?
+            WHERE id=?
+            """,
+            (
+                json.dumps(self.sample_image_info()),
+                json.dumps(self.sample_video_info()),
+                time.time(),
+                account_id,
+            ),
         )
         conn.commit()
         conn.close()
@@ -1428,8 +1438,18 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         account_id = self.seed_account()
         conn = server.db_conn()
         conn.execute(
-            "UPDATE accounts SET model_info_json=?, video_info_json=? WHERE id=?",
-            (json.dumps(self.sample_image_info()), json.dumps(self.sample_video_info()), account_id),
+            """
+            UPDATE accounts
+            SET model_info_json=?, video_info_json=?, rest_point=1000,
+                daily_point=0, bonus_point=1000, balance_updated_at=?
+            WHERE id=?
+            """,
+            (
+                json.dumps(self.sample_image_info()),
+                json.dumps(self.sample_video_info()),
+                time.time(),
+                account_id,
+            ),
         )
         conn.commit()
         conn.close()
