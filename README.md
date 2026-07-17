@@ -16,7 +16,9 @@
 - 已完成 Phase 1 任务中心：`/v1/generate` 默认异步排队，支持任务详情、重试、取消和重新水合
 - 后台支持独立修改管理员账号密码，修改后强制重新登录
 - 已补充 SSE 事件解析、上游错误分类、账号健康分类和历史消息资源 URL 抽取
-- 自动注册（YYDS 邮箱）链路尚未完成
+- 已打通自动注册（YYDS 邮箱）：批量注册、并发控制、域名成功率排序、管理台实时事件流；邮箱本地名与域名会做轻量多样化以降特征
+- 高级视频场景 `reference` / `frame_based` / `motion` 默认关闭，需人工批准耗点后单独验收
+- 生产推荐按需启用 `oreate.browser_worker_enabled`（默认关闭）；依赖真实浏览器生成时需配置 Node 模块路径与 Chromium
 
 ## 文件
 - `server.py` — FastAPI 服务，SQLite 持久化，管理页 `/admin`
@@ -341,9 +343,10 @@ Content-Type: multipart/form-data
 ```
 
 ## 当前缺口
-- 自动注册：待补 `/passport/api/emailsignupin` + YYDS 收信 + `/passport/api/emailregisterconfirm`
 - 上传类视频高级场景回归：文本转视频和上传图生视频 `text_or_image` 已用真实账号验证成功；`reference`、`frame_based`、`motion` 仍需要单独低成本实测
 - 号池维护：支持批量积分检查、低成本真实图片生成探针、失效账号隔离和健康账号自动补充；遇到 `212361` 会立即停止批量探测并保留账号，避免把网关环境问题误判为账号问题；新注册账号通过真实生成验证后才会进入可调度号池
+- 每日签到 / 上游积分补给 API 尚未闭环；容量估算里的日增积分目前是配置假设
+- 网关结果：已支持任务排队、重试、取消与重新水合；可观测性仍以 `/healthz` `/readyz` 与 JSON `/metrics` 为主，尚未接 Prometheus
 
 生产环境推荐在 `oreate` 配置中启用真实浏览器生成工作节点：
 
@@ -372,9 +375,9 @@ sudo bash scripts/deploy_release.sh /tmp/oreateai-<revision>.tar.gz <revision>
 上一版本。
 
 工作节点依赖 `puppeteer-core`，账号 Cookie 通过子进程标准输入传递，不会出现在进程命令行中。
-- 网关结果：已支持同步解析 SSE 和历史消息资源 URL，后续可补异步任务轮询、失败任务重试/取消
 
 ## 下一步
-1. 先补自动注册链路
+1. 明确生产环境是否启用 browser worker，并把依赖路径写进部署清单
 2. 低成本实测上传类视频高级场景：`reference`、`frame_based`、`motion`
-3. 补异步任务轮询、失败任务重试/取消和号池自动维护
+3. 继续拆分 `server.py`（注册 / 号池 / Admin HTML / 任务 worker）
+4. 评估每日签到补给与更标准的指标导出

@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import struct
 import subprocess
@@ -741,6 +742,38 @@ class GatewayHardeningTests(unittest.TestCase):
         ranked = server.rank_mail_domains(["bad.test", "good.test", "new.test"])
         self.assertEqual(ranked[0], "good.test")
         self.assertEqual(ranked[-1], "bad.test")
+
+    def test_generate_mailbox_local_part_looks_human_and_avoids_bot_prefix(self):
+        samples = [server.generate_mailbox_local_part() for _ in range(80)]
+        self.assertEqual(len(set(samples)), len(samples))
+        for local in samples:
+            self.assertRegex(local, r"^[a-z0-9](?:[a-z0-9._-]{3,28}[a-z0-9])?$")
+            self.assertFalse(re.match(r"^(create|oreate|probe|test)-", local))
+            self.assertNotRegex(local, r"^[0-9a-f]{8}$")
+        # Expect more than one structural family across a batch.
+        has_separator = any(("." in item or "_" in item) for item in samples)
+        has_digits = any(re.search(r"\d", item) for item in samples)
+        self.assertTrue(has_separator)
+        self.assertTrue(has_digits)
+
+    def test_soft_order_mail_domains_rotates_among_top_candidates(self):
+        ranked = [f"d{i}.test" for i in range(6)]
+        firsts = {server.soft_order_mail_domains(ranked)[0] for _ in range(80)}
+        self.assertGreaterEqual(len(firsts), 3)
+        for domain in firsts:
+            self.assertIn(domain, ranked[:6])
+
+    def test_generate_registration_password_is_varied_and_complex(self):
+        samples = [server.generate_registration_password() for _ in range(40)]
+        self.assertGreaterEqual(len(set(samples)), 35)
+        for password in samples:
+            self.assertGreaterEqual(len(password), 8)
+            self.assertLessEqual(len(password), 16)
+            self.assertRegex(password, r"[A-Z]")
+            self.assertRegex(password, r"[a-z]")
+            self.assertRegex(password, r"\d")
+            self.assertRegex(password, r"[@#!$%]")
+            self.assertFalse(password.startswith("Aa1@"))
 
     def test_auto_register_accounts_respects_registration_concurrency(self):
         original_cfg = server.CFG

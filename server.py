@@ -2984,7 +2984,7 @@ class YydsClient:
         return out
 
     def probe_domain(self, domain: str) -> Dict[str, Any]:
-        local_part = f"probe-{secrets.token_hex(3)}"
+        local_part = f"probe{secrets.token_hex(3)}"
         payload = {"localPart": local_part, "domain": domain}
         r = requests.post(f"{self.base}/accounts", json=payload, headers=self.headers(), timeout=30)
         try:
@@ -2998,10 +2998,12 @@ class YydsClient:
         domains = CFG["mail"].get("preferred_domains") or self.list_domains()
         if not domains:
             raise RuntimeError("No YYDS domains available")
-        domains = rank_mail_domains([str(item) for item in domains if str(item or "").strip()])
+        domains = soft_order_mail_domains(
+            rank_mail_domains([str(item) for item in domains if str(item or "").strip()])
+        )
         errors = []
         for domain in domains:
-            local_part = f"oreate-{secrets.token_hex(4)}"
+            local_part = generate_mailbox_local_part()
             payload = {"localPart": local_part, "domain": domain}
             r = requests.post(f"{self.base}/accounts", json=payload, headers=self.headers(), timeout=30)
             try:
@@ -5934,6 +5936,125 @@ def rank_mail_domains(domains: List[str]) -> List[str]:
         return sorted(unique, key=sort_key)
 
 
+def soft_order_mail_domains(ranked: List[str]) -> List[str]:
+    """Keep success ranking, but avoid always locking onto the #1 domain."""
+    if len(ranked) <= 1:
+        return list(ranked)
+    top_k = min(6, len(ranked))
+    weights = [max(1, (top_k - index) ** 2) for index in range(top_k)]
+    total = sum(weights)
+    pick = secrets.randbelow(total)
+    running = 0
+    chosen_index = 0
+    for index, weight in enumerate(weights):
+        running += weight
+        if pick < running:
+            chosen_index = index
+            break
+    chosen = ranked[chosen_index]
+    rest = [domain for index, domain in enumerate(ranked) if index != chosen_index]
+    return [chosen] + rest
+
+
+_MAIL_FIRST_NAMES = (
+    "alex", "aria", "blake", "cara", "dean", "ella", "finn", "gina", "hugo", "iris",
+    "jade", "kyle", "lena", "mira", "noah", "owen", "paige", "quin", "reed", "skye",
+    "theo", "uma", "vera", "wade", "yuki", "zane", "amy", "ben", "chris", "diana",
+    "ethan", "faye", "grace", "hank", "ivan", "jess", "kai", "lucy", "mark", "nina",
+    "omar", "ruby", "sam", "tara", "vince", "will", "zoe", "alan", "bella", "cole",
+)
+_MAIL_LAST_NAMES = (
+    "baker", "brooks", "chen", "clark", "cross", "davis", "ford", "grant", "hayes", "kim",
+    "lane", "lee", "moss", "nash", "park", "reed", "shaw", "stone", "west", "young",
+    "allen", "bell", "cole", "dunn", "fox", "gray", "hart", "owen", "page", "ward",
+    "casey", "drake", "ellis", "frost", "green", "hill", "james", "knox", "long", "mills",
+)
+_MAIL_WORDS = (
+    "amber", "cedar", "cloud", "coral", "ember", "frost", "grove", "harbor", "ivory", "jazz",
+    "lotus", "maple", "north", "orbit", "pearl", "quilt", "river", "sable", "tide", "violet",
+    "willow", "zenith", "pixel", "nova", "spark", "leaf", "pine", "dawn", "dusk", "mint",
+    "oasis", "ridge", "sonic", "trail", "urban", "vivid", "wave", "yarn", "bloom", "canyon",
+)
+_MAIL_SYLLABLES = (
+    "ba", "be", "bo", "ca", "ce", "co", "da", "de", "di", "fa", "fi", "ga", "go", "ha", "he",
+    "ja", "jo", "ka", "ki", "la", "li", "lo", "ma", "me", "mi", "mo", "na", "ne", "ni", "pa",
+    "pe", "po", "ra", "re", "ri", "ro", "sa", "se", "si", "so", "ta", "te", "ti", "to", "va",
+    "ve", "vi", "wa", "ya", "za",
+)
+
+
+def _mail_digit_tail(min_len: int = 2, max_len: int = 4) -> str:
+    length = secrets.choice(list(range(min_len, max_len + 1)))
+    return "".join(str(secrets.randbelow(10)) for _ in range(length))
+
+
+def generate_mailbox_local_part() -> str:
+    """Human-looking local parts with light structure, without fixed bot prefixes."""
+    digits = _mail_digit_tail()
+    roll = secrets.randbelow(100)
+    if roll < 30:
+        first = secrets.choice(_MAIL_FIRST_NAMES)
+        last = secrets.choice(_MAIL_LAST_NAMES)
+        sep = secrets.choice([".", "_", ""])
+        local = f"{first}{sep}{last}"
+        if secrets.randbelow(100) < 70:
+            local = f"{local}{digits}"
+    elif roll < 55:
+        word = secrets.choice(_MAIL_WORDS)
+        if secrets.randbelow(100) < 45:
+            local = f"{secrets.choice(_MAIL_FIRST_NAMES)}{secrets.choice(['.', '_', ''])}{word}"
+            if secrets.randbelow(100) < 60:
+                local = f"{local}{digits}"
+        else:
+            local = f"{word}{digits}"
+    elif roll < 72:
+        first = secrets.choice(_MAIL_FIRST_NAMES)
+        year = str(secrets.choice(range(1988, 2006)))
+        local = f"{first}{secrets.choice(['', '.', '_'])}{year if secrets.randbelow(100) < 55 else digits}"
+    elif roll < 88:
+        initials = f"{secrets.choice(_MAIL_FIRST_NAMES)[0]}{secrets.choice(_MAIL_LAST_NAMES)[0]}"
+        word = secrets.choice(_MAIL_WORDS)
+        sep = secrets.choice([".", "_", ""])
+        local = f"{initials}{sep}{word}{digits}"
+    else:
+        count = secrets.choice([3, 4, 5])
+        local = "".join(secrets.choice(_MAIL_SYLLABLES) for _ in range(count))
+        if secrets.randbelow(100) < 75:
+            local = f"{local}{digits}"
+
+    local = re.sub(r"[^a-z0-9._-]", "", str(local).lower())
+    local = re.sub(r"[._-]{2,}", ".", local).strip("._-")
+    if len(local) < 5:
+        local = f"{secrets.choice(_MAIL_WORDS)}{_mail_digit_tail()}"
+    if len(local) > 30:
+        local = local[:30].rstrip("._-")
+    if re.match(r"^(create|oreate|probe|test|tmp|mail)([._-]|$)", local):
+        local = f"{secrets.choice(_MAIL_FIRST_NAMES)}{secrets.choice(['.', '_', ''])}{secrets.choice(_MAIL_WORDS)}{digits}"
+        local = re.sub(r"[._-]{2,}", ".", local).strip("._-")
+    return local
+
+
+def generate_registration_password() -> str:
+    """Varied passwords that still satisfy common complexity checks."""
+    upper = secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ")
+    lowers = "abcdefghijkmnopqrstuvwxyz"
+    special = secrets.choice("@#!$%")
+    lower_body = "".join(secrets.choice(lowers) for _ in range(secrets.choice([4, 5, 6])))
+    digits = "".join(str(secrets.randbelow(10)) for _ in range(secrets.choice([2, 3, 4])))
+    patterns = (
+        f"{upper}{lower_body}{special}{digits}",
+        f"{lower_body}{upper}{digits}{special}",
+        f"{upper}{special}{lower_body}{digits}",
+        f"{lower_body}{digits}{special}{upper}{secrets.choice(lowers)}",
+        f"{secrets.choice(lowers)}{upper}{lower_body[:3]}{special}{digits}",
+    )
+    password = secrets.choice(patterns)
+    # Keep a predictable minimum shape if a pattern somehow collapses.
+    if not re.search(r"[A-Z]", password) or not re.search(r"[a-z]", password) or not re.search(r"\d", password) or not re.search(r"[@#!$%]", password):
+        password = f"{upper}{lower_body}{special}{digits}"
+    return password[:16]
+
+
 def register_one_account(
     progress: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, Any]:
@@ -5945,7 +6066,7 @@ def register_one_account(
     mailbox = MAIL.create_mailbox()
     email = mailbox["address"]
     token = mailbox["token"]
-    password = "Aa1@" + secrets.token_hex(6)[:8]
+    password = generate_registration_password()
     trace = []
     trace.append({"step": "create_mailbox", "email": email, "domain": mailbox.get("domain"), "mailbox_id": mailbox.get("mailbox_id")})
     report("signup_attempt", email)
@@ -10660,15 +10781,43 @@ ADMIN_HTML = """<!doctype html>
 <title>OreateAI Gateway</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f5f5f7;color:#1d1d1f;padding:0}
+body{font-family:'Segoe UI Variable','Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei UI',sans-serif;background:#f5f5f7;color:#1d1d1f;padding:0;min-height:100vh}
+body.login-mode{overflow:hidden;background:#0f1419}
 .nav{background:#fff;border-bottom:1px solid #e5e5e5;padding:16px 32px;display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100;animation:slideDown .5s cubic-bezier(.22,1,.36,1)}
 .nav h1{font-size:18px;font-weight:600;letter-spacing:-.3px}
 .nav a{color:#1d1d1f;text-decoration:none;font-size:14px;padding:6px 16px;border-radius:8px;transition:.2s;cursor:pointer}
 .nav a:hover{background:#f0f0f0}
 .nav .badge{background:#1d1d1f;color:#fff;font-size:11px;padding:2px 8px;border-radius:12px;margin-left:4px}
-.container{max-width:1200px;margin:0 auto;padding:24px 32px}
-.login-panel{max-width:420px;margin:80px auto 0}
-.login-error{color:#c62828;font-size:12px;margin-top:8px;min-height:16px}
+.container{max-width:1680px;margin:0 auto;padding:24px 32px;width:100%}
+.login-screen{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;padding:24px;overflow:auto;
+  background:
+    radial-gradient(ellipse 80% 60% at 18% 12%,rgba(56,189,168,.22),transparent 55%),
+    radial-gradient(ellipse 70% 50% at 88% 82%,rgba(90,140,200,.18),transparent 50%),
+    linear-gradient(160deg,#0f1419 0%,#1a2330 48%,#121820 100%);
+  animation:loginFade .55s cubic-bezier(.22,1,.36,1)}
+.login-screen::before{content:'';position:absolute;inset:0;pointer-events:none;opacity:.35;
+  background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);
+  background-size:48px 48px;mask-image:radial-gradient(ellipse 70% 60% at 50% 45%,#000 20%,transparent 75%)}
+.login-card{position:relative;width:min(400px,100%);padding:40px 36px 32px;border-radius:20px;
+  background:rgba(255,255,255,.94);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  border:1px solid rgba(255,255,255,.55);box-shadow:0 28px 64px rgba(0,0,0,.28),0 2px 8px rgba(0,0,0,.08);
+  animation:loginRise .6s cubic-bezier(.22,1,.36,1)}
+.login-brand{font-size:28px;font-weight:700;letter-spacing:-.6px;line-height:1.15;color:#0f1419}
+.login-tagline{margin-top:8px;margin-bottom:28px;font-size:13px;color:#6e6e73;line-height:1.5}
+.login-field{margin-top:14px}
+.login-field:first-of-type{margin-top:0}
+.login-field label{display:block;font-size:12px;font-weight:500;color:#6e6e73;margin-bottom:6px}
+.login-field input{width:100%;font-size:14px;padding:12px 14px;border:1px solid #d8d8dd;border-radius:12px;background:#fafafa;outline:none;transition:border-color .2s,box-shadow .2s,background .2s}
+.login-field input:focus{border-color:#1d1d1f;background:#fff;box-shadow:0 0 0 3px rgba(15,20,25,.08)}
+.login-actions{margin-top:22px}
+.login-actions .btn-primary{width:100%;padding:12px 20px;border-radius:12px;font-size:15px;letter-spacing:.2px}
+.login-error{color:#c62828;font-size:12px;margin-top:12px;min-height:16px;text-align:center}
+@keyframes loginFade{from{opacity:0}to{opacity:1}}
+@keyframes loginRise{from{opacity:0;transform:translateY(18px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
+@media(max-width:480px){
+  .login-card{padding:32px 22px 26px;border-radius:16px}
+  .login-brand{font-size:24px}
+}
 .section{background:#fff;border-radius:16px;padding:24px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,.04);animation:fadeUp .6s cubic-bezier(.22,1,.36,1)}
 .section h2{font-size:15px;font-weight:600;margin-bottom:16px;display:flex;align-items:center;gap:8px}
 .row{display:flex;gap:12px;flex-wrap:wrap;align-items:end}
@@ -10685,11 +10834,17 @@ button:active{transform:scale(.96)}
 .btn-sm{padding:6px 14px;font-size:12px;border-radius:8px}
 .table-wrap{overflow-x:auto;border-radius:10px;border:1px solid #e5e5e5}
 table{width:100%;border-collapse:collapse;font-size:13px}
+.accounts-table{min-width:1480px}
 th{background:#f5f5f7;padding:10px 12px;text-align:left;font-weight:500;border-bottom:1px solid #e5e5e5;white-space:nowrap}
 td{padding:10px 12px;border-bottom:1px solid #f0f0f0;vertical-align:middle}
+.accounts-table td{white-space:nowrap}
+.accounts-table td.email-cell{max-width:260px;overflow:hidden;text-overflow:ellipsis}
+.accounts-table td.password-cell,.accounts-table td.health-cell{white-space:normal}
+.accounts-table td.actions-cell{white-space:nowrap}
+.row-actions{display:inline-flex;gap:6px;align-items:center;flex-wrap:nowrap}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:#fafafa}
-.tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:6px;font-weight:500}
+.tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:6px;font-weight:500;white-space:nowrap}
 .tag-green{background:#e8f5e9;color:#2e7d32}
 .tag-red{background:#ffebee;color:#c62828}
 .tag-gray{background:#f5f5f5;color:#616161}
@@ -10839,12 +10994,17 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
 </head>
 <body>
 
-<div id="login-panel" class="section login-panel hidden">
-  <h2>管理员登录</h2>
-  <div style="margin-top:12px"><label>用户名</label><input id="login-user" autocomplete="username" value="admin"></div>
-  <div style="margin-top:12px"><label>密码</label><input id="login-pass" type="password" autocomplete="current-password"></div>
-  <div style="margin-top:16px"><button class="btn-primary" onclick="adminLogin()">登录</button></div>
-  <div id="login-error" class="login-error"></div>
+<div id="login-panel" class="login-screen hidden">
+  <div class="login-card">
+    <div class="login-brand">OreateAI</div>
+    <p class="login-tagline">Gateway 管理控制台</p>
+    <form onsubmit="event.preventDefault();adminLogin()">
+      <div class="login-field"><label for="login-user">用户名</label><input id="login-user" autocomplete="username" value="admin"></div>
+      <div class="login-field"><label for="login-pass">密码</label><input id="login-pass" type="password" autocomplete="current-password"></div>
+      <div class="login-actions"><button type="submit" class="btn-primary">登录</button></div>
+      <div id="login-error" class="login-error" role="alert"></div>
+    </form>
+  </div>
 </div>
 
 <div id="app-shell" class="hidden">
@@ -10903,7 +11063,7 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
     </div>
   </div>
   <div class="table-wrap">
-    <table>
+    <table class="accounts-table">
       <thead><tr>
         <th>ID</th><th>邮箱</th><th>密码</th><th>状态</th><th>健康</th><th>来源</th><th>OUID</th><th>余额 / 可用</th><th>活动任务预留</th><th>储备目标</th><th>更新时间</th><th>创建时间</th><th>操作</th>
       </tr></thead>
@@ -11309,11 +11469,13 @@ function authHeaders(){
   return headers;
 }
 function showLogin(message=''){
+  document.body.classList.add('login-mode');
   document.getElementById('login-panel').classList.remove('hidden');
   document.getElementById('app-shell').classList.add('hidden');
   document.getElementById('login-error').textContent = message;
 }
 function showApp(){
+  document.body.classList.remove('login-mode');
   document.getElementById('login-panel').classList.add('hidden');
   document.getElementById('app-shell').classList.remove('hidden');
 }
@@ -11874,13 +12036,13 @@ function renderAccounts(){
     const passwordText=!a.has_password?'未保存':passwordVisible?(credential?.password||'读取中…'):'••••••••';
     return `<tr>
       <td>${a.id}</td>
-      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(em)}<button class="copy-btn" data-copy-value="${escapeHtml(em)}" onclick="copyText(this.dataset.copyValue)">📋</button></td>
+      <td class="email-cell" title="${escapeHtml(em)}">${escapeHtml(em)} <button class="copy-btn" data-copy-value="${escapeHtml(em)}" onclick="copyText(this.dataset.copyValue)">📋</button></td>
       <td class="password-cell">
         <div class="password-value">${escapeHtml(passwordText)}</div>
         ${a.has_password?`<div class="password-actions"><button class="copy-btn" onclick="toggleAccountPassword(${a.id})">${passwordVisible?'隐藏密码':'查看密码'}</button><button class="copy-btn" onclick="copyAccountPassword(${a.id})">复制密码</button></div>`:''}
       </td>
       <td><span class="tag ${sc}">${escapeHtml(adminLabel('accountStatus',a.status))}</span></td>
-      <td><span class="tag ${hc}">${escapeHtml(adminLabel('healthStatus',a.health_status))}</span><div style="font-size:11px;color:#86868b">${escapeHtml(healthMeta)}</div></td>
+      <td class="health-cell"><span class="tag ${hc}">${escapeHtml(adminLabel('healthStatus',a.health_status))}</span><div style="font-size:11px;color:#86868b;white-space:nowrap">${escapeHtml(healthMeta)}</div></td>
       <td>${escapeHtml(adminLabel('source',a.source))}</td>
       <td style="font-family:monospace;font-size:11px">${escapeHtml(a.ouid_preview||'')}</td>
       <td class="point-value">${restPoint}<small>可用 ${availablePoints}</small></td>
@@ -11893,7 +12055,7 @@ function renderAccounts(){
       </td>
       <td style="font-size:11px">${balanceUpdatedAt}</td>
       <td style="font-size:11px">${new Date((a.created_at||0)*1000).toLocaleString()}</td>
-      <td><button class="btn-sm btn-secondary" onclick="generateWith(${a.id})">生成</button> <button class="btn-sm btn-secondary" onclick="refreshAccountBalance(${a.id})">刷新余额</button></td>
+      <td class="actions-cell"><div class="row-actions"><button class="btn-sm btn-secondary" onclick="generateWith(${a.id})">生成</button><button class="btn-sm btn-secondary" onclick="refreshAccountBalance(${a.id})">刷新余额</button></div></td>
     </tr>`;
   }).join('');
   document.getElementById('pool-count').textContent = state.accounts.filter(a=>a.health_status==='healthy').length;
