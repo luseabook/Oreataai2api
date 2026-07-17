@@ -721,6 +721,16 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertNotIn("alert(job.failed", html)
         self.assertNotIn("alert(`${prefix}", html)
 
+    def test_admin_html_avoids_native_browser_dialogs(self):
+        html = server.ADMIN_HTML
+        self.assertIn("function showConfirm", html)
+        self.assertIn("function showToast", html)
+        self.assertIn("confirm-backdrop", html)
+        self.assertNotRegex(html, r"(?<![.\w])alert\(")
+        self.assertNotRegex(html, r"(?<![.\w])confirm\(")
+        self.assertIn("await showConfirm(", html)
+        self.assertIn("开始体检", html)
+
     def test_extract_verify_code_matches_standalone_six_digit_codes(self):
         code = server.MAIL.extract_verify_code(
             {
@@ -5083,12 +5093,12 @@ async function api(method, path, body) {{
   return {{ok: true}};
 }}
 async function loadApiKeys() {{}}
-const alerts = [];
-function alert(message) {{ alerts.push(message); }}
+const toasts = [];
+function showToast(message) {{ toasts.push(message); }}
 {update_source}
 (async () => {{
   await updateApiKeyPolicy(9, editorBody);
-  if (alerts.length) throw new Error(`unexpected alert: ${{alerts.join(' | ')}}`);
+  if (toasts.length) throw new Error(`unexpected toast: ${{toasts.join(' | ')}}`);
   const expected = {{rate_limit_per_minute: null, daily_request_limit: 0, daily_point_limit: 17}};
   for (const [field, value] of Object.entries(expected)) {{
     if (capturedBody?.[field] !== value) {{
@@ -5101,11 +5111,11 @@ function alert(message) {{ alerts.push(message); }}
   loadApiKeys = async () => {{ throw new Error('refresh boom'); }};
   await updateApiKeyPolicy(9, editorBody);
   if (patchCalls !== 2) throw new Error(`expected two successful PATCH calls, got ${{patchCalls}}`);
-  if (alerts.length !== 1 || !alerts[0].includes('已保存但刷新失败')) {{
-    throw new Error(`refresh failure alert was misleading: ${{alerts.join(' | ')}}`);
+  if (toasts.length !== 1 || !toasts[0].includes('已保存但刷新失败')) {{
+    throw new Error(`refresh failure toast was misleading: ${{toasts.join(' | ')}}`);
   }}
-  if (alerts[0].includes('保存失败：')) {{
-    throw new Error(`refresh failure was reported as save failure: ${{alerts[0]}}`);
+  if (toasts[0].includes('保存失败：')) {{
+    throw new Error(`refresh failure was reported as save failure: ${{toasts[0]}}`);
   }}
 }})().catch(error => {{
   console.error(error);
@@ -5208,7 +5218,7 @@ for (const [index, [status, expected]] of Object.entries(Object.entries(expectat
 }}
 let apiCalls = 0;
 let refreshCalls = 0;
-const alerts = [];
+const toasts = [];
 let confirmResult = false;
 async function api(method, path) {{
   apiCalls += 1;
@@ -5220,11 +5230,11 @@ async function loadTasks() {{
   throw new Error('refresh boom');
 }}
 function renderTaskPreview() {{}}
-function confirm(message) {{
+async function showConfirm(message) {{
   if (message !== '确认取消任务 #42？') throw new Error(`unexpected confirmation: ${{message}}`);
   return confirmResult;
 }}
-function alert(message) {{ alerts.push(String(message)); }}
+function showToast(message) {{ toasts.push(String(message)); }}
 {action_source}
 (async () => {{
   await cancelTask(42);
@@ -5233,18 +5243,18 @@ function alert(message) {{ alerts.push(String(message)); }}
   await cancelTask(42);
   if (apiCalls !== 1) throw new Error(`expected one cancel API call, got ${{apiCalls}}`);
   if (refreshCalls !== 1) throw new Error(`expected one refresh, got ${{refreshCalls}}`);
-  if (alerts.length !== 1 || !alerts[0].includes('取消成功，但列表刷新失败')) {{
-    throw new Error(`refresh failure message was not action-specific: ${{alerts.join(' | ')}}`);
+  if (toasts.length !== 1 || !toasts[0].includes('取消成功，但列表刷新失败')) {{
+    throw new Error(`refresh failure message was not action-specific: ${{toasts.join(' | ')}}`);
   }}
-  if (alerts[0].includes('取消失败')) {{
-    throw new Error(`refresh failure was reported as action failure: ${{alerts[0]}}`);
+  if (toasts[0].includes('取消失败')) {{
+    throw new Error(`refresh failure was reported as action failure: ${{toasts[0]}}`);
   }}
   api = async () => {{
     throw new Error('TASK_NOT_CANCELLABLE: only active tasks can be cancelled');
   }};
   await cancelTask(42);
-  if (alerts.length !== 2 || !alerts[1].includes('TASK_NOT_CANCELLABLE')) {{
-    throw new Error(`Gateway envelope error was not readable: ${{alerts.join(' | ')}}`);
+  if (toasts.length !== 2 || !toasts[1].includes('TASK_NOT_CANCELLABLE')) {{
+    throw new Error(`Gateway envelope error was not readable: ${{toasts.join(' | ')}}`);
   }}
 }})().catch(error => {{
   console.error(error);

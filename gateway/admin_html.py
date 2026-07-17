@@ -188,6 +188,10 @@ tr:hover td{background:#fafafa}
 .toast.ok{background:#2e7d32}
 .toast.warn{background:#8d6e00}
 .toast.err{background:#c62828}
+.confirm-backdrop{position:fixed;inset:0;z-index:1100;background:rgba(15,20,25,.42);display:flex;align-items:center;justify-content:center;padding:20px;animation:loginFade .18s ease}
+.confirm-dialog{width:min(420px,100%);background:#fff;border-radius:16px;padding:22px 22px 18px;border:1px solid #e5e5e5;box-shadow:0 18px 48px rgba(0,0,0,.18);animation:loginRise .22s cubic-bezier(.22,1,.36,1)}
+.confirm-message{font-size:14px;line-height:1.65;color:#1d1d1f;margin:0 0 18px;white-space:pre-wrap}
+.confirm-actions{display:flex;justify-content:flex-end;gap:8px}
 .password-cell{min-width:190px}
 .password-value{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;word-break:break-all}
 .password-actions{display:flex;gap:5px;margin-top:6px}
@@ -752,8 +756,8 @@ async function downloadBackup(){
 async function restoreBackup(){
   const input=document.getElementById('restore-file');
   const file=input?.files?.[0];
-  if(!file){ alert('请选择备份文件'); return; }
-  if(!confirm('确认恢复备份？当前数据库和配置将被替换。')) return;
+  if(!file){ showToast('请选择备份文件','warn'); return; }
+  if(!(await showConfirm('确认恢复备份？当前数据库和配置将被替换。',{confirmText:'确认恢复',danger:true}))) return;
   const form=new FormData();
   form.append('confirm', 'true');
   form.append('file', file);
@@ -764,7 +768,7 @@ async function restoreBackup(){
   });
   const data=await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(data.detail || 'restore failed');
-  alert('恢复完成，请重新登录');
+  showToast('恢复完成，请重新登录','ok');
   adminToken='';
   localStorage.removeItem('oreate_admin_token');
   showLogin('恢复完成，请重新登录');
@@ -1291,7 +1295,7 @@ async function saveReserveTarget(accountId){
   const input=document.getElementById(`reserve-target-${accountId}`);
   const reserveTarget=Number(input?.value);
   if(!Number.isInteger(reserveTarget) || reserveTarget<0){
-    alert('储备目标必须是大于或等于 0 的整数');
+    showToast('储备目标必须是大于或等于 0 的整数','warn');
     return;
   }
   const status=document.getElementById('status-text');
@@ -1302,7 +1306,7 @@ async function saveReserveTarget(accountId){
     if(status) status.textContent=`账号 #${accountId} 储备目标已更新`;
   }catch(error){
     if(status) status.textContent='储备目标保存失败';
-    alert(`储备目标保存失败：${error?.message || String(error)}`);
+    showToast(`储备目标保存失败：${error?.message || String(error)}`,'err');
   }
 }
 async function loadAccountCredentials(accountId){
@@ -1317,7 +1321,7 @@ async function toggleAccountPassword(accountId){
     state.revealedAccountPasswords[accountId]=!state.revealedAccountPasswords[accountId];
     renderAccounts();
   }catch(error){
-    alert(`读取密码失败：${error?.message || String(error)}`);
+    showToast(`读取密码失败：${error?.message || String(error)}`,'err');
   }
 }
 async function copyAccountPassword(accountId){
@@ -1325,7 +1329,7 @@ async function copyAccountPassword(accountId){
     const credentials=await loadAccountCredentials(accountId);
     await copyText(credentials.password || '');
   }catch(error){
-    alert(`复制密码失败：${error?.message || String(error)}`);
+    showToast(`复制密码失败：${error?.message || String(error)}`,'err');
   }
 }
 function showToast(message, level='ok'){
@@ -1336,6 +1340,42 @@ function showToast(message, level='ok'){
   el.textContent=String(message||'');
   host.appendChild(el);
   setTimeout(()=>{el.remove();},4200);
+}
+function showConfirm(message, options={}){
+  const confirmText=options.confirmText || '确定';
+  const cancelText=options.cancelText || '取消';
+  const danger=Boolean(options.danger);
+  return new Promise((resolve)=>{
+    document.getElementById('confirm-backdrop')?.remove();
+    const backdrop=document.createElement('div');
+    backdrop.id='confirm-backdrop';
+    backdrop.className='confirm-backdrop';
+    backdrop.innerHTML='<div class="confirm-dialog" role="dialog" aria-modal="true"><p class="confirm-message"></p><div class="confirm-actions"><button type="button" class="btn-secondary confirm-cancel"></button><button type="button" class="confirm-ok"></button></div></div>';
+    backdrop.querySelector('.confirm-message').textContent=String(message||'');
+    const cancelBtn=backdrop.querySelector('.confirm-cancel');
+    const okBtn=backdrop.querySelector('.confirm-ok');
+    cancelBtn.textContent=cancelText;
+    okBtn.textContent=confirmText;
+    okBtn.className=(danger?'btn-danger':'btn-primary')+' confirm-ok';
+    let settled=false;
+    const onKey=(event)=>{
+      if(event.key==='Escape') finish(false);
+      if(event.key==='Enter') finish(true);
+    };
+    const finish=(value)=>{
+      if(settled) return;
+      settled=true;
+      document.removeEventListener('keydown', onKey);
+      backdrop.remove();
+      resolve(value);
+    };
+    cancelBtn.onclick=()=>finish(false);
+    okBtn.onclick=()=>finish(true);
+    backdrop.addEventListener('click',(event)=>{ if(event.target===backdrop) finish(false); });
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(backdrop);
+    okBtn.focus();
+  });
 }
 function showResultBanner(panelId, message, level='ok', onViewFailures=null){
   const panel=document.getElementById(panelId);
@@ -1663,7 +1703,7 @@ async function maintainPool(){
     showToast('已有号池维护任务正在执行','warn');
     return null;
   }
-  if(!confirm('将批量检测全部账号，并为每个候选账号发起一次低成本图片生成验证；风险和失效账号会被隔离，再按健康账号缺口自动补号。检测会消耗少量积分，是否继续？')) return null;
+  if(!(await showConfirm('将批量检测全部账号，并为每个候选账号发起一次低成本图片生成验证；风险和失效账号会被隔离，再按健康账号缺口自动补号。检测会消耗少量积分，是否继续？',{confirmText:'开始体检'}))) return null;
   const configuredTarget=Number(state.settings?.pool?.maintain_target);
   const target=Number.isSafeInteger(configuredTarget)&&configuredTarget>0?configuredTarget:5;
   const requestedMax=Number(document.getElementById('reg_count').value||1);
@@ -1691,7 +1731,7 @@ async function maintainPool(){
   }
 }
 function toggleImport(){document.getElementById('import-area').classList.toggle('hidden');}
-async function doImport(){const r=await api('POST','/api/accounts/import',{email:document.getElementById('imp-email').value,password:document.getElementById('imp-pwd').value});await loadAccounts();alert(r.ok?'✅ 导入成功':'❌ 失败');}
+async function doImport(){const r=await api('POST','/api/accounts/import',{email:document.getElementById('imp-email').value,password:document.getElementById('imp-pwd').value});await loadAccounts();showToast(r.ok?'导入成功':'导入失败', r.ok?'ok':'err');}
 function generateWith(aid){switchTab('generate');document.getElementById('g-account').value=aid;}
 async function refreshAccountBalance(aid){await api('POST',`/api/accounts/${aid}/refresh-balance`);await loadAccounts();}
 
@@ -1722,10 +1762,10 @@ async function refreshCapabilities(){
     const videoCount=capabilityModels('video').length;
     if(status) status.textContent=`账号 ${r.source_account_id || '-'} · 图片模型 ${imageCount} · 视频模型 ${videoCount}`;
     applyGenerateOptions();
-    alert('已刷新模型能力');
+    showToast('已刷新模型能力','ok');
   } catch(e) {
     if(status) status.textContent='刷新失败：' + e.message;
-    alert('刷新失败：' + e.message);
+    showToast('刷新失败：' + e.message,'err');
   }
 }
 function selectedModel(kind){
@@ -2040,7 +2080,7 @@ async function downloadCleanTaskAsset(taskId,assetIndex,button=null){
     link.remove();
     setTimeout(()=>URL.revokeObjectURL(blobUrl),0);
   }catch(error){
-    alert(`下载无水印图片失败：${error?.message || String(error)}`);
+    showToast(`下载无水印图片失败：${error?.message || String(error)}`,'err');
   }finally{
     if(button){
       button.disabled=false;
@@ -2125,14 +2165,14 @@ async function runTaskAction(id, action, label){
   try{
     result=await api('POST',`/api/tasks/${id}/${action}`);
   }catch(error){
-    alert(`❌ 任务 #${id} ${label}失败：${error?.message || String(error)}`);
+    showToast(`任务 #${id} ${label}失败：${error?.message || String(error)}`,'err');
     return null;
   }
   renderTaskPreview(result.task);
   try{
     await loadTasks();
   }catch(error){
-    alert(`⚠️ 任务 #${id} ${label}成功，但列表刷新失败：${error?.message || String(error)}`);
+    showToast(`任务 #${id} ${label}成功，但列表刷新失败：${error?.message || String(error)}`,'warn');
   }
   return result.task;
 }
@@ -2140,7 +2180,7 @@ async function retryTask(id){
   return runTaskAction(id,'retry','重试');
 }
 async function cancelTask(id){
-  if(!confirm(`确认取消任务 #${id}？`)) return null;
+  if(!(await showConfirm(`确认取消任务 #${id}？`,{confirmText:'确认取消',danger:true}))) return null;
   return runTaskAction(id,'cancel','取消');
 }
 async function hydrateTask(id){
@@ -2255,7 +2295,7 @@ function setApiKeyEditorChecked(id,value){
 }
 function openApiKeyEditor(id=null){
   const key=id===null?null:(state.apikeys||[]).find(item=>Number(item.id)===Number(id));
-  if(id!==null && !key){alert('未找到此 Key，请刷新后重试');return;}
+  if(id!==null && !key){showToast('未找到此 Key，请刷新后重试','warn');return;}
   apiKeyEditorId=key?Number(key.id):null;
   document.getElementById('apikey-editor-title').textContent=key?'编辑客户 Key':'创建客户 Key';
   document.getElementById('apikey-editor-subtitle').textContent=key?'修改额度、权限和启用状态。':'创建后即可复制完整 Key。';
@@ -2325,13 +2365,13 @@ async function updateApiKeyPolicy(id,bodyOverride=null){
   try{
     await api('PATCH','/api/admin/apikeys/'+id,body);
   }catch(error){
-    alert('保存失败：'+(error?.message || String(error)));
+    showToast('保存失败：'+(error?.message || String(error)),'err');
     return null;
   }
   try{
     await loadApiKeys();
   }catch(error){
-    alert('已保存但刷新失败：'+(error?.message || String(error)));
+    showToast('已保存但刷新失败：'+(error?.message || String(error)),'warn');
   }
   return true;
 }
@@ -2346,7 +2386,7 @@ async function saveApiKeyEditor(){
       if(saved) closeApiKeyEditor();
     }
   }catch(error){
-    alert('保存失败：'+(error?.message || String(error)));
+    showToast('保存失败：'+(error?.message || String(error)),'err');
     saveButton.disabled=false;
   }
 }
@@ -2354,24 +2394,24 @@ async function copyApiKey(id){
   try{
     const result=await api('GET',`/api/admin/apikeys/${id}/secret`);
     await copyText(result.key);
-    alert('完整 Key 已复制');
+    showToast('完整 Key 已复制','ok');
   }catch(error){
-    alert('复制失败：'+(error?.message || String(error)));
+    showToast('复制失败：'+(error?.message || String(error)),'err');
   }
 }
 async function copyKey(){
   const value=document.getElementById('ak-new-value').textContent;
   if(!value) return;
   await copyText(value);
-  alert('完整 Key 已复制');
+  showToast('完整 Key 已复制','ok');
 }
 async function toggleApiKey(id,enabled){
   const action=enabled?'启用':'停用';
-  if(!confirm(`确认${action}此客户 Key？`)) return;
+  if(!(await showConfirm(`确认${action}此客户 Key？`,{confirmText:'确认'+action,danger:!enabled}))) return;
   const saved=await updateApiKeyPolicy(id,{enabled});
-  if(saved) alert(`已${action}`);
+  if(saved) showToast(`已${action}`,'ok');
 }
-async function deleteKey(id){if(!confirm('确认删除此客户 Key？删除后不可恢复。')) return; await api('DELETE','/api/admin/apikeys/'+id);await loadApiKeys();}
+async function deleteKey(id){if(!(await showConfirm('确认删除此客户 Key？删除后不可恢复。',{confirmText:'确认删除',danger:true}))) return; await api('DELETE','/api/admin/apikeys/'+id);await loadApiKeys(); showToast('已删除客户 Key','ok');}
 
 // === Usage ===
 async function loadUsage(){
@@ -2572,12 +2612,12 @@ async function saveSettings(){
     try{
       await loadSettings();
     }catch(refreshError){
-      alert('⚠️ 已保存但刷新失败'+restartMessage+'：'+(refreshError?.message || String(refreshError)));
+      showToast('已保存但刷新失败'+restartMessage+'：'+(refreshError?.message || String(refreshError)),'warn');
       return;
     }
-    alert('✅ 已保存'+restartMessage);
+    showToast('已保存'+restartMessage,'ok');
   }catch(error){
-    alert('❌ 保存失败：'+(error?.message || String(error)));
+    showToast('保存失败：'+(error?.message || String(error)),'err');
   }
 }
 async function changeCredentials(){
@@ -2588,7 +2628,7 @@ async function changeCredentials(){
     confirm_password:document.getElementById('cred-confirm').value,
   };
   if(!body.current_password || !body.new_username || !body.new_password || !body.confirm_password){
-    alert('请填写当前密码、新用户名、新密码和确认密码');
+    showToast('请填写当前密码、新用户名、新密码和确认密码','warn');
     return;
   }
   const r=await api('POST','/api/admin/credentials',body);
