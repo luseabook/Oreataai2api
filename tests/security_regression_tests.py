@@ -1225,7 +1225,7 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
     def test_admin_html_raw_source_script_parses_in_node(self):
         node = shutil.which("node")
         self.assertIsNotNone(node, "Node.js is required to parse the raw embedded admin script")
-        source = Path(server.__file__).read_text(encoding="utf-8")
+        source = (Path(server.__file__).resolve().parent / "gateway" / "admin_html.py").read_text(encoding="utf-8")
         html_match = re.search(r'ADMIN_HTML\s*=\s*"""(.*?)"""', source, flags=re.DOTALL)
         self.assertIsNotNone(html_match, "ADMIN_HTML source literal was not found")
         raw_html = html_match.group(1)
