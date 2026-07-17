@@ -786,7 +786,8 @@ class GatewayHardeningTests(unittest.TestCase):
             self.assertRegex(password, r"[A-Z]")
             self.assertRegex(password, r"[a-z]")
             self.assertRegex(password, r"\d")
-            self.assertRegex(password, r"[@#!$%]")
+            self.assertIn("@", password)
+            self.assertNotRegex(password, r"[#!$%]")
             self.assertFalse(password.startswith("Aa1@"))
 
     def test_auto_register_accounts_respects_registration_concurrency(self):

@@ -156,22 +156,24 @@ def generate_mailbox_local_part() -> str:
 
 
 def generate_registration_password() -> str:
-    """Varied passwords that still satisfy common complexity checks."""
+    """Varied passwords that stay within Oreate-accepted complexity rules.
+
+    Upstream historically accepts `Upper + lower + digit + @` shapes and rejects
+    broader specials (e.g. #!$%) with status 100002 Invalid parameter.
+    """
     upper = secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ")
     lowers = "abcdefghijkmnopqrstuvwxyz"
-    special = secrets.choice("@#!$%")
     lower_body = "".join(secrets.choice(lowers) for _ in range(secrets.choice([4, 5, 6])))
-    digits = "".join(str(secrets.randbelow(10)) for _ in range(secrets.choice([2, 3, 4])))
+    digits = "".join(str(secrets.randbelow(10)) for _ in range(secrets.choice([3, 4, 5])))
+    # Keep a single accepted special; vary placement/length instead of charset.
     patterns = (
-        f"{upper}{lower_body}{special}{digits}",
-        f"{lower_body}{upper}{digits}{special}",
-        f"{upper}{special}{lower_body}{digits}",
-        f"{lower_body}{digits}{special}{upper}{secrets.choice(lowers)}",
-        f"{secrets.choice(lowers)}{upper}{lower_body[:3]}{special}{digits}",
+        f"{upper}{lower_body}@{digits}",
+        f"{upper}{digits}@{lower_body}",
+        f"{upper}{lower_body[:3]}{digits}@{secrets.choice(lowers)}{secrets.choice(lowers)}",
+        f"{upper}{secrets.choice(lowers)}@{lower_body}{digits}",
     )
     password = secrets.choice(patterns)
-    # Keep a predictable minimum shape if a pattern somehow collapses.
-    if not re.search(r"[A-Z]", password) or not re.search(r"[a-z]", password) or not re.search(r"\d", password) or not re.search(r"[@#!$%]", password):
-        password = f"{upper}{lower_body}{special}{digits}"
+    if not re.search(r"[A-Z]", password) or not re.search(r"[a-z]", password) or not re.search(r"\d", password) or "@" not in password:
+        password = f"{upper}{lower_body}@{digits}"
     return password[:16]
 
