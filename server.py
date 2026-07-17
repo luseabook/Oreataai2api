@@ -77,7 +77,7 @@ API_KEY_SCOPE_BOOL_DEFAULTS = {
     "allow_uploads": True,
     "allow_experimental": True,
 }
-API_LIST_KINDS = {"image", "video", "chat", "upload"}
+API_LIST_KINDS = {"image", "video", "upload"}
 MEDIA_ADMIN_KINDS = {"image", "video"}
 IMAGE_UPLOAD_EXTENSIONS = {"jpg", "jpeg", "png", "bmp", "webp"}
 VIDEO_UPLOAD_EXTENSIONS = {"mp4", "mov"}
@@ -147,12 +147,6 @@ DEFAULT_CONFIG = {
         "valid_threshold_pct": 1.0,
         "maintain_check_interval": 300,
         "generation_probe_prompt": "账号健康检测：请生成白色背景上的一个蓝色圆点",
-    },
-    "chat": {
-        "provider": "openai",
-        "base_url": "https://api.openai.com/v1",
-        "api_key": "",
-        "model": "gpt-3.5-turbo",
     },
     "gateway": {
         "default_rate_limit_per_minute": 60,
@@ -409,8 +403,6 @@ def public_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         out["server"]["encryption_key"] = SECRET_PLACEHOLDER
     if out.get("mail", {}).get("api_key"):
         out["mail"]["api_key"] = SECRET_PLACEHOLDER
-    if out.get("chat", {}).get("api_key"):
-        out["chat"]["api_key"] = SECRET_PLACEHOLDER
     return out
 
 
@@ -424,9 +416,6 @@ def clean_settings_update(data: Dict[str, Any]) -> Dict[str, Any]:
     mail_cfg = out.get("mail")
     if isinstance(mail_cfg, dict) and mail_cfg.get("api_key") in (None, "", SECRET_PLACEHOLDER):
         mail_cfg.pop("api_key", None)
-    chat_cfg = out.get("chat")
-    if isinstance(chat_cfg, dict) and chat_cfg.get("api_key") in (None, "", SECRET_PLACEHOLDER):
-        chat_cfg.pop("api_key", None)
     return out
 
 
@@ -2875,10 +2864,9 @@ class SettingsIn(BaseModel):
     server: Optional[ServerSettingsIn] = None
     oreate: Optional[Dict[str, Any]] = None
     mail: Optional[Dict[str, Any]] = None
-    chat: Optional[Dict[str, Any]] = None
     pool: Optional[PoolSettingsIn] = None
 
-    @field_validator("server", "oreate", "mail", "chat", "pool", mode="before")
+    @field_validator("server", "oreate", "mail", "pool", mode="before")
     @classmethod
     def reject_null_sections(cls, value: Any) -> Any:
         if value is None:
@@ -6847,14 +6835,7 @@ class GatewayAPIError(Exception):
 
 
 def is_openai_compat_path(path: str) -> bool:
-    return (
-        path == "/v1/chat/completions"
-        or path == "/v1/models"
-        or path.startswith("/v1/models/")
-        or path.startswith("/v1/images/")
-        or path == "/v1/videos"
-        or path.startswith("/v1/videos/")
-    )
+    return path == "/v1/models" or path.startswith("/v1/models/") or path.startswith("/v1/images/") or path == "/v1/videos" or path.startswith("/v1/videos/")
 
 
 def openai_error_response(
@@ -9365,32 +9346,7 @@ def gateway_capabilities(api_key_id: int = Depends(require_api_key)):
 def openai_models_for_api_key(api_key_id: int) -> Dict[str, Any]:
     policy = resolve_api_key_policy(get_api_key_record(api_key_id))
     capabilities = load_capabilities_from_pool(policy)
-    result = openai_model_list(capabilities, CFG)
-
-    chat_api_key, chat_base_url, configured_chat_model = chat_provider_settings()
-    allowed_kinds = policy.get("allowed_kinds") or []
-    allowed_models = policy.get("allowed_models") or []
-    chat_visible = (
-        bool(chat_api_key)
-        and chat_provider_url_is_valid(chat_base_url)
-        and "chat" in allowed_kinds
-        and (not allowed_models or configured_chat_model in allowed_models)
-    )
-    if chat_visible:
-        records = result.setdefault("data", [])
-        visible_ids = {str(item.get("id") or "") for item in records if isinstance(item, dict)}
-        for model_id in ("oreate-chat", configured_chat_model):
-            if model_id and model_id not in visible_ids:
-                records.append(
-                    {
-                        "id": model_id,
-                        "object": "model",
-                        "created": 0,
-                        "owned_by": "oreateai-gateway",
-                    }
-                )
-                visible_ids.add(model_id)
-    return result
+    return openai_model_list(capabilities, CFG)
 
 
 @app.get("/v1/models")
@@ -9410,375 +9366,6 @@ def gateway_openai_model_detail(model_id: str, api_key_id: int = Depends(require
         code="model_not_found",
         status_code=404,
     )
-
-
-class ChatCompletionsIn(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    model: Annotated[str, Field(min_length=1, max_length=200)] = "oreate-chat"
-    messages: Annotated[List[Dict[str, Any]], Field(min_length=1, max_length=100)]
-    stream: bool = False
-    temperature: Optional[Annotated[float, Field(ge=0, le=2)]] = None
-    max_tokens: Optional[Annotated[int, Field(strict=True, ge=1)]] = None
-
-    @field_validator("model")
-    @classmethod
-    def normalize_model(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("model must not be blank")
-        return normalized
-
-    @field_validator("messages")
-    @classmethod
-    def validate_messages(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        for index, message in enumerate(messages):
-            if not str(message.get("role") or "").strip():
-                raise ValueError(f"messages[{index}].role is required")
-        return messages
-
-
-def chat_provider_settings() -> Tuple[str, str, str]:
-    chat_cfg = CFG.get("chat", {})
-    if not isinstance(chat_cfg, dict):
-        chat_cfg = {}
-    return (
-        str(chat_cfg.get("api_key") or "").strip(),
-        str(chat_cfg.get("base_url") or "https://api.openai.com/v1").strip().rstrip("/"),
-        str(chat_cfg.get("model") or "gpt-3.5-turbo").strip(),
-    )
-
-
-def chat_provider_url_is_valid(base_url: str) -> bool:
-    parsed = urlparse(base_url)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
-
-def chat_upstream_error_message(response: requests.Response) -> str:
-    status_code = int(getattr(response, "status_code", 0) or 0)
-    fallback = f"chat upstream returned HTTP {status_code or 502}"
-    try:
-        payload = response.json()
-    except (TypeError, ValueError):
-        return fallback
-    if not isinstance(payload, dict):
-        return fallback
-    error = payload.get("error")
-    if isinstance(error, dict):
-        detail = error.get("message") or error.get("code")
-    elif error not in (None, ""):
-        detail = error
-    else:
-        detail = payload.get("message") or payload.get("detail")
-    if detail in (None, ""):
-        return fallback
-    if isinstance(detail, (dict, list)):
-        detail = json.dumps(detail, ensure_ascii=False)
-    return str(detail)[:500]
-
-
-def chat_usage_prompt(messages: List[Dict[str, Any]]) -> str:
-    """Return a privacy-safe usage descriptor instead of storing conversation content."""
-    message_count = len(messages)
-    suffix = "" if message_count == 1 else "s"
-    return f"{message_count} chat message{suffix}"
-
-
-def best_effort_update_chat_usage(usage_id: int, **fields: Any) -> None:
-    """Do not break an upstream response solely because final audit persistence failed."""
-    try:
-        update_usage_log(usage_id, **fields)
-    except Exception as exc:
-        warnings.warn(
-            f"failed to update chat usage log {usage_id}: {type(exc).__name__}",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-
-
-def admit_chat_request(
-    api_key_id: int,
-    request_id: str,
-    requested_model: str,
-    configured_model: str,
-    messages: List[Dict[str, Any]],
-) -> int:
-    """Apply API-key policy and reserve one audited request before calling the provider."""
-    with REQUEST_ADMISSION_LOCK:
-        policy = resolve_api_key_policy(get_api_key_record(api_key_id))
-        allowed_kinds = policy.get("allowed_kinds") or []
-        # Chat is explicit opt-in so legacy empty scopes do not inherit a new paid capability.
-        if "chat" not in allowed_kinds:
-            raise GatewayAPIError(
-                403,
-                "API_KEY_KIND_FORBIDDEN",
-                "API key is not allowed to use this kind",
-                {"field": "kind", "value": "chat", "allowed": allowed_kinds},
-                request_id=request_id,
-            )
-        if requested_model not in {"oreate-chat", configured_model}:
-            raise OpenAICompatError(
-                f"The model '{requested_model}' does not exist or you do not have access to it.",
-                param="model",
-                code="model_not_found",
-                status_code=404,
-            )
-        enforce_api_key_scope(
-            policy,
-            "chat",
-            {"model_name": configured_model},
-            {},
-            request_id,
-        )
-        now = time.time()
-        check_rate_limit(api_key_id, policy, now, request_id)
-        check_daily_quota(api_key_id, 0, policy, now, request_id)
-        return log_usage(
-            api_key_id,
-            "chat",
-            0,
-            chat_usage_prompt(messages),
-            "submitted",
-            "chat request admitted",
-            request_id=request_id,
-            model_name=configured_model,
-            estimated_point_cost=0,
-            status_code=202,
-        )
-
-
-@app.post("/v1/chat/completions")
-def gateway_chat_completions(
-    request: Request,
-    body: ChatCompletionsIn,
-    api_key_id: int = Depends(require_api_key),
-):
-    """OpenAI-compatible chat completions endpoint backed by the configured provider."""
-    api_key, base_url, configured_model = chat_provider_settings()
-    if not api_key:
-        raise OpenAICompatError(
-            "chat service is not configured",
-            code="chat_not_configured",
-            status_code=503,
-        )
-    if not chat_provider_url_is_valid(base_url):
-        raise OpenAICompatError(
-            "chat provider base URL is invalid",
-            code="chat_configuration_error",
-            status_code=503,
-        )
-    request_id = gateway_request_id(request)
-    usage_id = admit_chat_request(
-        api_key_id,
-        request_id,
-        body.model,
-        configured_model,
-        body.messages,
-    )
-    openai_payload = model_data(body)
-    openai_payload["model"] = configured_model
-    try:
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            json=openai_payload,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=120,
-            stream=body.stream,
-        )
-    except requests.RequestException as exc:
-        best_effort_update_chat_usage(
-            usage_id,
-            status="failed",
-            response_summary="chat upstream is unavailable",
-            error_code="UPSTREAM_UNAVAILABLE",
-            status_code=502,
-        )
-        raise OpenAICompatError(
-            "chat upstream is unavailable",
-            code="upstream_unavailable",
-            status_code=502,
-        ) from exc
-
-    upstream_status = int(response.status_code)
-    if not 200 <= upstream_status < 300:
-        message = chat_upstream_error_message(response)
-        status_code = upstream_status if 400 <= upstream_status <= 599 else 502
-        response.close()
-        best_effort_update_chat_usage(
-            usage_id,
-            status="failed",
-            response_summary=f"chat upstream returned HTTP {upstream_status}",
-            error_code="UPSTREAM_ERROR",
-            status_code=status_code,
-        )
-        raise OpenAICompatError(
-            message,
-            code="upstream_error",
-            status_code=status_code,
-        )
-
-    if body.stream:
-        def iter_upstream_chunks():
-            completed = False
-            try:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        yield chunk
-                completed = True
-            finally:
-                try:
-                    response.close()
-                finally:
-                    if completed:
-                        best_effort_update_chat_usage(
-                            usage_id,
-                            status="completed",
-                            response_summary="chat stream completed",
-                            error_code="",
-                            status_code=upstream_status,
-                        )
-                    else:
-                        best_effort_update_chat_usage(
-                            usage_id,
-                            status="failed",
-                            response_summary="chat stream interrupted",
-                            error_code="UPSTREAM_STREAM_INTERRUPTED",
-                            status_code=502,
-                        )
-
-        return StreamingResponse(
-            iter_upstream_chunks(),
-            media_type=response.headers.get("Content-Type") or "text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Request-ID": request_id},
-        )
-
-    try:
-        payload = response.json()
-    except (TypeError, ValueError) as exc:
-        best_effort_update_chat_usage(
-            usage_id,
-            status="failed",
-            response_summary="chat upstream returned invalid JSON",
-            error_code="INVALID_UPSTREAM_RESPONSE",
-            status_code=502,
-        )
-        raise OpenAICompatError(
-            "chat upstream returned an invalid JSON response",
-            code="invalid_upstream_response",
-            status_code=502,
-        ) from exc
-    finally:
-        response.close()
-    if not isinstance(payload, dict):
-        best_effort_update_chat_usage(
-            usage_id,
-            status="failed",
-            response_summary="chat upstream returned an invalid payload",
-            error_code="INVALID_UPSTREAM_RESPONSE",
-            status_code=502,
-        )
-        raise OpenAICompatError(
-            "chat upstream returned an invalid response payload",
-            code="invalid_upstream_response",
-            status_code=502,
-        )
-    best_effort_update_chat_usage(
-        usage_id,
-        status="completed",
-        response_summary="chat completion completed",
-        error_code="",
-        status_code=upstream_status,
-    )
-    return JSONResponse(
-        status_code=upstream_status,
-        content=payload,
-        headers={"X-Request-ID": request_id},
-    )
-
-
-class ChatIn(BaseModel):
-    prompt: Annotated[str, Field(min_length=1, max_length=4000)]
-    account_id: Optional[Annotated[int, Field(strict=True, ge=1)]] = None
-    chat_mode: str = "chat"
-
-    @field_validator("prompt")
-    @classmethod
-    def normalize_prompt(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("prompt must not be blank")
-        return normalized
-
-    @field_validator("chat_mode")
-    @classmethod
-    def validate_chat_mode(cls, value: str) -> str:
-        if value not in {"chat", "agent", "aiChat"}:
-            raise ValueError("chat_mode is not supported")
-        return value
-
-
-@app.post("/api/chat/send")
-def api_chat_send(body: ChatIn, _=Depends(require_admin)):
-    """Internal admin chat endpoint backed by the configured provider."""
-    api_key, base_url, model = chat_provider_settings()
-    if not api_key:
-        return {
-            "ok": False,
-            "response": "chat API key not configured",
-            "error": {"code": "NO_KEY", "message": "Set chat API key in Settings"},
-        }
-    if not chat_provider_url_is_valid(base_url):
-        return {
-            "ok": False,
-            "response": "chat provider base URL is invalid",
-            "error": {"code": "INVALID_CONFIG", "message": "Set a valid HTTP(S) chat API URL in Settings"},
-        }
-
-    try:
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            json={"model": model, "messages": [{"role": "user", "content": body.prompt}], "stream": False},
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            timeout=60,
-        )
-    except requests.RequestException:
-        return {
-            "ok": False,
-            "response": "chat upstream is unavailable",
-            "error": {"code": "UPSTREAM_UNAVAILABLE", "message": "Chat provider is temporarily unavailable"},
-        }
-
-    if not 200 <= response.status_code < 300:
-        message = chat_upstream_error_message(response)
-        status_code = response.status_code
-        response.close()
-        return {
-            "ok": False,
-            "response": message,
-            "error": {"code": str(status_code), "message": message},
-        }
-
-    try:
-        payload = response.json()
-    except (TypeError, ValueError):
-        return {
-            "ok": False,
-            "response": "chat upstream returned invalid JSON",
-            "error": {"code": "INVALID_RESPONSE", "message": "Chat provider returned invalid JSON"},
-        }
-    finally:
-        response.close()
-    if not isinstance(payload, dict):
-        return {
-            "ok": False,
-            "response": "chat upstream returned an invalid payload",
-            "error": {"code": "INVALID_RESPONSE", "message": "Chat provider returned an invalid payload"},
-        }
-    content = (payload.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-    return {"ok": True, "chat_id": "", "response": content, "error": None, "events": []}
 
 
 def gateway_task_detail_payload(task_id: int, api_key_id: Optional[int] = None) -> Dict[str, Any]:
@@ -10860,7 +10447,6 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
 <div id="app-shell" class="hidden">
 <div class="nav">
   <h1>OreateAI Gateway</h1>
-  <a onclick="switchTab('chat')">对话</a>
   <a onclick="switchTab('pool')">号池 <span class="badge" id="pool-count">0</span></a>
   <a onclick="switchTab('generate')">生成</a>
   <a onclick="switchTab('tasks')">任务</a>
@@ -11012,7 +10598,7 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
         <div class="apikey-summary-card"><strong id="ak-summary-usage">0</strong><span>今日用量（点数）</span></div>
       </div>
       <div class="endpoint-box" style="margin-top:14px">
-        <div class="url">POST /v1/generate &nbsp;·&nbsp; POST /v1/chat/completions</div>
+        <div class="url">POST /v1/generate</div>
         <div class="desc">请求头：<code>Authorization: Bearer &lt;API Key&gt;</code></div>
       </div>
       <div class="apikey-toolbar">
@@ -11033,7 +10619,7 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
         <div>
           <h2>用量日志</h2>
           <div class="list-filters">
-            <div><label>类型</label><select id="usage-filter-kind"><option value="">全部</option><option value="image">图片</option><option value="video">视频</option><option value="chat">文字对话</option></select></div>
+            <div><label>类型</label><select id="usage-filter-kind"><option value="">全部</option><option value="image">图片</option><option value="video">视频</option></select></div>
             <div><label>状态</label><select id="usage-filter-status"><option value="">全部</option><option value="queued">待处理</option><option value="running">生成中</option><option value="submitted">已提交</option><option value="hydrating">获取结果中</option><option value="completed">已完成</option><option value="failed">失败</option><option value="expired">已过期</option><option value="cancelled">已取消</option></select></div>
             <div><label>模型</label><input id="usage-filter-model-name" placeholder="模型名"></div>
             <div><label>客户 Key ID</label><input id="usage-filter-api-key-id" type="number" min="1" step="1"></div>
@@ -11119,7 +10705,6 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
         <div class="drawer-switches">
           <label class="drawer-switch"><input id="ak-editor-kind-image" type="checkbox" checked>允许图片生成</label>
           <label class="drawer-switch"><input id="ak-editor-kind-video" type="checkbox" checked>允许视频生成</label>
-          <label class="drawer-switch"><input id="ak-editor-kind-chat" type="checkbox">允许文字对话</label>
           <label class="drawer-switch"><input id="ak-editor-uploads" type="checkbox" checked>允许上传素材</label>
           <label class="drawer-switch"><input id="ak-editor-experimental" type="checkbox">允许实验模型</label>
         </div>
@@ -11211,7 +10796,6 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
         <li><code>GET /v1/models</code>：模型列表</li>
         <li><code>GET /v1/models/{model}</code>：查询单个可用模型</li>
         <li><code>GET /v1/capabilities</code>：模型、比例、分辨率、时长与场景能力</li>
-        <li><code>POST /v1/chat/completions</code>：OpenAI 风格文字对话（需为 Key 显式开启文字对话权限）</li>
         <li><code>POST /v1/images/generations</code>：OpenAI 风格图片接口</li>
         <li><code>POST /v1/images/edits</code>：OpenAI multipart 图片编辑接口</li>
         <li><code>POST /v1/videos</code> / <code>/v1/videos/generations</code>：视频接口</li>
@@ -11222,23 +10806,6 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
       <p style="margin-top:10px">返回 401 表示 Key 无效；403 表示 Key 权限不足；429 表示额度或频率受限；5xx 表示服务或上游暂时不可用。</p>
     </div>
   </div>
-</div>
-
-<!-- Tab: 对话 -->
-<div id="tab-chat" class="section hidden">
-  <h2>💬 文字对话</h2>
-  <div class="row" style="margin-bottom:12px">
-    <div class="col"><label>对话模式</label><select id="chat-mode"><option value="chat">Chat</option><option value="agent">Agent</option><option value="aiChat">AI Chat</option></select></div>
-    <div class="col"><label>账号ID（留空自动）</label><input id="chat-account" placeholder="auto"></div>
-  </div>
-  <div style="margin-bottom:12px">
-    <div id="chat-area" style="background:#fafafa;border:1px solid #eee;border-radius:10px;padding:12px;min-height:200px;max-height:400px;overflow-y:auto;font-size:14px;line-height:1.6"></div>
-  </div>
-  <div class="row">
-    <div class="col" style="flex:3"><textarea id="chat-prompt" placeholder="输入消息...Shift+Enter换行，Enter发送" style="min-height:60px"></textarea></div>
-    <div><button class="btn-primary" onclick="chatSend()" style="height:60px">发送</button></div>
-  </div>
-  <div style="margin-top:12px"><button class="btn-secondary btn-sm" onclick="document.getElementById('chat-area').innerHTML=''">清空对话</button></div>
 </div>
 
 <!-- Tab: 设置 -->
@@ -11259,14 +10826,6 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
   </div>
   <div class="row" style="margin-top:8px">
     <div class="col" style="flex:3"><label>首选域名（逗号分隔）</label><input id="s-mail-domains" placeholder="domain1.xyz,domain2.xyz"></div>
-  </div>
-  <h3 style="margin-top:20px;font-size:14px">💬 文字对话 API</h3>
-  <div class="row" style="margin-top:8px">
-    <div class="col" style="flex:2"><label>API 地址（OpenAI 兼容）</label><input id="s-chat-url" placeholder="https://api.openai.com/v1"></div>
-    <div class="col" style="flex:2"><label>API Key</label><input id="s-chat-key" type="password" autocomplete="off" placeholder="chat api key"></div>
-  </div>
-  <div class="row" style="margin-top:8px">
-    <div class="col"><label>模型名称</label><input id="s-chat-model" placeholder="gpt-3.5-turbo"></div>
   </div>
   <h3 style="margin-top:20px;font-size:14px">📦 号池配置</h3>
   <div class="row" style="margin-top:8px">
@@ -11366,33 +10925,6 @@ async function adminLogin(){
   await init();
 }
 
-// === Chat ===
-async function chatSend(){
-  const prompt=document.getElementById('chat-prompt').value.trim();
-  const mode=document.getElementById('chat-mode').value;
-  const aid=document.getElementById('chat-account').value.trim();
-  if(!prompt) return;
-  const area=document.getElementById('chat-area');
-  area.innerHTML+='<div class="msg msg-user"><strong>你:</strong> '+escapeHtml(prompt)+'</div>';
-  document.getElementById('chat-prompt').value='';
-  area.scrollTop=area.scrollHeight;
-  const respId='chat-r'+Date.now();
-  area.innerHTML+='<div class="msg msg-assistant" id="'+respId+'"><em>思考中...</em></div>';
-  const payload={prompt,chat_mode:mode};
-  if(aid) payload.account_id=Number(aid);
-  try{
-    const r=await api('POST','/api/chat/send',payload);
-    if(!r.ok) throw new Error(r.error?.message || r.response || '对话请求失败');
-    const el=document.getElementById(respId);
-    if(el) el.outerHTML='<div class="msg msg-assistant"><strong>AI:</strong> '+escapeHtml(r.response||'无回复')+'<br><span style="font-size:11px;color:#86868b">chatId: '+escapeHtml(r.chat_id||'')+'</span></div>';
-  }catch(e){
-    const el=document.getElementById(respId);
-    if(el) el.outerHTML='<div class="msg msg-assistant" style="color:#c62828"><strong>错误:</strong> '+escapeHtml(e?.message || String(e))+'</div>';
-  }
-  area.scrollTop=area.scrollHeight;
-}
-document.getElementById('chat-prompt')?.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();chatSend();}});
-
 function logout(){
   if (adminToken) {
     fetch(BASE + '/api/admin/logout', {
@@ -11438,7 +10970,7 @@ async function restoreBackup(){
   showLogin('恢复完成，请重新登录');
 }
 function switchTab(name) {
-  document.querySelectorAll('#tab-chat,#tab-pool,#tab-generate,#tab-tasks,#tab-apikeys,#tab-docs,#tab-settings').forEach(el => {
+  document.querySelectorAll('#tab-pool,#tab-generate,#tab-tasks,#tab-apikeys,#tab-docs,#tab-settings').forEach(el => {
     el.classList.toggle('hidden', el.id !== 'tab-'+name);
   });
 }
@@ -11768,7 +11300,6 @@ const ADMIN_LABELS=Object.freeze({
   kind:Object.freeze({
     image:'图片',
     video:'视频',
-    chat:'文字对话',
     audio:'音频',
   }),
   uploadStatus:Object.freeze({
@@ -12822,7 +12353,6 @@ function openApiKeyEditor(id=null){
   const kinds=Array.isArray(key?.allowed_kinds)&&key.allowed_kinds.length?key.allowed_kinds:['image','video'];
   setApiKeyEditorChecked('ak-editor-kind-image',kinds.includes('image'));
   setApiKeyEditorChecked('ak-editor-kind-video',kinds.includes('video'));
-  setApiKeyEditorChecked('ak-editor-kind-chat',kinds.includes('chat'));
   setApiKeyEditorChecked('ak-editor-uploads',key?key.allow_uploads!==false:true);
   setApiKeyEditorChecked('ak-editor-experimental',Boolean(key?.allow_experimental));
   setApiKeyEditorChecked('ak-editor-enabled',key?String(key.status ?? (key.enabled?'enabled':'disabled'))==='enabled':true);
@@ -12843,8 +12373,7 @@ function apiKeyEditorBody(){
   const allowedKinds=[];
   if(document.getElementById('ak-editor-kind-image')?.checked) allowedKinds.push('image');
   if(document.getElementById('ak-editor-kind-video')?.checked) allowedKinds.push('video');
-  if(document.getElementById('ak-editor-kind-chat')?.checked) allowedKinds.push('chat');
-  if(!allowedKinds.length) throw new Error('至少允许一种能力');
+  if(!allowedKinds.length) throw new Error('图片和视频至少允许一种');
   return {
     name,
     rotation_note:String(document.getElementById('ak-editor-note')?.value||'').trim(),
@@ -13065,10 +12594,6 @@ async function loadSettings(){
   document.getElementById('s-mail-key').value='';
   document.getElementById('s-mail-key').placeholder=s.mail?.api_key==='__redacted__'?'留空不修改':'mail api key';
   document.getElementById('s-mail-domains').value=(s.mail?.preferred_domains||[]).join(',');
-  document.getElementById('s-chat-url').value=s.chat?.base_url||'';
-  document.getElementById('s-chat-key').placeholder=s.chat?.api_key==='__redacted__'?'留空不修改':'chat api key';
-  document.getElementById('s-chat-key').value='';
-  document.getElementById('s-chat-model').value=s.chat?.model||'';
   document.getElementById('cred-user').value=s.server?.admin_username||'';
   document.getElementById('settings-raw').textContent=JSON.stringify(s,null,2);
 }
@@ -13099,10 +12624,6 @@ async function saveSettings(){
         base_url:document.getElementById('s-mail-url').value,
         preferred_domains:doms,
       },
-      chat:{
-        base_url:document.getElementById('s-chat-url').value,
-        model:document.getElementById('s-chat-model').value,
-      },
       pool:{
         min_accounts:minAccounts,
         maintain_target:maintainTarget,
@@ -13110,8 +12631,6 @@ async function saveSettings(){
     };
     const mailKey=document.getElementById('s-mail-key').value.trim();
     if(mailKey) body.mail.api_key=mailKey;
-    const chatKey=document.getElementById('s-chat-key').value.trim();
-    if(chatKey) body.chat.api_key=chatKey;
     const r=await api('PUT','/api/admin/settings',body);
     const restartMessage=r.restart_required ? '，服务端口变更需重启后生效' : '';
     try{

@@ -386,7 +386,6 @@ class SecurityRegressionTests(unittest.TestCase):
             ("get", "/api/register/jobs/1", None),
             ("post", "/api/accounts/import", {"email": "a@b.test", "password": "x"}),
             ("post", "/api/media/generate", {"kind": "image", "prompt": "x"}),
-            ("post", "/api/chat/send", {"prompt": "x"}),
             ("get", "/api/tasks", None),
             ("post", "/api/tasks/1/mark", {"status": "completed"}),
             ("post", "/api/pool/maintain", {"force_register": True, "max_register": 1}),
@@ -672,7 +671,7 @@ class SecurityRegressionTests(unittest.TestCase):
         headers = self.admin_headers()
         baseline_cfg = json.loads(json.dumps(server.CFG))
 
-        for update in ({"server": None}, {"pool": None}, {"chat": None}):
+        for update in ({"server": None}, {"pool": None}, {"mail": None}):
             with self.subTest(update=update):
                 server.CFG = json.loads(json.dumps(baseline_cfg))
                 server.save_config(server.CFG)
@@ -1257,7 +1256,6 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
             {
                 "server": {"admin_password": "secret-password"},
                 "mail": {"api_key": "AC-secret-key"},
-                "chat": {"api_key": "chat-secret-key"},
             },
         )
         try:
@@ -1269,14 +1267,12 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         payload = response.json()
         self.assertEqual(payload["server"]["admin_password"], server.SECRET_PLACEHOLDER)
         self.assertEqual(payload["mail"]["api_key"], server.SECRET_PLACEHOLDER)
-        self.assertEqual(payload["chat"]["api_key"], server.SECRET_PLACEHOLDER)
 
     def test_admin_settings_blank_secret_values_preserve_existing_keys(self):
         server.CFG = server.deep_merge(
             server.CFG,
             {
                 "mail": {"api_key": "AC-existing-key"},
-                "chat": {"api_key": "chat-existing-key"},
             },
         )
         server.save_config(server.CFG)
@@ -1286,62 +1282,15 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
             headers=self.admin_headers(),
             json={
                 "mail": {"api_key": ""},
-                "chat": {"api_key": server.SECRET_PLACEHOLDER},
             },
         )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(server.CFG["mail"]["api_key"], "AC-existing-key")
-        self.assertEqual(server.CFG["chat"]["api_key"], "chat-existing-key")
         saved = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["mail"]["api_key"], "AC-existing-key")
-        self.assertEqual(saved["chat"]["api_key"], "chat-existing-key")
         payload = response.json()["config"]
         self.assertEqual(payload["mail"]["api_key"], server.SECRET_PLACEHOLDER)
-        self.assertEqual(payload["chat"]["api_key"], server.SECRET_PLACEHOLDER)
-
-    def test_admin_html_chat_tab_is_a_switchable_top_level_section(self):
-        chat_tab = server.ADMIN_HTML.index('<div id="tab-chat" class="section hidden">')
-        settings_tab = server.ADMIN_HTML.index('<div id="tab-settings" class="section hidden">')
-
-        self.assertLess(chat_tab, settings_tab)
-        self.assertIn(
-            "document.querySelectorAll('#tab-chat,#tab-pool,#tab-generate,#tab-tasks,#tab-apikeys,#tab-docs,#tab-settings')",
-            server.ADMIN_HTML,
-        )
-
-    def test_admin_chat_sanitizes_provider_configuration_and_transport_failures(self):
-        server.CFG["chat"] = {
-            "provider": "openai",
-            "base_url": "file:///tmp/chat",
-            "api_key": "chat-secret-key",
-            "model": "chat-model",
-        }
-        invalid_config = self.client.post(
-            "/api/chat/send",
-            headers=self.admin_headers(),
-            json={"prompt": "hello"},
-        )
-        self.assertEqual(invalid_config.status_code, 200)
-        self.assertFalse(invalid_config.json()["ok"])
-        self.assertEqual(invalid_config.json()["error"]["code"], "INVALID_CONFIG")
-
-        server.CFG["chat"]["base_url"] = "https://chat.example.test/v1"
-        with patch.object(
-            server.requests,
-            "post",
-            side_effect=server.requests.Timeout("private provider detail"),
-        ):
-            unavailable = self.client.post(
-                "/api/chat/send",
-                headers=self.admin_headers(),
-                json={"prompt": "hello"},
-            )
-        self.assertEqual(unavailable.status_code, 200)
-        self.assertFalse(unavailable.json()["ok"])
-        self.assertEqual(unavailable.json()["error"]["code"], "UPSTREAM_UNAVAILABLE")
-        self.assertNotIn("private provider detail", unavailable.text)
-        self.assertNotIn("chat-secret-key", unavailable.text)
 
     def test_accounts_response_does_not_expose_credentials_or_session_cookies(self):
         account_id = self.seed_account()

@@ -48,12 +48,6 @@
     "maintain_check_interval": 300,
     "generation_probe_prompt": "账号健康检测：请生成白色背景上的一个蓝色圆点"
   },
-  "chat": {
-    "provider": "openai",
-    "base_url": "https://api.openai.com/v1",
-    "api_key": "CHAT-REPLACE_ME",
-    "model": "gpt-3.5-turbo"
-  },
   "gateway": {
     "default_rate_limit_per_minute": 60,
     "default_daily_request_limit": 0,

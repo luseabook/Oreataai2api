@@ -4758,9 +4758,6 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("allowed_scenes", html)
         self.assertIn("allowed_resolutions", html)
         self.assertIn("allowed_durations", html)
-        self.assertIn('id="ak-editor-kind-chat"', html)
-        self.assertIn('<option value="chat">\u6587\u5b57\u5bf9\u8bdd</option>', html)
-        self.assertIn("chat:'\u6587\u5b57\u5bf9\u8bdd'", html)
         self.assertIn("allow_uploads", html)
         self.assertIn("allow_experimental", html)
         self.assertIn("updateApiKeyPolicy", html)
@@ -4895,7 +4892,6 @@ const fields = {{
   'ak-editor-points': {{value: '17'}},
   'ak-editor-kind-image': {{checked: true}},
   'ak-editor-kind-video': {{checked: false}},
-  'ak-editor-kind-chat': {{checked: true}},
   'ak-editor-models': {{value: 'model-a, model-a, model-b'}},
   'ak-editor-scenes': {{value: ''}},
   'ak-editor-resolutions': {{value: '1K,4K'}},
@@ -4914,7 +4910,7 @@ for (const [field, value] of Object.entries(expectedEditorLimits)) {{
 if (JSON.stringify(editorBody.allowed_models) !== JSON.stringify(['model-a','model-b'])) {{
   throw new Error(`model scope was not normalized: ${{JSON.stringify(editorBody.allowed_models)}}`);
 }}
-if (JSON.stringify(editorBody.allowed_kinds) !== JSON.stringify(['image','chat'])) {{
+if (JSON.stringify(editorBody.allowed_kinds) !== JSON.stringify(['image'])) {{
   throw new Error(`kind scope was not normalized: ${{JSON.stringify(editorBody.allowed_kinds)}}`);
 }}
 let capturedBody = undefined;
