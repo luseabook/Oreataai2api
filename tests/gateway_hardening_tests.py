@@ -575,8 +575,12 @@ class GatewayHardeningTests(unittest.TestCase):
                     return type("Resp", (), {"raise_for_status": lambda self: None})()
 
             fake = FakeSession()
-            with patch.object(server.requests, "Session", return_value=fake):
-                client = server.OreateClient()
+            with patch("gateway.oreate_client.requests.Session", return_value=fake):
+                client = server.OreateClient(
+                    lambda: server.CFG["oreate"],
+                    decrypt_secret=server.decrypt_secret_value,
+                    tls_verify=server.tls_verify_enabled,
+                )
                 session = client.new_session()
         finally:
             server.CFG = original_cfg
@@ -2348,9 +2352,8 @@ class GatewayHardeningTests(unittest.TestCase):
 
         fake = FakeSession()
         client = server.OreateClient()
-        with patch.object(
-            server,
-            "generate_banti_artifacts",
+        with patch(
+            "gateway.oreate_client.generate_banti_artifacts",
             return_value={"jt": "helper-jt", "cookies": {"__bid_n": "helper-bid"}},
         ):
             client.stream_generation(
@@ -2385,9 +2388,8 @@ class GatewayHardeningTests(unittest.TestCase):
 
         fake = FakeSession()
         client = server.OreateClient()
-        with patch.object(
-            server,
-            "generate_banti_artifacts",
+        with patch(
+            "gateway.oreate_client.generate_banti_artifacts",
             side_effect=[
                 {"jt": "fallback-jt", "cookies": {}},
                 {"jt": "helper-jt", "cookies": {"__bid_n": "helper-bid"}},
@@ -2419,7 +2421,10 @@ class GatewayHardeningTests(unittest.TestCase):
 
         fake = FakeSession()
         client = server.OreateClient()
-        with patch.object(server, "generate_banti_artifacts", return_value={"jt": "helper-jt", "cookies": {}}):
+        with patch(
+            "gateway.oreate_client.generate_banti_artifacts",
+            return_value={"jt": "helper-jt", "cookies": {}},
+        ):
             with self.assertRaisesRegex(RuntimeError, "banti mirror artifacts unavailable"):
                 client.stream_generation(
                     fake,
