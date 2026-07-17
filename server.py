@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 import zipfile
 from urllib.parse import parse_qs, quote, urljoin, urlparse
@@ -90,6 +91,12 @@ REGISTRATION_THREADS_LOCK = threading.Lock()
 REGISTRATION_THREADS: Dict[int, threading.Thread] = {}
 POOL_MAINTENANCE_THREADS_LOCK = threading.Lock()
 POOL_MAINTENANCE_THREADS: Dict[int, threading.Thread] = {}
+POOL_MAINTENANCE_SCHEDULER_LOCK = threading.Lock()
+POOL_MAINTENANCE_SCHEDULER_THREAD: Optional[threading.Thread] = None
+POOL_MAINTENANCE_SCHEDULER_STOP = threading.Event()
+POOL_MAINTENANCE_SCHEDULER_WAKE = threading.Event()
+MAIL_DOMAIN_STATS_LOCK = threading.Lock()
+MAIL_DOMAIN_STATS: Dict[str, Dict[str, int]] = {}
 GATEWAY_ENVIRONMENT_ERROR_CODES = {"212361"}
 
 DEFAULT_CONFIG = {
@@ -146,6 +153,8 @@ DEFAULT_CONFIG = {
         "maintain_target": 5,
         "valid_threshold_pct": 1.0,
         "maintain_check_interval": 300,
+        "registration_concurrency": 3,
+        "auto_maintain_max_register": 5,
         "generation_probe_prompt": "账号健康检测：请生成白色背景上的一个蓝色圆点",
     },
     "gateway": {
@@ -2640,6 +2649,7 @@ def init_db():
             current_step TEXT NOT NULL DEFAULT 'queued',
             current_email TEXT NOT NULL DEFAULT '',
             items_json TEXT NOT NULL DEFAULT '[]',
+            events_json TEXT NOT NULL DEFAULT '[]',
             error_message TEXT NOT NULL DEFAULT '',
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
@@ -2650,6 +2660,7 @@ def init_db():
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_registration_jobs_status ON registration_jobs(status, id)"
     )
+    add_column_if_missing(conn, "registration_jobs", "events_json", "TEXT NOT NULL DEFAULT '[]'")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS pool_maintenance_jobs (
@@ -2849,8 +2860,18 @@ class PoolSettingsIn(BaseModel):
 
     min_accounts: Optional[Annotated[int, Field(strict=True, ge=0)]] = None
     maintain_target: Optional[Annotated[int, Field(strict=True, ge=0)]] = None
+    maintain_check_interval: Optional[Annotated[int, Field(strict=True, ge=0)]] = None
+    registration_concurrency: Optional[Annotated[int, Field(strict=True, ge=1, le=8)]] = None
+    auto_maintain_max_register: Optional[Annotated[int, Field(strict=True, ge=0, le=50)]] = None
 
-    @field_validator("min_accounts", "maintain_target", mode="before")
+    @field_validator(
+        "min_accounts",
+        "maintain_target",
+        "maintain_check_interval",
+        "registration_concurrency",
+        "auto_maintain_max_register",
+        mode="before",
+    )
     @classmethod
     def reject_null_pool_counts(cls, value: Any) -> Any:
         if value is None:
@@ -2977,6 +2998,7 @@ class YydsClient:
         domains = CFG["mail"].get("preferred_domains") or self.list_domains()
         if not domains:
             raise RuntimeError("No YYDS domains available")
+        domains = rank_mail_domains([str(item) for item in domains if str(item or "").strip()])
         errors = []
         for domain in domains:
             local_part = f"oreate-{secrets.token_hex(4)}"
@@ -3037,7 +3059,7 @@ class YydsClient:
             elif isinstance(value, str):
                 blobs.append(value)
         joined = "\n".join(blobs)
-        m = re.search(r'\\b(\\d{6})\\b', joined)
+        m = re.search(r'\b(\d{6})\b', joined)
         return m.group(1) if m else ""
 
     def wait_verification_artifact(self, address: str, token: str, timeout_sec: int = 180) -> Dict[str, str]:
@@ -5843,51 +5865,185 @@ def save_and_validate_registered_account(
     return account_id, "verified"
 
 
-def auto_register_accounts(
-    count: int = 1,
+
+def registration_concurrency() -> int:
+    raw = CFG.get("pool", {}).get("registration_concurrency", 3)
+    value = int_or_default(raw, 3)
+    return max(1, min(8, value))
+
+
+def pool_auto_maintain_interval_seconds() -> float:
+    raw = CFG.get("pool", {}).get("maintain_check_interval", 300)
+    value = float_or_default(raw, 300.0)
+    if not math.isfinite(value):
+        return 300.0
+    return max(0.0, value)
+
+
+def pool_auto_maintain_enabled() -> bool:
+    return pool_auto_maintain_interval_seconds() > 0
+
+
+def pool_auto_maintain_max_register() -> int:
+    raw = CFG.get("pool", {}).get("auto_maintain_max_register", 5)
+    value = int_or_default(raw, 5)
+    return max(0, min(50, value))
+
+
+def record_mail_domain_outcome(domain: str, status: str) -> None:
+    normalized = str(domain or "").strip().lower()
+    if not normalized:
+        return
+    outcome = str(status or "")
+    with MAIL_DOMAIN_STATS_LOCK:
+        stats = MAIL_DOMAIN_STATS.setdefault(
+            normalized,
+            {"success": 0, "failure": 0, "verify_timeout": 0},
+        )
+        if outcome == "verified":
+            stats["success"] += 1
+            return
+        stats["failure"] += 1
+        if outcome == "verify_timeout":
+            stats["verify_timeout"] += 1
+
+
+def rank_mail_domains(domains: List[str]) -> List[str]:
+    unique: List[str] = []
+    seen = set()
+    for domain in domains:
+        key = str(domain or "").strip()
+        if not key:
+            continue
+        lowered = key.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        unique.append(key)
+    with MAIL_DOMAIN_STATS_LOCK:
+        def sort_key(domain: str) -> Tuple[float, int, int, str]:
+            stats = MAIL_DOMAIN_STATS.get(domain.lower(), {})
+            success = int(stats.get("success") or 0)
+            failure = int(stats.get("failure") or 0)
+            timeout = int(stats.get("verify_timeout") or 0)
+            total = success + failure
+            # Laplace smoothing so unused domains stay competitive.
+            rate = (success + 1.0) / (total + 2.0)
+            return (-rate, timeout, failure, domain.lower())
+
+        return sorted(unique, key=sort_key)
+
+
+def register_one_account(
     progress: Optional[Callable[[str, str], None]] = None,
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     def report(step: str, email: str = "") -> None:
         if progress is not None:
             progress(step, email)
 
-    results = []
-    for _ in range(max(1, count)):
-        report("create_mailbox")
-        mailbox = MAIL.create_mailbox()
-        email = mailbox["address"]
-        token = mailbox["token"]
-        password = "Aa1@" + secrets.token_hex(6)[:8]
-        trace = []
-        trace.append({"step": "create_mailbox", "email": email, "domain": mailbox.get("domain"), "mailbox_id": mailbox.get("mailbox_id")})
-        report("signup_attempt", email)
-        signup = CLIENT.signup_attempt(email, password)
-        body = signup.get("response", {})
-        status_code = signup.get("status_code")
-        signup_ok = status_code == 200 and body.get("status", {}).get("code") == 0
-        trace.append({"step": "signup_attempt", "status_code": status_code, "response": body})
-        artifact = {}
-        verification = {}
-        account_id = None
-        final_status = "signup_failed"
+    report("create_mailbox")
+    mailbox = MAIL.create_mailbox()
+    email = mailbox["address"]
+    token = mailbox["token"]
+    password = "Aa1@" + secrets.token_hex(6)[:8]
+    trace = []
+    trace.append({"step": "create_mailbox", "email": email, "domain": mailbox.get("domain"), "mailbox_id": mailbox.get("mailbox_id")})
+    report("signup_attempt", email)
+    signup = CLIENT.signup_attempt(email, password)
+    body = signup.get("response", {})
+    status_code = signup.get("status_code")
+    signup_ok = status_code == 200 and body.get("status", {}).get("code") == 0
+    trace.append({"step": "signup_attempt", "status_code": status_code, "response": body})
+    artifact = {}
+    verification = {}
+    account_id = None
+    final_status = "signup_failed"
 
-        if signup_ok:
-            send_email_count = body.get("data", {}).get("sendEmailCount") or body.get("sendEmailCount")
-            confirm_status = body.get("data", {}).get("confirmEmailStatus") or body.get("confirmEmailStatus")
-            register_status = body.get("data", {}).get("registerStatus") or body.get("registerStatus")
-            ticket_id = signup["ticket"]["ticketID"]
-            trace.append({"step": "signup_flags", "sendEmailCount": send_email_count, "confirmEmailStatus": confirm_status, "registerStatus": register_status, "ticketID": ticket_id})
-            report("email_verification", email)
-            if register_status == 2:
+    if signup_ok:
+        send_email_count = body.get("data", {}).get("sendEmailCount") or body.get("sendEmailCount")
+        confirm_status = body.get("data", {}).get("confirmEmailStatus") or body.get("confirmEmailStatus")
+        register_status = body.get("data", {}).get("registerStatus") or body.get("registerStatus")
+        ticket_id = signup["ticket"]["ticketID"]
+        trace.append({"step": "signup_flags", "sendEmailCount": send_email_count, "confirmEmailStatus": confirm_status, "registerStatus": register_status, "ticketID": ticket_id})
+        report("email_verification", email)
+        if register_status == 2:
+            try:
+                verification = CLIENT.check_email_verified(email, ticket_id)
+                trace.append({"step": "check_email_verified", "response": verification})
+                token_id = verification.get("tokenID") or verification.get("data", {}).get("tokenID") or verification.get("tokenId")
+                if token_id:
+                    confirm = CLIENT.confirm_email_register(email, token_id, ticket_id, password)
+                    verification["confirm"] = confirm
+                    trace.append({"step": "emailregisterconfirm", "response": confirm})
+                    if confirm.get("status_code") == 200 and confirm.get("response", {}).get("status", {}).get("code") == 0:
+                        report("login_and_save", email)
+                        session = CLIENT.login(email, password)
+                        sess = CLIENT.session_from_cookie_dict(session.cookies)
+                        img = CLIENT.fetch_image_models(sess)
+                        vid = {
+                            "models": CLIENT.fetch_video_models(sess),
+                            "scenes": CLIENT.fetch_video_scenes(sess),
+                        }
+                        report("generation_validation", email)
+                        account_id, final_status = save_and_validate_registered_account(
+                            email,
+                            password,
+                            session,
+                            img,
+                            vid,
+                            trace,
+                        )
+                    else:
+                        final_status = "confirm_failed"
+                else:
+                    final_status = "verify_pending"
+            except Exception as e:
+                verification = {"error": str(e), "sendEmailCount": send_email_count, "confirmEmailStatus": confirm_status}
+                trace.append({"step": "verify_error", "error": str(e)})
+                final_status = "verify_error"
+        else:
+            try:
+                # Oreate often reports sendEmailCount=1 but the first verification
+                # message does not actually land in YYDS. Force one resend before
+                # waiting for the verification artifact.
                 try:
-                    verification = CLIENT.check_email_verified(email, ticket_id)
-                    trace.append({"step": "check_email_verified", "response": verification})
-                    token_id = verification.get("tokenID") or verification.get("data", {}).get("tokenID") or verification.get("tokenId")
+                    resend = CLIENT.resend_confirm_email(email)
+                    trace.append({"step": "resend_confirm_email", "response": resend})
+                except Exception as resend_error:
+                    trace.append({"step": "resend_confirm_email_error", "error": str(resend_error)})
+
+                artifact = MAIL.wait_verification_artifact(email, token, timeout_sec=180)
+                trace.append({"step": "wait_verification_artifact", "artifact": artifact})
+                if artifact.get("link") or artifact.get("code"):
+                    # Extract tokenID from the verification link and visit it
+                    token_id = ""
+                    link = artifact.get("link", "")
+                    if link:
+                        token_id = extract_token_id_from_link(link)
+                        trace.append({"step": "extract_token_from_link", "tokenID": token_id, "link": link})
+                        # Visit the verification link (click it) - REQUIRED for email to be marked verified
+                        try:
+                            vr = requests.get(link, verify=tls_verify_enabled(), timeout=10, allow_redirects=True)
+                            trace.append({"step": "visit_verification_link", "status": vr.status_code})
+                        except Exception as e:
+                            trace.append({"step": "visit_verification_link", "error": str(e)})
+                    
+                    code = artifact.get("code", "")
+                    if not token_id and code:
+                        token_id = code
+                    
+                    if not token_id:
+                        # Fallback: try check_email_verified
+                        verification = CLIENT.check_email_verified(email, ticket_id)
+                        trace.append({"step": "check_email_verified", "response": verification})
+                        token_id = verification.get("tokenID") or verification.get("data", {}).get("tokenID") or verification.get("tokenId")
+                    
                     if token_id:
                         confirm = CLIENT.confirm_email_register(email, token_id, ticket_id, password)
                         verification["confirm"] = confirm
                         trace.append({"step": "emailregisterconfirm", "response": confirm})
-                        if confirm.get("status_code") == 200 and confirm.get("response", {}).get("status", {}).get("code") == 0:
+                        confirm_code = confirm.get("response", {}).get("status", {}).get("code")
+                        if confirm.get("status_code") == 200 and confirm_code == 0:
                             report("login_and_save", email)
                             session = CLIENT.login(email, password)
                             sess = CLIENT.session_from_cookie_dict(session.cookies)
@@ -5906,56 +6062,7 @@ def auto_register_accounts(
                                 trace,
                             )
                         else:
-                            final_status = "confirm_failed"
-                    else:
-                        final_status = "verify_pending"
-                except Exception as e:
-                    verification = {"error": str(e), "sendEmailCount": send_email_count, "confirmEmailStatus": confirm_status}
-                    trace.append({"step": "verify_error", "error": str(e)})
-                    final_status = "verify_error"
-            else:
-                try:
-                    # Oreate often reports sendEmailCount=1 but the first verification
-                    # message does not actually land in YYDS. Force one resend before
-                    # waiting for the verification artifact.
-                    try:
-                        resend = CLIENT.resend_confirm_email(email)
-                        trace.append({"step": "resend_confirm_email", "response": resend})
-                    except Exception as resend_error:
-                        trace.append({"step": "resend_confirm_email_error", "error": str(resend_error)})
-
-                    artifact = MAIL.wait_verification_artifact(email, token, timeout_sec=180)
-                    trace.append({"step": "wait_verification_artifact", "artifact": artifact})
-                    if artifact.get("link") or artifact.get("code"):
-                        # Extract tokenID from the verification link and visit it
-                        token_id = ""
-                        link = artifact.get("link", "")
-                        if link:
-                            token_id = extract_token_id_from_link(link)
-                            trace.append({"step": "extract_token_from_link", "tokenID": token_id, "link": link})
-                            # Visit the verification link (click it) - REQUIRED for email to be marked verified
                             try:
-                                vr = requests.get(link, verify=tls_verify_enabled(), timeout=10, allow_redirects=True)
-                                trace.append({"step": "visit_verification_link", "status": vr.status_code})
-                            except Exception as e:
-                                trace.append({"step": "visit_verification_link", "error": str(e)})
-                        
-                        code = artifact.get("code", "")
-                        if not token_id and code:
-                            token_id = code
-                        
-                        if not token_id:
-                            # Fallback: try check_email_verified
-                            verification = CLIENT.check_email_verified(email, ticket_id)
-                            trace.append({"step": "check_email_verified", "response": verification})
-                            token_id = verification.get("tokenID") or verification.get("data", {}).get("tokenID") or verification.get("tokenId")
-                        
-                        if token_id:
-                            confirm = CLIENT.confirm_email_register(email, token_id, ticket_id, password)
-                            verification["confirm"] = confirm
-                            trace.append({"step": "emailregisterconfirm", "response": confirm})
-                            confirm_code = confirm.get("response", {}).get("status", {}).get("code")
-                            if confirm.get("status_code") == 200 and confirm_code == 0:
                                 report("login_and_save", email)
                                 session = CLIENT.login(email, password)
                                 sess = CLIENT.session_from_cookie_dict(session.cookies)
@@ -5973,65 +6080,79 @@ def auto_register_accounts(
                                     vid,
                                     trace,
                                 )
-                            else:
-                                try:
-                                    report("login_and_save", email)
-                                    session = CLIENT.login(email, password)
-                                    sess = CLIENT.session_from_cookie_dict(session.cookies)
-                                    img = CLIENT.fetch_image_models(sess)
-                                    vid = {
-                                        "models": CLIENT.fetch_video_models(sess),
-                                        "scenes": CLIENT.fetch_video_scenes(sess),
+                                trace.append(
+                                    {
+                                        "step": "login_after_confirm_fallback",
+                                        "account_id": account_id,
+                                        "confirm_code": confirm_code,
                                     }
-                                    report("generation_validation", email)
-                                    account_id, final_status = save_and_validate_registered_account(
-                                        email,
-                                        password,
-                                        session,
-                                        img,
-                                        vid,
-                                        trace,
-                                    )
-                                    trace.append(
-                                        {
-                                            "step": "login_after_confirm_fallback",
-                                            "account_id": account_id,
-                                            "confirm_code": confirm_code,
-                                        }
-                                    )
-                                except Exception as login_error:
-                                    trace.append(
-                                        {
-                                            "step": "login_after_confirm_fallback_error",
-                                            "error": str(login_error),
-                                            "confirm_code": confirm_code,
-                                        }
-                                    )
-                                    final_status = "confirm_failed"
-                        else:
-                            final_status = "verify_pending"
+                                )
+                            except Exception as login_error:
+                                trace.append(
+                                    {
+                                        "step": "login_after_confirm_fallback_error",
+                                        "error": str(login_error),
+                                        "confirm_code": confirm_code,
+                                    }
+                                )
+                                final_status = "confirm_failed"
                     else:
-                        final_status = "verify_timeout"
-                except Exception as e:
-                    artifact = {"error": str(e)}
-                    trace.append({"step": "wait_verification_error", "error": str(e)})
-                    final_status = "verify_error"
+                        final_status = "verify_pending"
+                else:
+                    final_status = "verify_timeout"
+            except Exception as e:
+                artifact = {"error": str(e)}
+                trace.append({"step": "wait_verification_error", "error": str(e)})
+                final_status = "verify_error"
 
-        results.append({
-            "ok": final_status == "verified",
-            "status": final_status,
-            "account_id": account_id,
-            "email": email,
-            "password": password,
-            "signup_status": status_code,
-            "signup_response": body,
-            "verification": verification,
-            "verification_artifact": artifact,
-            "trace": trace,
-            "mailbox": {"address": email, "token": token},
-        })
-        report("completed", email)
-    return results
+    result = {
+        "ok": final_status == "verified",
+        "status": final_status,
+        "account_id": account_id,
+        "email": email,
+        "password": password,
+        "signup_status": status_code,
+        "signup_response": body,
+        "verification": verification,
+        "verification_artifact": artifact,
+        "trace": trace,
+        "mailbox": {"address": email, "token": token},
+    }
+    record_mail_domain_outcome(str(mailbox.get("domain") or ""), final_status)
+    report("completed", email)
+    return result
+
+
+def auto_register_accounts(
+    count: int = 1,
+    progress: Optional[Callable[[str, str], None]] = None,
+) -> List[Dict[str, Any]]:
+    total = max(1, int(count))
+    workers = min(registration_concurrency(), total)
+    if workers <= 1 or total == 1:
+        return [register_one_account(progress=progress) for _ in range(total)]
+
+    progress_lock = threading.Lock()
+
+    def safe_progress(step: str, email: str = "") -> None:
+        if progress is None:
+            return
+        with progress_lock:
+            progress(step, email)
+
+    results: List[Optional[Dict[str, Any]]] = [None] * total
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(register_one_account, progress=safe_progress): index
+            for index in range(total)
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            results[index] = future.result()
+    return [
+        item if item is not None else {"ok": False, "status": "registration_error"}
+        for item in results
+    ]
 
 
 def registration_job_payload(row: sqlite3.Row) -> Dict[str, Any]:
@@ -6041,7 +6162,107 @@ def registration_job_payload(row: sqlite3.Row) -> Dict[str, Any]:
     except (TypeError, ValueError, json.JSONDecodeError):
         results = []
     item["items"] = results if isinstance(results, list) else []
+    try:
+        events = json.loads(item.pop("events_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        events = []
+    if not isinstance(events, list):
+        events = []
+    # Keep the newest events while bounding payload size for polling clients.
+    item["events"] = events[-200:]
     return item
+
+
+REGISTRATION_EVENT_STEP_MESSAGES = {
+    "queued": "等待开始",
+    "starting": "正在启动注册任务",
+    "create_mailbox": "正在创建邮箱",
+    "signup_attempt": "正在提交注册",
+    "email_verification": "正在等待邮箱验证",
+    "login_and_save": "正在登录并保存账号",
+    "generation_validation": "正在验证真实生成能力",
+    "completed": "当前账号处理完成",
+    "account_done": "账号注册结束",
+    "interrupted": "任务已中断",
+    "failed": "任务执行失败",
+    "registration_error": "注册过程异常",
+}
+
+REGISTRATION_PIPELINE_STEPS = (
+    "create_mailbox",
+    "signup_attempt",
+    "email_verification",
+    "login_and_save",
+    "generation_validation",
+    "completed",
+)
+
+REGISTRATION_JOB_EVENTS_LOCK = threading.Lock()
+
+
+def registration_event_message(step: str, *, level: str = "info", status: str = "") -> str:
+    key = str(step or "").strip().lower()
+    if level == "success":
+        return "注册成功"
+    if level == "error":
+        status_key = str(status or "").strip().lower()
+        if status_key:
+            return f"注册失败（{status_key}）"
+        return "注册失败"
+    return REGISTRATION_EVENT_STEP_MESSAGES.get(key, key or "处理中")
+
+
+def append_registration_job_events(job_id: int, new_events: List[Dict[str, Any]]) -> None:
+    if not new_events:
+        return
+    with REGISTRATION_JOB_EVENTS_LOCK:
+        conn = db_conn()
+        try:
+            row = conn.execute(
+                "SELECT events_json FROM registration_jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                events = json.loads(row["events_json"] or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                events = []
+            if not isinstance(events, list):
+                events = []
+            events.extend(new_events)
+            events = events[-200:]
+            conn.execute(
+                """
+                UPDATE registration_jobs
+                SET events_json=?, updated_at=?
+                WHERE id=?
+                """,
+                (json.dumps(events, ensure_ascii=False), time.time(), job_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def append_registration_job_event(
+    job_id: int,
+    *,
+    step: str,
+    email: str = "",
+    level: str = "info",
+    message: str = "",
+    status: str = "",
+) -> None:
+    event = {
+        "ts": time.time(),
+        "email": str(email or ""),
+        "step": str(step or ""),
+        "level": str(level or "info"),
+        "message": str(message or registration_event_message(step, level=level, status=status)),
+        "status": str(status or ""),
+    }
+    append_registration_job_events(job_id, [event])
 
 
 def create_registration_job(count: int) -> Dict[str, Any]:
@@ -6054,9 +6275,9 @@ def create_registration_job(count: int) -> Dict[str, Any]:
         """
         INSERT INTO registration_jobs(
             status,total,completed,succeeded,failed,current_index,current_step,
-            current_email,items_json,error_message,created_at,updated_at
+            current_email,items_json,events_json,error_message,created_at,updated_at
         )
-        VALUES('queued',?,0,0,0,0,'queued','','[]','',?,?)
+        VALUES('queued',?,0,0,0,0,'queued','','[]','[]','',?,?)
         """,
         (total, now, now),
     )
@@ -6082,6 +6303,8 @@ def update_registration_job(job_id: int, **fields: Any) -> None:
     payload = dict(fields)
     if "items" in payload:
         payload["items_json"] = json.dumps(payload.pop("items"), ensure_ascii=False)
+    if "events" in payload:
+        payload["events_json"] = json.dumps(payload.pop("events"), ensure_ascii=False)
     payload["updated_at"] = time.time()
     assignments = ", ".join(f"{key}=?" for key in payload)
     conn = db_conn()
@@ -6108,51 +6331,92 @@ def run_registration_job(job_id: int) -> None:
         current_step="starting",
         error_message="",
     )
+    append_registration_job_event(
+        job_id,
+        step="starting",
+        level="info",
+        message=f"开始注册任务，目标 {total} 个账号，并发 {registration_concurrency()}",
+    )
 
-    for index in range(completed, total):
+    progress_lock = threading.Lock()
+    while completed < total:
+        batch_size = min(registration_concurrency(), total - completed)
         current_email = ""
 
         def progress(step: str, email: str = "") -> None:
             nonlocal current_email
-            if email:
-                current_email = email
-            update_registration_job(
-                job_id,
-                current_index=index + 1,
-                current_step=step,
-                current_email=current_email,
-            )
+            with progress_lock:
+                if email:
+                    current_email = email
+                update_registration_job(
+                    job_id,
+                    current_index=min(total, completed + batch_size),
+                    current_step=step,
+                    current_email=current_email,
+                )
+                append_registration_job_event(
+                    job_id,
+                    step=step,
+                    email=email or current_email,
+                    level="info",
+                )
 
         try:
-            registered = auto_register_accounts(1, progress=progress)
-            if not registered:
-                raise RuntimeError("registration returned no result")
-            result = public_registration_result(registered[0])
+            registered = auto_register_accounts(batch_size, progress=progress)
+            if len(registered) != batch_size:
+                raise RuntimeError("registration returned incomplete batch")
         except Exception as exc:
-            result = {
-                "ok": False,
-                "status": "registration_error",
-                "email": current_email,
-                "error": str(exc),
-            }
-        results.append(result)
-        if result.get("ok") or result.get("status") == "verified":
-            succeeded += 1
-        else:
-            failed += 1
-        completed = index + 1
-        update_registration_job(
-            job_id,
-            completed=completed,
-            succeeded=succeeded,
-            failed=failed,
-            current_index=completed,
-            current_step="completed",
-            current_email=str(result.get("email") or current_email),
-            items=results,
-        )
+            registered = [
+                {
+                    "ok": False,
+                    "status": "registration_error",
+                    "email": current_email,
+                    "error": str(exc),
+                }
+                for _ in range(batch_size)
+            ]
+
+        for raw in registered:
+            result = public_registration_result(raw)
+            results.append(result)
+            ok = bool(result.get("ok") or result.get("status") == "verified")
+            if ok:
+                succeeded += 1
+            else:
+                failed += 1
+            completed += 1
+            email = str(result.get("email") or current_email)
+            status = str(result.get("status") or "")
+            append_registration_job_event(
+                job_id,
+                step="account_done",
+                email=email,
+                level="success" if ok else "error",
+                status=status,
+                message=registration_event_message(
+                    "account_done",
+                    level="success" if ok else "error",
+                    status=status,
+                ),
+            )
+            update_registration_job(
+                job_id,
+                completed=completed,
+                succeeded=succeeded,
+                failed=failed,
+                current_index=completed,
+                current_step="completed",
+                current_email=email,
+                items=results,
+            )
 
     final_status = "completed" if failed == 0 else "completed_with_errors"
+    append_registration_job_event(
+        job_id,
+        step="completed",
+        level="success" if failed == 0 else "error",
+        message=f"注册任务结束：成功 {succeeded}，失败 {failed}",
+    )
     update_registration_job(
         job_id,
         status=final_status,
@@ -6632,52 +6896,61 @@ def run_pool_maintenance_job(job_id: int) -> None:
 
     registered = 0
     registration_failed = 0
-    for _ in range(registration_target):
+    remaining = registration_target
+    progress_lock = threading.Lock()
+    while remaining > 0:
+        batch_size = min(registration_concurrency(), remaining)
         current_email = ""
 
         def progress(step: str, email: str = "") -> None:
             nonlocal current_email
-            if email:
-                current_email = email
-            update_pool_maintenance_job(
-                job_id,
-                current_step=f"register_{step}",
-                current_email=current_email,
-            )
+            with progress_lock:
+                if email:
+                    current_email = email
+                update_pool_maintenance_job(
+                    job_id,
+                    current_step=f"register_{step}",
+                    current_email=current_email,
+                )
 
         try:
-            registered_items = auto_register_accounts(1, progress=progress)
-            if not registered_items:
-                raise RuntimeError("registration returned no result")
-            result = public_registration_result(registered_items[0])
+            registered_items = auto_register_accounts(batch_size, progress=progress)
+            if len(registered_items) != batch_size:
+                raise RuntimeError("registration returned incomplete batch")
         except Exception:
-            result = {
-                "ok": False,
-                "status": "registration_error",
-                "email": current_email,
-                "error": "账号注册失败",
-            }
+            registered_items = [
+                {
+                    "ok": False,
+                    "status": "registration_error",
+                    "email": current_email,
+                    "error": "账号注册失败",
+                }
+                for _ in range(batch_size)
+            ]
 
-        ok = bool(result.get("ok") or result.get("status") == "verified")
-        if ok:
-            registered += 1
-        else:
-            registration_failed += 1
-        items.append(
-            {
-                **result,
-                "category": "registration",
-                "action": "registered" if ok else "registration_failed",
-            }
-        )
-        update_pool_maintenance_job(
-            job_id,
-            registered=registered,
-            registration_failed=registration_failed,
-            current_step="supplementing",
-            current_email=str(result.get("email") or current_email),
-            items=items,
-        )
+        for raw in registered_items:
+            result = public_registration_result(raw)
+            ok = bool(result.get("ok") or result.get("status") == "verified")
+            if ok:
+                registered += 1
+            else:
+                registration_failed += 1
+            items.append(
+                {
+                    **result,
+                    "category": "registration",
+                    "action": "registered" if ok else "registration_failed",
+                }
+            )
+            remaining -= 1
+            update_pool_maintenance_job(
+                job_id,
+                registered=registered,
+                registration_failed=registration_failed,
+                current_step="supplementing",
+                current_email=str(result.get("email") or current_email),
+                items=items,
+            )
 
     final_summary = account_pool_summary(list_accounts())
     target_unmet = supplement and final_summary["healthy"] < target_healthy
@@ -6763,6 +7036,101 @@ def recover_interrupted_pool_maintenance_jobs() -> int:
         return int(cursor.rowcount or 0)
     finally:
         conn.close()
+
+
+def active_pool_maintenance_job_id() -> Optional[int]:
+    conn = db_conn()
+    row = conn.execute(
+        """
+        SELECT id FROM pool_maintenance_jobs
+        WHERE status IN ('queued','running')
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return int(row["id"])
+
+
+def maybe_launch_scheduled_pool_maintenance() -> Optional[int]:
+    """Create and launch one maintenance job when auto-maintain is enabled and idle."""
+    if not pool_auto_maintain_enabled():
+        return None
+    if active_pool_maintenance_job_id() is not None:
+        return None
+    try:
+        job = create_pool_maintenance_job(
+            clean_risk=True,
+            supplement=True,
+            target_healthy=None,
+            max_register=pool_auto_maintain_max_register(),
+        )
+    except HTTPException as exc:
+        if int(getattr(exc, "status_code", 0) or 0) == 409:
+            return None
+        raise
+    launch_pool_maintenance_job(int(job["id"]))
+    emit_log("info", f"已调度号池自动维护任务 #{job['id']}")
+    return int(job["id"])
+
+
+def pool_maintenance_scheduler_loop() -> None:
+    while not POOL_MAINTENANCE_SCHEDULER_STOP.is_set():
+        interval = pool_auto_maintain_interval_seconds()
+        if interval <= 0:
+            POOL_MAINTENANCE_SCHEDULER_WAKE.wait(60.0)
+            POOL_MAINTENANCE_SCHEDULER_WAKE.clear()
+            continue
+        POOL_MAINTENANCE_SCHEDULER_WAKE.wait(interval)
+        POOL_MAINTENANCE_SCHEDULER_WAKE.clear()
+        if POOL_MAINTENANCE_SCHEDULER_STOP.is_set():
+            break
+        try:
+            maybe_launch_scheduled_pool_maintenance()
+        except Exception as exc:
+            emit_log(
+                "warning",
+                f"号池自动维护调度失败：{type(exc).__name__}: {exc}",
+            )
+
+
+def ensure_pool_maintenance_scheduler_started() -> None:
+    global POOL_MAINTENANCE_SCHEDULER_THREAD
+    with POOL_MAINTENANCE_SCHEDULER_LOCK:
+        if not pool_auto_maintain_enabled():
+            return
+        existing = POOL_MAINTENANCE_SCHEDULER_THREAD
+        if existing is not None and existing.is_alive():
+            return
+        POOL_MAINTENANCE_SCHEDULER_STOP.clear()
+        POOL_MAINTENANCE_SCHEDULER_THREAD = threading.Thread(
+            target=pool_maintenance_scheduler_loop,
+            name="pool-maintenance-scheduler",
+            daemon=True,
+        )
+        POOL_MAINTENANCE_SCHEDULER_THREAD.start()
+
+
+def stop_pool_maintenance_scheduler(timeout: float) -> bool:
+    global POOL_MAINTENANCE_SCHEDULER_THREAD
+    POOL_MAINTENANCE_SCHEDULER_STOP.set()
+    POOL_MAINTENANCE_SCHEDULER_WAKE.set()
+    with POOL_MAINTENANCE_SCHEDULER_LOCK:
+        worker = POOL_MAINTENANCE_SCHEDULER_THREAD
+        if worker is None or not worker.is_alive():
+            POOL_MAINTENANCE_SCHEDULER_THREAD = None
+            return True
+        join_timeout = float_or_default(timeout, 0.0)
+        if not math.isfinite(join_timeout):
+            join_timeout = 0.0
+        worker.join(timeout=max(0.0, join_timeout))
+        if worker.is_alive():
+            return False
+        POOL_MAINTENANCE_SCHEDULER_THREAD = None
+        return True
+
 
 
 class OpenAIPathCORSMiddleware:
@@ -9782,6 +10150,7 @@ def on_startup():
         recover_interrupted_registration_jobs()
         recover_interrupted_pool_maintenance_jobs()
         ensure_task_worker_started()
+        ensure_pool_maintenance_scheduler_started()
     except BaseException:
         APP_LIFECYCLE_STARTED = False
         application_lock.release()
@@ -9800,7 +10169,9 @@ def on_shutdown() -> bool:
     )
     if not math.isfinite(shutdown_timeout):
         shutdown_timeout = 30.0
-    worker_stopped = stop_task_worker(max(0.0, shutdown_timeout))
+    task_stopped = stop_task_worker(max(0.0, shutdown_timeout))
+    scheduler_stopped = stop_pool_maintenance_scheduler(max(0.0, min(5.0, shutdown_timeout)))
+    worker_stopped = task_stopped and scheduler_stopped
     APP_LIFECYCLE_STARTED = False
     if not worker_stopped:
         return False
@@ -9927,11 +10298,19 @@ def put_settings(body: SettingsIn, _=Depends(require_admin)):
         restart_required = candidate.get("server", {}).get("port") != CFG.get("server", {}).get("port")
         save_config(candidate)
         CFG = candidate
-        return {
-            "ok": True,
-            "config": public_config(CFG),
-            "restart_required": restart_required,
-        }
+    # Apply pool auto-maintain changes without requiring a process restart.
+    # Only touch the live scheduler when the app lifecycle is running; API-only
+    # unit tests must not spawn background workers that keep the temp DB locked.
+    if APP_LIFECYCLE_STARTED:
+        if pool_auto_maintain_enabled():
+            ensure_pool_maintenance_scheduler_started()
+        else:
+            stop_pool_maintenance_scheduler(0.5)
+    return {
+        "ok": True,
+        "config": public_config(CFG),
+        "restart_required": restart_required,
+    }
 
 
 @app.get("/api/accounts")
@@ -10403,6 +10782,30 @@ tr:hover td{background:#fafafa}
 .registration-fill{height:100%;background:#1d1d1f;border-radius:999px;transition:width .3s}
 .registration-meta{font-size:12px;color:#6e6e73;line-height:1.7}
 .registration-results{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.reg-console-controls{display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-bottom:16px}
+.reg-console-controls .col{flex:0 0 140px;min-width:120px}
+.reg-console-hint{font-size:12px;color:#86868b;align-self:center;padding-bottom:10px}
+.reg-pipeline{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 12px}
+.reg-pipeline-step{font-size:11px;padding:5px 10px;border-radius:999px;background:#ececef;color:#6e6e73}
+.reg-pipeline-step.active{background:#1d1d1f;color:#fff}
+.reg-pipeline-step.done{background:#e8f5e9;color:#2e7d32}
+.reg-event-log{max-height:240px;overflow:auto;border:1px solid #e8e8ed;border-radius:10px;background:#fff;padding:8px 10px;font-size:12px;line-height:1.55}
+.reg-event-row{display:grid;grid-template-columns:64px minmax(120px,1.2fr) minmax(140px,1.6fr);gap:8px;padding:4px 0;border-bottom:1px solid #f3f3f4}
+.reg-event-row:last-child{border-bottom:none}
+.reg-event-row.level-success{color:#2e7d32}
+.reg-event-row.level-error{color:#c62828}
+.reg-event-time{color:#86868b;font-variant-numeric:tabular-nums}
+.reg-event-email{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-all}
+.reg-result-banner{display:flex;align-items:center;justify-content:space-between;gap:12px;border-radius:10px;padding:10px 12px;margin:0 0 12px;font-size:13px}
+.reg-result-banner.ok{background:#e8f5e9;color:#1b5e20}
+.reg-result-banner.warn{background:#fff8e1;color:#8d6e00}
+.reg-result-banner.err{background:#ffebee;color:#b71c1c}
+.reg-result-banner button{border:none;background:transparent;color:inherit;cursor:pointer;font-size:12px;text-decoration:underline}
+.toast-host{position:fixed;right:20px;bottom:20px;z-index:1000;display:flex;flex-direction:column;gap:8px;max-width:360px;pointer-events:none}
+.toast{pointer-events:auto;background:#1d1d1f;color:#fff;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.45;box-shadow:0 8px 24px rgba(0,0,0,.18);animation:fadeUp .25s ease}
+.toast.ok{background:#2e7d32}
+.toast.warn{background:#8d6e00}
+.toast.err{background:#c62828}
 .password-cell{min-width:190px}
 .password-value{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;word-break:break-all}
 .password-actions{display:flex;gap:5px;margin-top:6px}
@@ -10459,6 +10862,7 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
 </div>
 
 <div class="container">
+<div id="toast-host" class="toast-host" aria-live="polite"></div>
 
 <div class="stats">
   <div class="stat-card"><div class="num" id="st-total">-</div><div class="label">总账号</div></div>
@@ -10479,13 +10883,15 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
     </div>
     <div id="pool-capacity-note" class="pool-capacity-note">正在加载积分容量…</div>
   </div>
-  <div class="row" style="margin-bottom:16px">
+  <div class="reg-console-controls">
     <div class="col"><label>注册数量</label><input id="reg_count" type="number" min="1" max="50" step="1" value="1"></div>
-    <div><button id="reg-one" class="btn-primary" onclick="registerOne()">注册 1 个</button></div>
-    <div><button id="reg-batch" class="btn-primary" onclick="registerBatch()">批量注册</button></div>
-    <div><button id="maintenance-start" class="btn-secondary" onclick="maintainPool()">批量体检并补号</button></div>
+    <div><button id="reg-start" class="btn-primary" onclick="startRegistrationFromControls()">开始注册</button></div>
+    <div><button id="maintenance-start" class="btn-secondary" onclick="maintainPool()">体检并补号</button></div>
     <div><button class="btn-secondary" onclick="toggleImport()">导入账号</button></div>
+    <div id="reg-concurrency-hint" class="reg-console-hint">并发：-</div>
   </div>
+  <div id="registration-result-banner" class="reg-result-banner hidden"></div>
+  <div id="maintenance-result-banner" class="reg-result-banner hidden"></div>
   <div id="registration-progress" class="registration-progress hidden"></div>
   <div id="maintenance-progress" class="registration-progress hidden"></div>
   <div id="import-area" class="hidden" style="margin-bottom:12px">
@@ -10832,6 +11238,11 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
     <div class="col"><label>最低账号数</label><input id="s-min" type="number" min="0" step="1" value="3"></div>
     <div class="col"><label>维护目标数</label><input id="s-target" type="number" min="0" step="1" value="5"></div>
   </div>
+  <div class="row" style="margin-top:8px">
+    <div class="col"><label>自动维护间隔（秒，0=关闭）</label><input id="s-maintain-interval" type="number" min="0" step="1" value="300"></div>
+    <div class="col"><label>注册并发数（1-8）</label><input id="s-reg-concurrency" type="number" min="1" max="8" step="1" value="3"></div>
+    <div class="col"><label>自动补号上限（0-50）</label><input id="s-auto-register-max" type="number" min="0" max="50" step="1" value="5"></div>
+  </div>
   <div style="margin-top:16px"><button class="btn-primary" onclick="saveSettings()">保存设置</button></div>
   <pre id="settings-raw" style="margin-top:12px"></pre>
 
@@ -11110,6 +11521,7 @@ function listPageSummary(page){
 let state = {
   accounts:[],tasks:[],apikeys:[],clients:[],usage:[],uploads:[],costReport:[],auditLogs:[],
   accountCredentials:{},revealedAccountPasswords:{},registrationJob:null,maintenanceJob:null,
+  registrationLogPinned:false,maintenanceLogPinned:false,
   capacity:null,
   settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}},
   lists:{
@@ -11527,6 +11939,46 @@ async function copyAccountPassword(accountId){
     alert(`复制密码失败：${error?.message || String(error)}`);
   }
 }
+function showToast(message, level='ok'){
+  const host=document.getElementById('toast-host');
+  if(!host) return;
+  const el=document.createElement('div');
+  el.className='toast '+(level||'ok');
+  el.textContent=String(message||'');
+  host.appendChild(el);
+  setTimeout(()=>{el.remove();},4200);
+}
+function showResultBanner(panelId, message, level='ok', onViewFailures=null){
+  const panel=document.getElementById(panelId);
+  if(!panel) return;
+  panel.className='reg-result-banner '+(level||'ok');
+  panel.classList.remove('hidden');
+  panel.innerHTML='<span>'+escapeHtml(message)+'</span><span></span>';
+  const actions=panel.lastElementChild;
+  if(onViewFailures){
+    const viewBtn=document.createElement('button');
+    viewBtn.type='button';
+    viewBtn.textContent='查看失败';
+    viewBtn.onclick=onViewFailures;
+    actions.appendChild(viewBtn);
+  }
+  const closeBtn=document.createElement('button');
+  closeBtn.type='button';
+  closeBtn.textContent='关闭';
+  closeBtn.onclick=()=>panel.classList.add('hidden');
+  actions.appendChild(closeBtn);
+}
+function formatEventTime(ts){
+  const date=new Date((Number(ts)||0)*1000);
+  if(Number.isNaN(date.getTime())) return '--:--:--';
+  return date.toLocaleTimeString('zh-CN',{hour12:false});
+}
+function maskEmail(email){
+  const value=String(email||'').trim();
+  const at=value.indexOf('@');
+  if(at<=1) return value || '-';
+  return value.slice(0,1)+'***'+value.slice(at);
+}
 function registrationStepLabel(step){
   return ({
     queued:'等待开始',
@@ -11537,7 +11989,10 @@ function registrationStepLabel(step){
     login_and_save:'正在登录并保存账号',
     generation_validation:'正在验证真实生成能力',
     completed:'当前账号处理完成',
+    account_done:'账号注册结束',
     interrupted:'任务已中断',
+    failed:'任务执行失败',
+    registration_error:'注册过程异常',
   })[String(step||'').toLowerCase()] || String(step||'处理中');
 }
 function registrationStatusLabel(status){
@@ -11549,38 +12004,90 @@ function registrationStatusLabel(status){
     failed:'失败',
   })[String(status||'').toLowerCase()] || String(status||'');
 }
+function registrationPipelineSteps(){
+  return [
+    {id:'create_mailbox',label:'建邮'},
+    {id:'signup_attempt',label:'注册'},
+    {id:'email_verification',label:'验邮'},
+    {id:'login_and_save',label:'登录'},
+    {id:'generation_validation',label:'探针'},
+    {id:'completed',label:'入库'},
+  ];
+}
+function pipelineStepClass(stepId, currentStep, status){
+  const order=registrationPipelineSteps().map(s=>s.id);
+  const current=String(currentStep||'').toLowerCase();
+  const idx=order.indexOf(stepId);
+  const curIdx=order.indexOf(current);
+  const terminal=['completed','completed_with_errors','failed'].includes(String(status||'').toLowerCase());
+  if(terminal) return 'done';
+  if(curIdx<0) return idx===0?'active':'';
+  if(idx<curIdx) return 'done';
+  if(idx===curIdx) return 'active';
+  return '';
+}
+function renderRegistrationEventLog(events){
+  if(!Array.isArray(events) || !events.length){
+    return '<div class="registration-meta">等待事件日志…</div>';
+  }
+  const rows=events.slice(-200).map(event=>{
+    const level=String(event?.level||'info');
+    const message=event?.message || registrationStepLabel(event?.step);
+    return `<div class="reg-event-row level-${escapeHtml(level)}"><span class="reg-event-time">${escapeHtml(formatEventTime(event?.ts))}</span><span class="reg-event-email">${escapeHtml(maskEmail(event?.email))}</span><span>${escapeHtml(message)}</span></div>`;
+  }).join('');
+  return `<div id="registration-event-log" class="reg-event-log">${rows}</div>`;
+}
+function updateRegistrationConcurrencyHint(){
+  const hint=document.getElementById('reg-concurrency-hint');
+  if(!hint) return;
+  const concurrency=Number(state.settings?.pool?.registration_concurrency);
+  hint.textContent=`并发：${Number.isSafeInteger(concurrency)&&concurrency>0?concurrency:3}`;
+}
 function renderRegistrationProgress(job,connectionMessage=''){
   const panel=document.getElementById('registration-progress');
   if(!panel || !job) return;
   const total=Math.max(1,Number(job.total)||1);
   const completed=Math.max(0,Number(job.completed)||0);
   const percent=Math.min(100,Math.round(completed/total*100));
-  const items=Array.isArray(job.items)?job.items:[];
-  const itemTags=items.map(item=>{
-    const ok=item?.ok || item?.status==='verified';
-    return `<span class="tag ${ok?'tag-green':'tag-red'}">${escapeHtml(item?.email||`第 ${items.indexOf(item)+1} 个`)} · ${ok?'成功':'失败'}</span>`;
+  const events=Array.isArray(job.events)?job.events:[];
+  const pipeline=registrationPipelineSteps().map(step=>{
+    const cls=pipelineStepClass(step.id, job.current_step, job.status);
+    return `<span class="reg-pipeline-step ${cls}">${escapeHtml(step.label)}</span>`;
   }).join('');
+  const previousLog=document.getElementById('registration-event-log');
+  const previousPinned=state.registrationLogPinned;
+  const previousScroll=previousLog?previousLog.scrollTop:0;
   panel.classList.remove('hidden');
   panel.innerHTML=`
     <div class="registration-progress-head">
       <span>注册任务 #${escapeHtml(job.id||'-')} · ${escapeHtml(registrationStatusLabel(job.status))}</span>
-      <span>${completed} / ${total}</span>
+      <span>${completed} / ${total} · 成功 ${Number(job.succeeded)||0} · 失败 ${Number(job.failed)||0}</span>
     </div>
     <div class="registration-track"><div class="registration-fill" style="width:${percent}%"></div></div>
+    <div class="reg-pipeline">${pipeline}</div>
     <div class="registration-meta">
       当前步骤：${escapeHtml(registrationStepLabel(job.current_step))}
       ${job.current_email?` · 当前邮箱：${escapeHtml(job.current_email)}`:''}
-      <br>成功 ${Number(job.succeeded)||0} 个 · 失败 ${Number(job.failed)||0} 个
       ${connectionMessage?`<br>${escapeHtml(connectionMessage)}`:''}
       ${job.error_message?`<br><span style="color:#c62828">${escapeHtml(job.error_message)}</span>`:''}
     </div>
-    ${itemTags?`<div class="registration-results">${itemTags}</div>`:''}`;
+    ${renderRegistrationEventLog(events)}`;
+  const log=document.getElementById('registration-event-log');
+  if(log){
+    log.addEventListener('scroll',()=>{
+      const distance=log.scrollHeight-log.scrollTop-log.clientHeight;
+      state.registrationLogPinned=distance>24;
+    });
+    if(previousPinned) log.scrollTop=previousScroll;
+    else log.scrollTop=log.scrollHeight;
+  }
 }
 function setRegistrationButtonsDisabled(disabled){
-  ['reg-one','reg-batch'].forEach(id=>{
-    const button=document.getElementById(id);
-    if(button) button.disabled=disabled;
-  });
+  const button=document.getElementById('reg-start');
+  if(button){
+    button.disabled=disabled;
+    button.textContent=disabled?'注册中…':'开始注册';
+  }
 }
 async function pollRegistrationJob(jobId){
   const terminal=new Set(['completed','completed_with_errors','failed']);
@@ -11599,36 +12106,53 @@ async function pollRegistrationJob(jobId){
     if(terminal.has(String(job.status||'').toLowerCase())){
       setRegistrationButtonsDisabled(false);
       await loadAccounts();
-      document.getElementById('status-text').textContent=`注册完成 — 成功 ${job.succeeded||0}，失败 ${job.failed||0}`;
-      alert(job.failed?`注册完成：成功 ${job.succeeded||0} 个，失败 ${job.failed||0} 个`:`注册成功：${job.succeeded||0} 个账号`);
+      const succeeded=Number(job.succeeded)||0;
+      const failed=Number(job.failed)||0;
+      document.getElementById('status-text').textContent=`注册完成 — 成功 ${succeeded}，失败 ${failed}`;
+      const level=failed? (succeeded?'warn':'err') : 'ok';
+      const message=failed
+        ?`注册完成：成功 ${succeeded} 个，失败 ${failed} 个`
+        :`注册成功：${succeeded} 个账号`;
+      showResultBanner('registration-result-banner', message, level, failed?()=>{
+        const log=document.getElementById('registration-event-log');
+        if(log) log.scrollTop=log.scrollHeight;
+      }:null);
+      showToast(message, level);
       return job;
     }
   }
 }
 async function startRegistration(count){
   if(state.registrationJob && ['queued','running'].includes(String(state.registrationJob.status||'').toLowerCase())){
-    alert('已有注册任务正在执行');
+    showToast('已有注册任务正在执行','warn');
     return null;
   }
   const total=Number(count);
   if(!Number.isSafeInteger(total) || total<1 || total>50){
-    alert('注册数量必须是 1～50 的整数');
+    showToast('注册数量必须是 1～50 的整数','err');
     return null;
   }
+  try{localStorage.setItem('oreate_reg_count', String(total));}catch(_){ }
   setRegistrationButtonsDisabled(true);
+  document.getElementById('registration-result-banner')?.classList.add('hidden');
   document.getElementById('status-text').textContent='正在创建注册任务…';
+  updateRegistrationConcurrencyHint();
   try{
     const response=await api('POST','/api/register/jobs',{count:total});
     state.registrationJob=response.job;
+    state.registrationLogPinned=false;
     renderRegistrationProgress(response.job);
     document.getElementById('status-text').textContent='账号注册中…';
     return await pollRegistrationJob(response.job.id);
   }catch(error){
     setRegistrationButtonsDisabled(false);
     document.getElementById('status-text').textContent='注册任务创建失败';
-    alert(`注册失败：${error?.message || String(error)}`);
+    showToast(`注册失败：${error?.message || String(error)}`,'err');
     return null;
   }
+}
+function startRegistrationFromControls(){
+  return startRegistration(Number(document.getElementById('reg_count').value||1));
 }
 async function registerOne(){return startRegistration(1);}
 async function registerBatch(){return startRegistration(Number(document.getElementById('reg_count').value||1));}
@@ -11684,11 +12208,11 @@ function renderMaintenanceProgress(job,connectionMessage=''){
   const total=Math.max(0,Number(job.total_accounts)||0);
   const checked=Math.max(0,Number(job.checked_accounts)||0);
   const percent=total===0?100:Math.min(100,Math.round(checked/total*100));
-  const items=(Array.isArray(job.items)?job.items:[]).slice(-30);
-  const itemTags=items.map(item=>{
+  const items=(Array.isArray(job.items)?job.items:[]).slice(-40);
+  const rows=items.map(item=>{
     const failed=item?.action==='registration_failed'||item?.category==='check_failed';
-    const isolated=item?.action==='isolated';
-    return `<span class="tag ${failed?'tag-red':isolated?'tag-blue':'tag-green'}">${escapeHtml(maintenanceItemLabel(item))}</span>`;
+    const level=failed?'error':(item?.action==='isolated'?'info':'success');
+    return `<div class="reg-event-row level-${level}"><span class="reg-event-time">--:--:--</span><span class="reg-event-email">${escapeHtml(maskEmail(item?.email||`#${item?.account_id||'-'}`))}</span><span>${escapeHtml(maintenanceItemLabel(item))}</span></div>`;
   }).join('');
   panel.classList.remove('hidden');
   panel.innerHTML=`
@@ -11705,7 +12229,9 @@ function renderMaintenanceProgress(job,connectionMessage=''){
       ${connectionMessage?`<br>${escapeHtml(connectionMessage)}`:''}
       ${job.error_message?`<br><span style="color:#c62828">${escapeHtml(job.error_message)}</span>`:''}
     </div>
-    ${itemTags?`<div class="registration-results">${itemTags}</div>`:''}`;
+    <div id="maintenance-event-log" class="reg-event-log">${rows || '<div class="registration-meta">等待检测结果…</div>'}</div>`;
+  const log=document.getElementById('maintenance-event-log');
+  if(log && !state.maintenanceLogPinned) log.scrollTop=log.scrollHeight;
 }
 function setMaintenanceButtonDisabled(disabled){
   const button=document.getElementById('maintenance-start');
@@ -11735,14 +12261,17 @@ async function pollMaintenanceJob(jobId){
         :job.status==='failed'
           ?'号池维护失败'
           :'号池维护部分完成';
-      alert(`${prefix}：健康账号 ${job.healthy_after||0} 个，隔离风险/失效账号 ${job.isolated_accounts||0} 个，补号成功 ${job.registered||0} 个，失败 ${job.registration_failed||0} 个`);
+      const message=`${prefix}：健康 ${job.healthy_after||0}，隔离 ${job.isolated_accounts||0}，补号成功 ${job.registered||0}，失败 ${job.registration_failed||0}`;
+      const level=job.status==='completed'?'ok':(job.status==='failed'?'err':'warn');
+      showResultBanner('maintenance-result-banner', message, level);
+      showToast(message, level);
       return job;
     }
   }
 }
 async function maintainPool(){
   if(state.maintenanceJob && ['queued','running'].includes(String(state.maintenanceJob.status||'').toLowerCase())){
-    alert('已有号池维护任务正在执行');
+    showToast('已有号池维护任务正在执行','warn');
     return null;
   }
   if(!confirm('将批量检测全部账号，并为每个候选账号发起一次低成本图片生成验证；风险和失效账号会被隔离，再按健康账号缺口自动补号。检测会消耗少量积分，是否继续？')) return null;
@@ -11751,6 +12280,7 @@ async function maintainPool(){
   const requestedMax=Number(document.getElementById('reg_count').value||1);
   const maxRegister=Number.isSafeInteger(requestedMax)&&requestedMax>=0&&requestedMax<=50?requestedMax:1;
   setMaintenanceButtonDisabled(true);
+  document.getElementById('maintenance-result-banner')?.classList.add('hidden');
   document.getElementById('status-text').textContent='正在创建号池维护任务…';
   try{
     const response=await api('POST','/api/pool/maintenance/jobs',{
@@ -11760,13 +12290,14 @@ async function maintainPool(){
       max_register:maxRegister,
     });
     state.maintenanceJob=response.job;
+    state.maintenanceLogPinned=false;
     renderMaintenanceProgress(response.job);
     document.getElementById('status-text').textContent='正在批量检测账号…';
     return await pollMaintenanceJob(response.job.id);
   }catch(error){
     setMaintenanceButtonDisabled(false);
     document.getElementById('status-text').textContent='号池维护任务创建失败';
-    alert(`号池维护失败：${error?.message||String(error)}`);
+    showToast(`号池维护失败：${error?.message||String(error)}`,'err');
     return null;
   }
 }
@@ -12590,6 +13121,16 @@ async function loadSettings(){
   document.getElementById('s-vid-model').value=s.oreate?.default_video_model||'';
   document.getElementById('s-min').value=s.pool?.min_accounts??3;
   document.getElementById('s-target').value=s.pool?.maintain_target??5;
+  document.getElementById('s-maintain-interval').value=s.pool?.maintain_check_interval??300;
+  document.getElementById('s-reg-concurrency').value=s.pool?.registration_concurrency??3;
+  document.getElementById('s-auto-register-max').value=s.pool?.auto_maintain_max_register??5;
+  updateRegistrationConcurrencyHint();
+  try{
+    const savedCount=Number(localStorage.getItem('oreate_reg_count'));
+    if(Number.isSafeInteger(savedCount) && savedCount>=1 && savedCount<=50){
+      document.getElementById('reg_count').value=savedCount;
+    }
+  }catch(_){ }
   document.getElementById('s-mail-url').value=s.mail?.base_url||'';
   document.getElementById('s-mail-key').value='';
   document.getElementById('s-mail-key').placeholder=s.mail?.api_key==='__redacted__'?'留空不修改':'mail api key';
@@ -12611,6 +13152,9 @@ async function saveSettings(){
     const port=requiredIntegerValue('s-port','服务端口',1,65535);
     const minAccounts=requiredIntegerValue('s-min','最低账号数',0);
     const maintainTarget=requiredIntegerValue('s-target','维护目标数',0);
+    const maintainInterval=requiredIntegerValue('s-maintain-interval','自动维护间隔',0);
+    const registrationConcurrency=requiredIntegerValue('s-reg-concurrency','注册并发数',1,8);
+    const autoMaintainMaxRegister=requiredIntegerValue('s-auto-register-max','自动补号上限',0,50);
     if(maintainTarget < minAccounts) throw new Error('维护目标数不能小于最低账号数');
     const doms=document.getElementById('s-mail-domains').value.split(',').map(s=>s.trim()).filter(Boolean);
     const body={
@@ -12627,6 +13171,9 @@ async function saveSettings(){
       pool:{
         min_accounts:minAccounts,
         maintain_target:maintainTarget,
+        maintain_check_interval:maintainInterval,
+        registration_concurrency:registrationConcurrency,
+        auto_maintain_max_register:autoMaintainMaxRegister,
       },
     };
     const mailKey=document.getElementById('s-mail-key').value.trim();

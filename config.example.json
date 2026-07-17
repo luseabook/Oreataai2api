@@ -46,6 +46,8 @@
     "maintain_target": 5,
     "valid_threshold_pct": 1.0,
     "maintain_check_interval": 300,
+    "registration_concurrency": 3,
+    "auto_maintain_max_register": 5,
     "generation_probe_prompt": "账号健康检测：请生成白色背景上的一个蓝色圆点"
   },
   "gateway": {

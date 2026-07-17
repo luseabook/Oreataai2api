@@ -691,6 +691,129 @@ class GatewayHardeningTests(unittest.TestCase):
         ]
         self.assertEqual(fallback_steps[0]["confirm_code"], 1001)
 
+    def test_admin_settings_html_exposes_pool_auto_maintain_controls(self):
+        html = server.ADMIN_HTML
+        self.assertIn('id="s-maintain-interval"', html)
+        self.assertIn('id="s-reg-concurrency"', html)
+        self.assertIn('id="s-auto-register-max"', html)
+        self.assertIn("maintain_check_interval:maintainInterval", html)
+        self.assertIn("registration_concurrency:registrationConcurrency", html)
+        self.assertIn("auto_maintain_max_register:autoMaintainMaxRegister", html)
+
+    def test_admin_pool_console_uses_single_register_cta_and_event_log(self):
+        html = server.ADMIN_HTML
+        self.assertIn('id="reg-start"', html)
+        self.assertIn("开始注册", html)
+        self.assertNotIn('id="reg-one"', html)
+        self.assertNotIn("批量注册", html)
+        self.assertIn('id="registration-result-banner"', html)
+        self.assertIn('id="toast-host"', html)
+        self.assertIn("function showToast", html)
+        self.assertIn("renderRegistrationEventLog", html)
+        self.assertIn("reg-event-log", html)
+        self.assertIn("reg-pipeline", html)
+        # Completion paths should not use blocking browser alerts.
+        self.assertNotIn("alert(job.failed", html)
+        self.assertNotIn("alert(`${prefix}", html)
+
+    def test_extract_verify_code_matches_standalone_six_digit_codes(self):
+        code = server.MAIL.extract_verify_code(
+            {
+                "subject": "Oreate verify",
+                "text": "Your code is 123456 for confirmation.",
+            }
+        )
+        self.assertEqual(code, "123456")
+
+    def test_rank_mail_domains_prefers_successful_domains(self):
+        with server.MAIL_DOMAIN_STATS_LOCK:
+            server.MAIL_DOMAIN_STATS.clear()
+            server.MAIL_DOMAIN_STATS["good.test"] = {
+                "success": 4,
+                "failure": 0,
+                "verify_timeout": 0,
+            }
+            server.MAIL_DOMAIN_STATS["bad.test"] = {
+                "success": 0,
+                "failure": 3,
+                "verify_timeout": 2,
+            }
+        ranked = server.rank_mail_domains(["bad.test", "good.test", "new.test"])
+        self.assertEqual(ranked[0], "good.test")
+        self.assertEqual(ranked[-1], "bad.test")
+
+    def test_auto_register_accounts_respects_registration_concurrency(self):
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {"pool": {"registration_concurrency": 3}},
+        )
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def fake_register(progress=None):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return {
+                "ok": True,
+                "status": "verified",
+                "email": "user@example.com",
+                "mailbox": {"address": "user@example.com", "token": "t"},
+            }
+
+        try:
+            with patch.object(server, "register_one_account", side_effect=fake_register):
+                results = server.auto_register_accounts(5)
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(len(results), 5)
+        self.assertGreaterEqual(max_active, 2)
+        self.assertLessEqual(max_active, 3)
+
+    def test_scheduled_pool_maintenance_skips_when_job_already_active(self):
+        job = server.create_pool_maintenance_job(
+            clean_risk=False,
+            supplement=False,
+            target_healthy=1,
+            max_register=0,
+        )
+        with patch.object(server, "launch_pool_maintenance_job") as launch:
+            launched = server.maybe_launch_scheduled_pool_maintenance()
+        self.assertIsNone(launched)
+        launch.assert_not_called()
+        self.assertEqual(server.active_pool_maintenance_job_id(), job["id"])
+
+    def test_scheduled_pool_maintenance_creates_job_when_idle(self):
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "pool": {
+                    "maintain_check_interval": 300,
+                    "maintain_target": 2,
+                    "auto_maintain_max_register": 1,
+                }
+            },
+        )
+        try:
+            with patch.object(server, "launch_pool_maintenance_job") as launch:
+                job_id = server.maybe_launch_scheduled_pool_maintenance()
+            self.assertIsNotNone(job_id)
+            launch.assert_called_once_with(job_id)
+            job = server.get_pool_maintenance_job(job_id)
+            self.assertEqual(job["max_register"], 1)
+            self.assertEqual(job["target_healthy"], 2)
+            self.assertTrue(job["supplement"])
+        finally:
+            server.CFG = original_cfg
+
     def test_registered_account_validation_is_deferred_when_gateway_environment_is_risk_controlled(self):
         session = server.OreateSession(
             email="risk@example.com",

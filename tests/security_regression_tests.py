@@ -1616,20 +1616,23 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         calls = {"count": 0}
 
         def fake_register(count, progress=None):
-            calls["count"] += 1
-            email = f"user{calls['count']}@example.com"
-            if progress:
-                progress("create_mailbox", email)
-                progress("signup_attempt", email)
-            return [
-                {
-                    "ok": calls["count"] == 1,
-                    "status": "verified" if calls["count"] == 1 else "signup_failed",
-                    "account_id": calls["count"] if calls["count"] == 1 else None,
-                    "email": email,
-                    "password": "Aa1@secret123",
-                }
-            ]
+            items = []
+            for _ in range(max(1, int(count))):
+                calls["count"] += 1
+                email = f"user{calls['count']}@example.com"
+                if progress:
+                    progress("create_mailbox", email)
+                    progress("signup_attempt", email)
+                items.append(
+                    {
+                        "ok": calls["count"] == 1,
+                        "status": "verified" if calls["count"] == 1 else "signup_failed",
+                        "account_id": calls["count"] if calls["count"] == 1 else None,
+                        "email": email,
+                        "password": "Aa1@secret123",
+                    }
+                )
+            return items
 
         with patch.object(server, "auto_register_accounts", side_effect=fake_register):
             server.run_registration_job(job["id"])
@@ -1643,6 +1646,22 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertEqual(len(completed["items"]), 2)
         self.assertNotIn("password", json.dumps(completed["items"], ensure_ascii=False))
         self.assertEqual(completed["current_step"], "completed")
+        events = completed.get("events") or []
+        self.assertGreaterEqual(len(events), 2)
+        self.assertTrue(any(event.get("step") == "create_mailbox" for event in events))
+        self.assertTrue(
+            any(
+                event.get("level") == "success" and event.get("email") == "user1@example.com"
+                for event in events
+            )
+        )
+        self.assertTrue(
+            any(
+                event.get("level") == "error" and event.get("email") == "user2@example.com"
+                for event in events
+            )
+        )
+        self.assertNotIn("Aa1@secret123", json.dumps(events, ensure_ascii=False))
 
     def test_registration_job_api_returns_immediately_and_exposes_progress(self):
         with patch.object(server, "launch_registration_job") as launch:
@@ -2322,7 +2341,7 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertIn("查看密码", html)
         self.assertIn("复制密码", html)
         self.assertIn("连接暂时中断，正在重试", html)
-        self.assertIn("批量体检并补号", html)
+        self.assertIn("体检并补号", html)
         self.assertIn("/api/pool/maintenance/jobs", html)
         self.assertIn('id="maintenance-progress"', html)
         self.assertNotIn("s-admin-pwd", html)

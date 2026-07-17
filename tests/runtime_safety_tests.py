@@ -284,6 +284,7 @@ class ServerLifecycleTests(unittest.TestCase):
                 patch.object(server, "recover_stale_running_tasks") as recover_tasks,
                 patch.object(server, "recover_interrupted_registration_jobs") as recover_registration_jobs,
                 patch.object(server, "ensure_task_worker_started") as start_worker,
+                patch.object(server, "ensure_pool_maintenance_scheduler_started") as start_scheduler,
                 patch.dict(os.environ, {}, clear=True),
             ):
                 with self.assertRaisesRegex(
@@ -297,6 +298,7 @@ class ServerLifecycleTests(unittest.TestCase):
                 recover_tasks.assert_not_called()
                 recover_registration_jobs.assert_not_called()
                 start_worker.assert_not_called()
+                start_scheduler.assert_not_called()
 
                 with SingleWorkerLock(worker_lock_path(database_path, {})):
                     pass
@@ -328,6 +330,7 @@ class ServerLifecycleTests(unittest.TestCase):
                 patch.object(server, "recover_stale_running_tasks") as recover_tasks,
                 patch.object(server, "recover_interrupted_registration_jobs") as recover_registration_jobs,
                 patch.object(server, "ensure_task_worker_started") as start_worker,
+                patch.object(server, "ensure_pool_maintenance_scheduler_started") as start_scheduler,
                 patch.dict(os.environ, {}, clear=True),
             ):
                 with self.assertRaisesRegex(RuntimeError, "public bind"):
@@ -338,6 +341,7 @@ class ServerLifecycleTests(unittest.TestCase):
                 recover_tasks.assert_not_called()
                 recover_registration_jobs.assert_not_called()
                 start_worker.assert_not_called()
+                start_scheduler.assert_not_called()
                 self.assertFalse(server.APP_LIFECYCLE_STARTED)
                 self.assertIsNone(server.APPLICATION_WORKER_LOCK)
 
@@ -370,6 +374,7 @@ class ServerLifecycleTests(unittest.TestCase):
                 patch.object(server, "recover_stale_running_tasks") as recover_tasks,
                 patch.object(server, "recover_interrupted_registration_jobs") as recover_registration_jobs,
                 patch.object(server, "ensure_task_worker_started") as start_worker,
+                patch.object(server, "ensure_pool_maintenance_scheduler_started") as start_scheduler,
                 patch.dict(os.environ, {}, clear=True),
             ):
                 try:
@@ -385,6 +390,7 @@ class ServerLifecycleTests(unittest.TestCase):
                     recover_tasks.assert_called_once_with(stale_after_seconds=0.0)
                     recover_registration_jobs.assert_called_once_with()
                     start_worker.assert_called_once_with()
+                    start_scheduler.assert_called_once_with()
                 finally:
                     lock = server.APPLICATION_WORKER_LOCK
                     if lock is not None:
