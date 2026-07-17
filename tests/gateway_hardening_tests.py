@@ -600,6 +600,7 @@ class GatewayHardeningTests(unittest.TestCase):
                         "cookies": {},
                     },
                 ),
+                patch.object(server.CLIENT, "resend_confirm_email", return_value={"status_code": 200}) as resend_confirm,
                 patch.object(server.MAIL, "wait_verification_artifact", return_value={"link": "https://www.oreateai.com/passport/confirm?tokenID=abc123", "code": ""}),
                 patch.object(server.requests, "get") as visit_link,
                 patch.object(server.CLIENT, "confirm_email_register", return_value={"status_code": 200, "response": {"status": {"code": 0}}}),
@@ -621,8 +622,74 @@ class GatewayHardeningTests(unittest.TestCase):
 
         self.assertEqual(result[0]["status"], "verified")
         self.assertEqual(save_account.call_args.kwargs["status"], "pending_validation")
+        resend_confirm.assert_called_once_with("user@example.com")
         self.assertTrue(visit_link.called)
         self.assertTrue(visit_link.call_args.kwargs["verify"])
+
+    def test_auto_register_accounts_falls_back_to_login_when_confirm_response_is_nonzero(self):
+        session = server.OreateSession(
+            email="fallback@example.com",
+            password="pass",
+            cookies={"OUID": "ouid", "ouss": "ouss"},
+        )
+        with (
+            patch.object(
+                server.MAIL,
+                "create_mailbox",
+                return_value={
+                    "address": "fallback@example.com",
+                    "token": "mail-token",
+                    "domain": "example.com",
+                    "mailbox_id": "mb-1",
+                },
+            ),
+            patch.object(
+                server.CLIENT,
+                "signup_attempt",
+                return_value={
+                    "status_code": 200,
+                    "response": {
+                        "status": {"code": 0},
+                        "data": {"sendEmailCount": 1, "confirmEmailStatus": 1, "registerStatus": 1},
+                    },
+                    "ticket": {"ticketID": "ticket-1"},
+                    "cookies": {},
+                },
+            ),
+            patch.object(server.CLIENT, "resend_confirm_email", return_value={"status_code": 200}),
+            patch.object(
+                server.MAIL,
+                "wait_verification_artifact",
+                return_value={"link": "", "code": "token-1"},
+            ),
+            patch.object(
+                server.CLIENT,
+                "confirm_email_register",
+                return_value={"status_code": 200, "response": {"status": {"code": 1001}}},
+            ),
+            patch.object(server.CLIENT, "login", return_value=session) as login,
+            patch.object(server.CLIENT, "session_from_cookie_dict", return_value=object()),
+            patch.object(server.CLIENT, "fetch_image_models", return_value={}),
+            patch.object(server.CLIENT, "fetch_video_models", return_value=[]),
+            patch.object(server.CLIENT, "fetch_video_scenes", return_value=[]),
+            patch.object(
+                server,
+                "save_and_validate_registered_account",
+                return_value=(11, "verified"),
+            ) as save_and_validate,
+        ):
+            result = server.auto_register_accounts(1)
+
+        self.assertEqual(result[0]["status"], "verified")
+        self.assertEqual(result[0]["account_id"], 11)
+        login.assert_called_once_with("fallback@example.com", unittest.mock.ANY)
+        save_and_validate.assert_called_once()
+        fallback_steps = [
+            item
+            for item in result[0]["trace"]
+            if item.get("step") == "login_after_confirm_fallback"
+        ]
+        self.assertEqual(fallback_steps[0]["confirm_code"], 1001)
 
     def test_registered_account_validation_is_deferred_when_gateway_environment_is_risk_controlled(self):
         session = server.OreateSession(
@@ -4691,6 +4758,9 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("allowed_scenes", html)
         self.assertIn("allowed_resolutions", html)
         self.assertIn("allowed_durations", html)
+        self.assertIn('id="ak-editor-kind-chat"', html)
+        self.assertIn('<option value="chat">\u6587\u5b57\u5bf9\u8bdd</option>', html)
+        self.assertIn("chat:'\u6587\u5b57\u5bf9\u8bdd'", html)
         self.assertIn("allow_uploads", html)
         self.assertIn("allow_experimental", html)
         self.assertIn("updateApiKeyPolicy", html)
@@ -4825,6 +4895,7 @@ const fields = {{
   'ak-editor-points': {{value: '17'}},
   'ak-editor-kind-image': {{checked: true}},
   'ak-editor-kind-video': {{checked: false}},
+  'ak-editor-kind-chat': {{checked: true}},
   'ak-editor-models': {{value: 'model-a, model-a, model-b'}},
   'ak-editor-scenes': {{value: ''}},
   'ak-editor-resolutions': {{value: '1K,4K'}},
@@ -4842,6 +4913,9 @@ for (const [field, value] of Object.entries(expectedEditorLimits)) {{
 }}
 if (JSON.stringify(editorBody.allowed_models) !== JSON.stringify(['model-a','model-b'])) {{
   throw new Error(`model scope was not normalized: ${{JSON.stringify(editorBody.allowed_models)}}`);
+}}
+if (JSON.stringify(editorBody.allowed_kinds) !== JSON.stringify(['image','chat'])) {{
+  throw new Error(`kind scope was not normalized: ${{JSON.stringify(editorBody.allowed_kinds)}}`);
 }}
 let capturedBody = undefined;
 let patchCalls = 0;

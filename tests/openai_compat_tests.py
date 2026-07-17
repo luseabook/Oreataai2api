@@ -132,6 +132,29 @@ class OpenAICompatPrimitiveTests(unittest.TestCase):
 TEST_ENCRYPTION_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
 
+class FakeChatResponse:
+    def __init__(self, *, status_code=200, payload=None, chunks=(), headers=None, json_error=None):
+        self.status_code = status_code
+        self.payload = payload
+        self.chunks = list(chunks)
+        self.headers = headers or {}
+        self.json_error = json_error
+        self.closed = False
+        self.iterated = False
+
+    def json(self):
+        if self.json_error is not None:
+            raise self.json_error
+        return self.payload
+
+    def iter_content(self, chunk_size=8192):
+        self.iterated = True
+        yield from self.chunks
+
+    def close(self):
+        self.closed = True
+
+
 class OpenAICompatEndpointTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -348,6 +371,24 @@ class OpenAICompatEndpointTests(unittest.TestCase):
                 1,
             ),
         )
+        conn.execute(
+            """
+            INSERT INTO api_keys(
+                key,name,enabled,created_at,allowed_kinds,allowed_models,
+                allow_uploads,allow_experimental
+            ) VALUES(?,?,?,?,?,?,?,?)
+            """,
+            (
+                "openai-chat-key",
+                "OpenAI chat key",
+                1,
+                now,
+                json.dumps(["chat"]),
+                json.dumps(["configured-chat-model"]),
+                0,
+                0,
+            ),
+        )
         conn.commit()
         conn.close()
 
@@ -416,6 +457,277 @@ class OpenAICompatEndpointTests(unittest.TestCase):
                 self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
                 self.assertEqual(response.json()["error"]["param"], "prompt")
                 self.assertEqual(response.json()["error"]["code"], "validation_error")
+
+    def configure_chat_provider(self):
+        server.CFG["chat"] = {
+            "provider": "openai",
+            "base_url": "https://chat.example.test/v1",
+            "api_key": "upstream-secret",
+            "model": "configured-chat-model",
+        }
+
+    def test_chat_completions_uses_openai_error_contract_for_auth_and_validation(self):
+        unauthenticated = self.client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+        self.assertEqual(unauthenticated.status_code, 401)
+        self.assertEqual(set(unauthenticated.json()), {"error"})
+        self.assertEqual(unauthenticated.json()["error"]["type"], "authentication_error")
+
+        invalid = self.client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer openai-chat-key"},
+            json={"messages": []},
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(set(invalid.json()), {"error"})
+        self.assertEqual(invalid.json()["error"]["param"], "messages")
+        self.assertEqual(invalid.json()["error"]["code"], "validation_error")
+
+    def test_chat_completions_forwards_extra_fields_and_closes_non_stream_response(self):
+        self.configure_chat_provider()
+        upstream_payload = {
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "choices": [{"message": {"role": "assistant", "content": "hello"}}],
+        }
+        upstream = FakeChatResponse(status_code=200, payload=upstream_payload)
+
+        with patch.object(server.requests, "post", return_value=upstream) as post:
+            response = self.client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer openai-chat-key"},
+                json={
+                    "model": "oreate-chat",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "top_p": 0.7,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), upstream_payload)
+        self.assertTrue(upstream.closed)
+        request = post.call_args
+        self.assertEqual(request.args[0], "https://chat.example.test/v1/chat/completions")
+        self.assertEqual(request.kwargs["json"]["model"], "configured-chat-model")
+        self.assertEqual(request.kwargs["json"]["top_p"], 0.7)
+        self.assertFalse(request.kwargs["stream"])
+        self.assertEqual(request.kwargs["headers"]["Authorization"], "Bearer upstream-secret")
+        self.assertTrue(response.headers["x-request-id"].startswith("req_"))
+
+        conn = server.db_conn()
+        usage = conn.execute(
+            "SELECT * FROM usage_log WHERE api_key_id=? AND kind='chat'",
+            (self.api_key_id("openai-chat-key"),),
+        ).fetchone()
+        conn.close()
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage["account_id"], 0)
+        self.assertEqual(usage["prompt"], "1 chat message")
+        self.assertNotIn("hello", usage["prompt"])
+        self.assertEqual(usage["model_name"], "configured-chat-model")
+        self.assertEqual(usage["estimated_point_cost"], 0)
+        self.assertEqual(usage["status"], "completed")
+        self.assertEqual(usage["status_code"], 200)
+
+    def test_chat_completions_enforces_api_key_scope_and_single_configured_model(self):
+        self.configure_chat_provider()
+        body = {"messages": [{"role": "user", "content": "hello"}]}
+
+        with patch.object(server.requests, "post") as post:
+            forbidden = self.client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer openai-model-key"},
+                json=body,
+            )
+            conn = server.db_conn()
+            conn.execute("UPDATE api_keys SET allowed_kinds=NULL WHERE key=?", ("openai-chat-key",))
+            conn.commit()
+            conn.close()
+            legacy_unscoped = self.client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer openai-chat-key"},
+                json=body,
+            )
+            conn = server.db_conn()
+            conn.execute(
+                "UPDATE api_keys SET allowed_kinds=? WHERE key=?",
+                (json.dumps(["chat"]), "openai-chat-key"),
+            )
+            conn.commit()
+            conn.close()
+            unknown_model = self.client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer openai-chat-key"},
+                json={**body, "model": "unconfigured-expensive-model"},
+            )
+
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertEqual(forbidden.json()["error"]["code"], "api_key_kind_forbidden")
+        self.assertEqual(legacy_unscoped.status_code, 403)
+        self.assertEqual(legacy_unscoped.json()["error"]["code"], "api_key_kind_forbidden")
+        self.assertEqual(unknown_model.status_code, 404)
+        self.assertEqual(unknown_model.json()["error"]["code"], "model_not_found")
+        self.assertEqual(unknown_model.json()["error"]["param"], "model")
+        post.assert_not_called()
+
+    def test_chat_completions_enforces_rate_limit_before_upstream_call(self):
+        self.configure_chat_provider()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE api_keys SET rate_limit_per_minute=1,daily_request_limit=0 WHERE key=?",
+            ("openai-chat-key",),
+        )
+        conn.commit()
+        conn.close()
+        upstream = FakeChatResponse(status_code=200, payload={"choices": []})
+        headers = {"Authorization": "Bearer openai-chat-key"}
+        body = {"messages": [{"role": "user", "content": "hello"}]}
+
+        with patch.object(server.requests, "post", return_value=upstream) as post:
+            accepted = self.client.post("/v1/chat/completions", headers=headers, json=body)
+            limited = self.client.post("/v1/chat/completions", headers=headers, json=body)
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(limited.status_code, 429)
+        self.assertEqual(limited.json()["error"]["code"], "rate_limited")
+        self.assertEqual(post.call_count, 1)
+
+    def test_chat_completions_enforces_daily_request_limit_before_upstream_call(self):
+        self.configure_chat_provider()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE api_keys SET rate_limit_per_minute=0,daily_request_limit=1 WHERE key=?",
+            ("openai-chat-key",),
+        )
+        conn.commit()
+        conn.close()
+        upstream = FakeChatResponse(status_code=200, payload={"choices": []})
+        headers = {"Authorization": "Bearer openai-chat-key"}
+        body = {"messages": [{"role": "user", "content": "hello"}]}
+
+        with patch.object(server.requests, "post", return_value=upstream) as post:
+            accepted = self.client.post("/v1/chat/completions", headers=headers, json=body)
+            limited = self.client.post("/v1/chat/completions", headers=headers, json=body)
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(limited.status_code, 429)
+        self.assertEqual(limited.json()["error"]["code"], "daily_request_limit_exceeded")
+        self.assertEqual(post.call_count, 1)
+
+    def test_chat_completions_rejects_upstream_error_before_streaming(self):
+        self.configure_chat_provider()
+        upstream = FakeChatResponse(
+            status_code=429,
+            payload={"error": {"message": "provider rate limited"}},
+            chunks=[b"should-not-stream"],
+        )
+
+        with patch.object(server.requests, "post", return_value=upstream):
+            response = self.client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer openai-chat-key"},
+                json={
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json()["error"]["type"], "rate_limit_error")
+        self.assertEqual(response.json()["error"]["code"], "upstream_error")
+        self.assertEqual(response.json()["error"]["message"], "provider rate limited")
+        self.assertFalse(upstream.iterated)
+        self.assertTrue(upstream.closed)
+
+    def test_chat_completions_streams_raw_chunks_and_closes_response(self):
+        self.configure_chat_provider()
+        upstream = FakeChatResponse(
+            status_code=200,
+            chunks=[b'data: {"delta":"one"}\n\n', b"data: [DONE]\n\n"],
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+        with patch.object(server.requests, "post", return_value=upstream):
+            response = self.client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer openai-chat-key"},
+                json={
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.content,
+            b'data: {"delta":"one"}\n\ndata: [DONE]\n\n',
+        )
+        self.assertTrue(response.headers["x-request-id"].startswith("req_"))
+        self.assertTrue(upstream.iterated)
+        self.assertTrue(upstream.closed)
+
+    def test_chat_completions_maps_transport_and_invalid_json_failures(self):
+        self.configure_chat_provider()
+        request_body = {"messages": [{"role": "user", "content": "hello"}]}
+        headers = {"Authorization": "Bearer openai-chat-key"}
+
+        with patch.object(
+            server.requests,
+            "post",
+            side_effect=server.requests.Timeout("private upstream detail"),
+        ):
+            unavailable = self.client.post(
+                "/v1/chat/completions",
+                headers=headers,
+                json=request_body,
+            )
+        self.assertEqual(unavailable.status_code, 502)
+        self.assertEqual(unavailable.json()["error"]["code"], "upstream_unavailable")
+        self.assertNotIn("private upstream detail", unavailable.text)
+
+        invalid_upstream = FakeChatResponse(
+            status_code=200,
+            json_error=ValueError("invalid JSON"),
+        )
+        with patch.object(server.requests, "post", return_value=invalid_upstream):
+            invalid = self.client.post(
+                "/v1/chat/completions",
+                headers=headers,
+                json=request_body,
+            )
+        self.assertEqual(invalid.status_code, 502)
+        self.assertEqual(invalid.json()["error"]["code"], "invalid_upstream_response")
+        self.assertTrue(invalid_upstream.closed)
+
+    def test_models_endpoint_lists_chat_only_for_explicit_chat_scope(self):
+        self.configure_chat_provider()
+
+        chat_response = self.client.get(
+            "/v1/models",
+            headers={"Authorization": "Bearer openai-chat-key"},
+        )
+        image_response = self.client.get(
+            "/v1/models",
+            headers={"Authorization": "Bearer openai-model-key"},
+        )
+        detail_response = self.client.get(
+            "/v1/models/oreate-chat",
+            headers={"Authorization": "Bearer openai-chat-key"},
+        )
+
+        self.assertEqual(chat_response.status_code, 200)
+        self.assertEqual(
+            {item["id"] for item in chat_response.json()["data"]},
+            {"oreate-chat", "configured-chat-model"},
+        )
+        self.assertNotIn(
+            "oreate-chat",
+            {item["id"] for item in image_response.json()["data"]},
+        )
+        self.assertEqual(detail_response.status_code, 200)
+        self.assertEqual(detail_response.json()["id"], "oreate-chat")
 
     def test_models_endpoint_lists_only_models_visible_to_api_key(self):
         response = self.client.get(
