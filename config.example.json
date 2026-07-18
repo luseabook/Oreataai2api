@@ -40,7 +40,8 @@
     "base_url": "https://maliapi.215.im/v1",
     "api_key": "AC-REPLACE_ME",
     "api_mode": "auto",
-    "preferred_domains": []
+    "preferred_domains": [],
+    "verification_timeout_sec": 300
   },
   "pool": {
     "min_accounts": 3,

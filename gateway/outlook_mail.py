@@ -13,7 +13,7 @@ import json
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
@@ -27,6 +27,23 @@ FinishMailboxFn = Callable[[str, str, str], None]
 
 _GRAPH_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
 _GRAPH_SCOPE = "https://graph.microsoft.com/.default offline_access"
+_GRAPH_DEFAULT_FOLDERS = ("inbox", "junkemail", "clutter")
+_GRAPH_FOLDER_ALIASES = {
+    "inbox": {"inbox", "mailinbox", ""},
+    "junkemail": {"junk", "junkemail", "junkemailmessages", "spam"},
+    "clutter": {"clutter", "focused"},
+}
+_GRAPH_FOLDER_NAME_HINTS = (
+    "junk",
+    "spam",
+    "clutter",
+    "junkemail",
+    "垃圾",
+    "垃圾邮件",
+    "垃圾郵件",
+    "杂乱",
+    "雜亂",
+)
 _SHOP_ERROR_RE = re.compile(r"(账号不存在|取件失败|密钥错误|缺少email|not\s*found|unauthorized)", re.I)
 
 
@@ -336,50 +353,157 @@ class OutlookMailClient:
             raise RuntimeError(f"outlook graph token failed: HTTP {r.status_code} {err}")
         return token
 
-    def _fetch_via_graph(self, account: Mapping[str, Any], folders: Sequence[str] = ("inbox", "junkemail")) -> List[Dict[str, Any]]:
+    def _graph_folder_urls(self, access_token: str, folders: Sequence[str]) -> List[Tuple[str, str]]:
+        """Return (folder_label, messages_url) pairs, including discovered junk/clutter folders."""
+        headers = {"Authorization": f"Bearer {access_token}"}
+        urls: List[Tuple[str, str]] = []
+        seen_urls: set[str] = set()
+
+        def add(label: str, url: str) -> None:
+            if url in seen_urls:
+                return
+            seen_urls.add(url)
+            urls.append((label, url))
+
+        for folder in folders:
+            folder_key = str(folder or "").strip().lower()
+            select = (
+                "?$top=25&$select=id,subject,bodyPreview,body,receivedDateTime"
+                "&$orderby=receivedDateTime desc"
+            )
+            if folder_key in _GRAPH_FOLDER_ALIASES["inbox"]:
+                add("inbox", "https://graph.microsoft.com/v1.0/me/messages" + select)
+            elif folder_key in _GRAPH_FOLDER_ALIASES["junkemail"]:
+                add(
+                    "junkemail",
+                    "https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages" + select,
+                )
+            elif folder_key in _GRAPH_FOLDER_ALIASES["clutter"]:
+                add(
+                    "clutter",
+                    "https://graph.microsoft.com/v1.0/me/mailFolders/clutter/messages" + select,
+                )
+            elif folder_key:
+                add(
+                    folder_key,
+                    f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder}/messages" + select,
+                )
+
+        # Discover localized folder names (e.g. 垃圾邮件) and scan them too.
+        try:
+            r = _mail_session().get(
+                "https://graph.microsoft.com/v1.0/me/mailFolders"
+                "?$top=50&$select=id,displayName,wellKnownName",
+                headers=headers,
+                timeout=45,
+            )
+            body = r.json() if r.content else {}
+            if r.status_code < 400:
+                for item in body.get("value") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    folder_id = str(item.get("id") or "").strip()
+                    if not folder_id:
+                        continue
+                    well_known = str(item.get("wellKnownName") or "").strip().lower()
+                    display = str(item.get("displayName") or "").strip().lower()
+                    interesting = well_known in {"inbox", "junkemail", "clutter"} or any(
+                        hint in display for hint in _GRAPH_FOLDER_NAME_HINTS
+                    )
+                    if not interesting:
+                        continue
+                    label = well_known or display or folder_id[:12]
+                    add(
+                        f"discovered:{label}",
+                        (
+                            f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder_id}/messages"
+                            "?$top=25&$select=id,subject,bodyPreview,body,receivedDateTime"
+                            "&$orderby=receivedDateTime desc"
+                        ),
+                    )
+        except Exception:
+            pass
+        return urls
+
+    def _fetch_via_graph(
+        self,
+        account: Mapping[str, Any],
+        folders: Sequence[str] = _GRAPH_DEFAULT_FOLDERS,
+    ) -> List[Dict[str, Any]]:
         access = self._graph_access_token(account)
         headers = {"Authorization": f"Bearer {access}"}
         messages: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
         errors: List[str] = []
-        for folder in folders:
-            folder_key = str(folder or "").strip().lower()
-            if folder_key in {"inbox", "mailinbox", ""}:
-                url = (
-                    "https://graph.microsoft.com/v1.0/me/messages"
-                    "?$top=12&$select=id,subject,bodyPreview,body,receivedDateTime"
-                    "&$orderby=receivedDateTime desc"
-                )
-            elif folder_key in {"junk", "junkemail", "junkemailmessages"}:
-                url = (
-                    "https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages"
-                    "?$top=12&$select=id,subject,bodyPreview,body,receivedDateTime"
-                    "&$orderby=receivedDateTime desc"
-                )
-            else:
-                url = (
-                    f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder}/messages"
-                    "?$top=12&$select=id,subject,bodyPreview,body,receivedDateTime"
-                    "&$orderby=receivedDateTime desc"
-                )
+        for folder_label, url in self._graph_folder_urls(access, folders):
             r = _mail_session().get(url, headers=headers, timeout=45)
             try:
                 body = r.json()
             except Exception:
                 body = {}
             if r.status_code >= 400:
-                err = (body.get("error") or {}).get("message") if isinstance(body.get("error"), dict) else (r.text or "")[:160]
-                errors.append(f"{folder}: HTTP {r.status_code} {err}")
+                err = (
+                    (body.get("error") or {}).get("message")
+                    if isinstance(body.get("error"), dict)
+                    else (r.text or "")[:160]
+                )
+                errors.append(f"{folder_label}: HTTP {r.status_code} {err}")
                 continue
             for item in body.get("value") or []:
-                if isinstance(item, dict):
-                    messages.append(graph_message_to_payload(item))
+                if not isinstance(item, dict):
+                    continue
+                message_id = str(item.get("id") or "").strip()
+                if message_id and message_id in seen_ids:
+                    continue
+                if message_id:
+                    seen_ids.add(message_id)
+                messages.append(graph_message_to_payload(item))
         if not messages and errors:
             raise RuntimeError("outlook graph fetch failed: " + " | ".join(errors[:4]))
         return messages
 
+    def probe_graph_mailbox(self, account: Mapping[str, Any]) -> Dict[str, Any]:
+        """Classify whether Graph credentials work and whether the mailbox has any mail."""
+        try:
+            messages = self._fetch_via_graph(account)
+            return {
+                "ok": True,
+                "messages": messages,
+                "message_count": len(messages),
+                "oreate_candidates": sum(
+                    1
+                    for message in messages
+                    if "oreate" in _message_blobs(message).lower()
+                    or "oreate" in str(message.get("subject") or "").lower()
+                ),
+                "error": "",
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "messages": [],
+                "message_count": 0,
+                "oreate_candidates": 0,
+                "error": str(exc),
+            }
+
     def fetch_latest_message(self, account: Mapping[str, Any], folders: Sequence[str] = ("INBOX", "Junk")) -> Dict[str, Any]:
         mode = self.api_mode
         errors: List[str] = []
+        # Prefer Graph in auto mode: shop APIs are frequently missing for card pools.
+        if mode in ("auto", "graph", "microsoft", "msgraph"):
+            try:
+                messages = self._fetch_via_graph(account)
+                if messages:
+                    for message in messages:
+                        blob = _message_blobs(message)
+                        if "oreateai.com" in blob.lower() or "oreate" in str(message.get("subject") or "").lower():
+                            return message
+                    return messages[0]
+            except Exception as exc:
+                errors.append(f"graph:{exc}")
+                if mode != "auto":
+                    raise
         if mode in ("auto", "get"):
             try:
                 message = self._fetch_via_get(account)
@@ -397,22 +521,8 @@ class OutlookMailClient:
                         return message
                 except Exception as exc:
                     errors.append(f"{folder}:{exc}")
-            if mode not in ("auto",) and mode.startswith("mso"):
+            if mode not in ("auto",) and str(mode).lower().startswith("mso"):
                 raise RuntimeError("outlook msoauth2 fetch failed: " + " | ".join(errors[:6]))
-        if mode in ("auto", "graph", "microsoft", "msgraph"):
-            try:
-                messages = self._fetch_via_graph(account)
-                if messages:
-                    # Prefer Oreate verification mail over unrelated latest mail.
-                    for message in messages:
-                        blob = _message_blobs(message)
-                        if "oreateai.com" in blob.lower() or "oreate" in str(message.get("subject") or "").lower():
-                            return message
-                    return messages[0]
-            except Exception as exc:
-                errors.append(f"graph:{exc}")
-                if mode != "auto":
-                    raise
         if errors:
             raise RuntimeError("outlook mail fetch failed: " + " | ".join(errors[:6]))
         return {}
@@ -420,10 +530,10 @@ class OutlookMailClient:
     def fetch_candidate_messages(self, account: Mapping[str, Any]) -> List[Dict[str, Any]]:
         mode = self.api_mode
         if mode in ("auto", "graph", "microsoft", "msgraph"):
+            # Graph success with an empty mailbox must NOT fall back to shop APIs.
+            # Shop 404s previously masked the real "mail not arrived" condition.
             try:
-                messages = self._fetch_via_graph(account)
-                if messages:
-                    return messages
+                return self._fetch_via_graph(account)
             except Exception:
                 if mode != "auto":
                     raise
@@ -467,7 +577,7 @@ class OutlookMailClient:
         self,
         address: str,
         token: str,
-        timeout_sec: int = 180,
+        timeout_sec: int = 300,
         *,
         not_before: Optional[float] = None,
         exclude_token_ids: Optional[Sequence[str]] = None,
@@ -475,15 +585,38 @@ class OutlookMailClient:
         account = self._resolve_mailbox(str(token))
         if str(account.get("email") or "").lower() != str(address or "").lower():
             raise RuntimeError("outlook mailbox token/email mismatch")
-        deadline = time.time() + timeout_sec
+        started = time.time()
+        deadline = started + max(1, int(timeout_sec))
         last_error = ""
         seen_fingerprints = set()
         excluded = {str(item).strip().lower() for item in (exclude_token_ids or []) if str(item).strip()}
         # Default: ignore mail that already existed before this wait cycle.
-        min_ts = float(not_before) if not_before is not None else (time.time() - 15.0)
+        # Allow modest clock skew between local host and Graph timestamps.
+        min_ts = float(not_before) if not_before is not None else (started - 60.0)
+        graph_ok_seen = False
+        max_message_count = 0
+        credential_error = ""
         while time.time() < deadline:
+            messages: List[Dict[str, Any]] = []
             try:
-                messages = self.fetch_candidate_messages(account)
+                mode = self.api_mode
+                if mode in ("auto", "graph", "microsoft", "msgraph"):
+                    probe = self.probe_graph_mailbox(account)
+                    if probe.get("ok"):
+                        graph_ok_seen = True
+                        messages = list(probe.get("messages") or [])
+                        max_message_count = max(max_message_count, len(messages))
+                        credential_error = ""
+                    else:
+                        credential_error = str(probe.get("error") or "graph probe failed")
+                        last_error = credential_error
+                        # Shop fallback only when Graph credentials themselves failed.
+                        if mode == "auto":
+                            messages = self.fetch_candidate_messages(account)
+                else:
+                    messages = self.fetch_candidate_messages(account)
+                    max_message_count = max(max_message_count, len(messages))
+
                 for message in messages:
                     received_ts = self._message_received_ts(message)
                     if received_ts and received_ts < min_ts:
@@ -499,17 +632,35 @@ class OutlookMailClient:
                     link = str(artifact.get("link") or "")
                     token_id = ""
                     if link:
-                        from urllib.parse import parse_qs, urlparse
-
-                        token_id = (parse_qs(urlparse(html.unescape(link).replace("&amp;", "&")).query).get("tokenID") or [""])[0]
+                        token_id = (
+                            parse_qs(urlparse(html.unescape(link).replace("&amp;", "&")).query).get("tokenID") or [""]
+                        )[0]
                     if token_id and token_id.lower() in excluded:
                         continue
-                    # If Graph omitted receivedDateTime, only accept after first poll cycle
-                    # when fingerprint is newly observed during this wait.
                     return artifact
             except Exception as exc:
                 last_error = str(exc)
-            time.sleep(5)
+                lowered = last_error.lower()
+                if "graph token failed" in lowered or "credentials missing" in lowered:
+                    credential_error = last_error
+            elapsed = time.time() - started
+            time.sleep(8.0 if elapsed >= 60 else 5.0)
+
+        if credential_error and not graph_ok_seen:
+            raise RuntimeError(
+                "outlook verification timeout: graph credentials invalid "
+                f"({credential_error[:240]})"
+            )
+        if graph_ok_seen and max_message_count == 0:
+            raise RuntimeError(
+                "outlook verification timeout: graph ok but mailbox empty "
+                "(activation mail not arrived or delayed)"
+            )
+        if graph_ok_seen:
+            raise RuntimeError(
+                "outlook verification timeout: graph ok but no Oreate activation mail "
+                f"(scanned {max_message_count} messages across inbox/junk/clutter)"
+            )
         suffix = f" ({last_error})" if last_error else ""
         raise RuntimeError(f"outlook verification artifact timeout{suffix}")
 

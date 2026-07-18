@@ -189,6 +189,7 @@ DEFAULT_CONFIG = {
         "api_key": "",
         "api_mode": "auto",
         "preferred_domains": [],
+        "verification_timeout_sec": 300,
     },
     "pool": {
         "min_accounts": 3,
@@ -5647,12 +5648,16 @@ def register_one_account(
 
                 excluded_token_ids: List[str] = []
                 confirm_code = None
+                verify_timeout_sec = max(
+                    60,
+                    int_or_default((CFG.get("mail") or {}).get("verification_timeout_sec"), 300),
+                )
                 for verify_attempt in range(2):
                     artifact = MAIL.wait_verification_artifact(
                         email,
                         token,
-                        timeout_sec=180,
-                        not_before=wait_started_at - 5,
+                        timeout_sec=verify_timeout_sec,
+                        not_before=wait_started_at - 60,
                         exclude_token_ids=excluded_token_ids,
                     )
                     trace.append(
