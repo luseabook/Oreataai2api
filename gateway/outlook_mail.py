@@ -638,6 +638,12 @@ class OutlookMailClient:
         except Exception:
             return 0.0
 
+    def _int_cfg(self, key: str, default: int) -> int:
+        try:
+            return max(1, int(self._cfg().get(key, default) or default))
+        except Exception:
+            return default
+
     def wait_verification_artifact(
         self,
         address: str,
@@ -652,6 +658,16 @@ class OutlookMailClient:
             raise RuntimeError("outlook mailbox token/email mismatch")
         started = time.time()
         deadline = started + max(1, int(timeout_sec))
+        # Empty inboxes rarely receive Oreate mail later; fail fast instead of sitting on "验邮".
+        empty_fail_after = min(
+            max(15, self._int_cfg("empty_mailbox_fail_after_sec", 75)),
+            max(1, int(timeout_sec)),
+        )
+        # Bad refresh_token/client_id should not burn the full verification window.
+        credential_fail_after = min(
+            max(5, self._int_cfg("credential_fail_after_sec", 20)),
+            max(1, int(timeout_sec)),
+        )
         last_error = ""
         seen_fingerprints = set()
         excluded = {str(item).strip().lower() for item in (exclude_token_ids or []) if str(item).strip()}
@@ -661,6 +677,7 @@ class OutlookMailClient:
         graph_ok_seen = False
         max_message_count = 0
         credential_error = ""
+        credential_fail_since: Optional[float] = None
         while time.time() < deadline:
             messages: List[Dict[str, Any]] = []
             try:
@@ -669,15 +686,23 @@ class OutlookMailClient:
                     probe = self.probe_graph_mailbox(account)
                     if probe.get("ok"):
                         graph_ok_seen = True
+                        credential_fail_since = None
                         messages = list(probe.get("messages") or [])
                         max_message_count = max(max_message_count, len(messages))
                         credential_error = ""
                     else:
                         credential_error = str(probe.get("error") or "graph probe failed")
                         last_error = credential_error
+                        if credential_fail_since is None:
+                            credential_fail_since = time.time()
                         # Shop fallback only when Graph credentials themselves failed.
                         if mode == "auto":
                             messages = self.fetch_candidate_messages(account)
+                        elif time.time() - credential_fail_since >= credential_fail_after:
+                            raise RuntimeError(
+                                "outlook verification timeout: graph credentials invalid "
+                                f"({credential_error[:240]})"
+                            )
                 else:
                     messages = self.fetch_candidate_messages(account)
                     max_message_count = max(max_message_count, len(messages))
@@ -703,11 +728,34 @@ class OutlookMailClient:
                     if token_id and token_id.lower() in excluded:
                         continue
                     return artifact
+
+                elapsed = time.time() - started
+                # Graph can read the mailbox, but it stays empty => card won't get activation mail.
+                if graph_ok_seen and max_message_count == 0 and elapsed >= empty_fail_after:
+                    raise RuntimeError(
+                        "outlook verification timeout: graph ok but mailbox empty "
+                        f"(no mail after {int(elapsed)}s; activation mail not arrived)"
+                    )
+                # Graph credentials keep failing in auto mode (shop fallback also empty).
+                if (
+                    credential_fail_since is not None
+                    and not graph_ok_seen
+                    and not messages
+                    and time.time() - credential_fail_since >= credential_fail_after
+                ):
+                    raise RuntimeError(
+                        "outlook verification timeout: graph credentials invalid "
+                        f"({credential_error[:240]})"
+                    )
+            except RuntimeError:
+                raise
             except Exception as exc:
                 last_error = str(exc)
                 lowered = last_error.lower()
                 if "graph token failed" in lowered or "credentials missing" in lowered:
                     credential_error = last_error
+                    if credential_fail_since is None:
+                        credential_fail_since = time.time()
             elapsed = time.time() - started
             time.sleep(8.0 if elapsed >= 60 else 5.0)
 

@@ -190,6 +190,8 @@ DEFAULT_CONFIG = {
         "api_mode": "auto",
         "preferred_domains": [],
         "verification_timeout_sec": 300,
+        "empty_mailbox_fail_after_sec": 75,
+        "credential_fail_after_sec": 20,
     },
     "pool": {
         "min_accounts": 3,
@@ -5555,6 +5557,64 @@ def register_one_account(
     password = generate_registration_password()
     trace = []
     trace.append({"step": "create_mailbox", "email": email, "domain": mailbox.get("domain"), "mailbox_id": mailbox.get("mailbox_id")})
+    # Outlook: probe Graph before signup so bad refresh_token cards fail in seconds, not at 验邮.
+    if str(mailbox.get("provider") or "").lower() == "outlook":
+        try:
+            account = resolve_outlook_mailbox(str(token))
+            probe = MAIL.outlook.probe_graph_mailbox(account)
+            trace.append(
+                {
+                    "step": "outlook_graph_preflight",
+                    "ok": bool(probe.get("ok")),
+                    "message_count": int(probe.get("message_count") or 0),
+                    "error": str(probe.get("error") or "")[:300],
+                }
+            )
+            if not probe.get("ok"):
+                detail = f"graph_preflight_failed: {probe.get('error') or 'unknown'}"
+                MAIL.finish_mailbox(str(token), "disabled", detail[:1000])
+                report("failed", email)
+                return {
+                    "ok": False,
+                    "status": "verify_error",
+                    "account_id": None,
+                    "email": email,
+                    "password": password,
+                    "signup_status": None,
+                    "signup_response": {},
+                    "verification": {},
+                    "verification_artifact": {},
+                    "trace": trace,
+                    "mailbox": {
+                        "address": email,
+                        "token": token,
+                        "provider": mailbox.get("provider") or "",
+                        "mailbox_id": mailbox.get("mailbox_id") or "",
+                    },
+                }
+        except Exception as preflight_error:
+            detail = f"graph_preflight_error: {preflight_error}"
+            trace.append({"step": "outlook_graph_preflight_error", "error": str(preflight_error)})
+            MAIL.finish_mailbox(str(token), "disabled", detail[:1000])
+            report("failed", email)
+            return {
+                "ok": False,
+                "status": "verify_error",
+                "account_id": None,
+                "email": email,
+                "password": password,
+                "signup_status": None,
+                "signup_response": {},
+                "verification": {},
+                "verification_artifact": {},
+                "trace": trace,
+                "mailbox": {
+                    "address": email,
+                    "token": token,
+                    "provider": mailbox.get("provider") or "",
+                    "mailbox_id": mailbox.get("mailbox_id") or "",
+                },
+            }
     report("signup_attempt", email)
     signup = CLIENT.signup_attempt(email, password)
     body = signup.get("response", {})

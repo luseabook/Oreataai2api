@@ -41,7 +41,9 @@
     "api_key": "AC-REPLACE_ME",
     "api_mode": "auto",
     "preferred_domains": [],
-    "verification_timeout_sec": 300
+    "verification_timeout_sec": 300,
+    "empty_mailbox_fail_after_sec": 75,
+    "credential_fail_after_sec": 20
   },
   "pool": {
     "min_accounts": 3,

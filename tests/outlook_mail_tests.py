@@ -244,7 +244,12 @@ class OutlookMailClientTests(unittest.TestCase):
             "refresh_token": "rt",
         }
         client = OutlookMailClient(
-            lambda: {"base_url": "http://example", "api_key": "k", "api_mode": "auto"},
+            lambda: {
+                "base_url": "http://example",
+                "api_key": "k",
+                "api_mode": "auto",
+                "empty_mailbox_fail_after_sec": 1,
+            },
             claim_mailbox=lambda: account,
             resolve_mailbox=lambda token: account,
         )
@@ -259,6 +264,44 @@ class OutlookMailClientTests(unittest.TestCase):
                 client.wait_verification_artifact("pool@outlook.com", "1", timeout_sec=1)
         self.assertIn("mailbox empty", str(ctx.exception))
 
+    def test_wait_fails_fast_when_mailbox_stays_empty(self):
+        account = {
+            "id": 1,
+            "email": "pool@outlook.com",
+            "password": "x",
+            "client_id": "cid",
+            "refresh_token": "rt",
+        }
+        client = OutlookMailClient(
+            lambda: {
+                "base_url": "http://example",
+                "api_key": "k",
+                "api_mode": "auto",
+                "empty_mailbox_fail_after_sec": 20,
+            },
+            claim_mailbox=lambda: account,
+            resolve_mailbox=lambda token: account,
+        )
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            return clock["t"]
+
+        def fake_sleep(seconds):
+            clock["t"] += float(seconds)
+
+        with patch.object(
+            client,
+            "probe_graph_mailbox",
+            return_value={"ok": True, "messages": [], "message_count": 0, "oreate_candidates": 0, "error": ""},
+        ), patch.object(client, "fetch_candidate_messages", return_value=[]), patch(
+            "gateway.outlook_mail.time.time", side_effect=fake_time
+        ), patch("gateway.outlook_mail.time.sleep", side_effect=fake_sleep):
+            with self.assertRaises(RuntimeError) as ctx:
+                client.wait_verification_artifact("pool@outlook.com", "1", timeout_sec=300)
+        self.assertIn("mailbox empty", str(ctx.exception))
+        self.assertLess(clock["t"] - 1000.0, 40.0)
+
     def test_wait_timeout_classifies_invalid_graph_credentials(self):
         account = {
             "id": 1,
@@ -268,7 +311,12 @@ class OutlookMailClientTests(unittest.TestCase):
             "refresh_token": "rt",
         }
         client = OutlookMailClient(
-            lambda: {"base_url": "http://example", "api_key": "k", "api_mode": "graph"},
+            lambda: {
+                "base_url": "http://example",
+                "api_key": "k",
+                "api_mode": "graph",
+                "credential_fail_after_sec": 1,
+            },
             claim_mailbox=lambda: account,
             resolve_mailbox=lambda token: account,
         )
