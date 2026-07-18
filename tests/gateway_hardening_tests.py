@@ -847,6 +847,78 @@ class GatewayHardeningTests(unittest.TestCase):
         next_day = same_day + 26 * 3600
         self.assertTrue(server.account_needs_daily_checkin(row, now=next_day))
 
+    def test_auto_pool_maintenance_throttles_generation_probes(self):
+        first_id = self.seed_account_with_capabilities(email=f"probe-a-{time.time_ns()}@example.com")
+        second_id = self.seed_account_with_capabilities(email=f"probe-b-{time.time_ns()}@example.com")
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "pool": {
+                    "generation_probe_interval_sec": 86400,
+                    "generation_probe_max_per_cycle": 1,
+                }
+            },
+        )
+        try:
+            with (
+                patch.object(
+                    server.CLIENT,
+                    "fetch_account_point_detail",
+                    return_value={"rest_point": 100, "daily_point": 30, "bonus_point": 0},
+                ),
+                patch.object(
+                    server,
+                    "probe_account_generation_health",
+                    return_value={"ok": True, "asset_count": 1},
+                ) as probe_mock,
+                patch.object(server, "account_needs_daily_checkin", return_value=False),
+            ):
+                job = server.create_pool_maintenance_job(
+                    clean_risk=False,
+                    supplement=False,
+                    target_healthy=1,
+                    max_register=0,
+                    force_generation_probe=False,
+                )
+                server.run_pool_maintenance_job(int(job["id"]))
+            self.assertEqual(probe_mock.call_count, 1)
+
+            # Mark both as recently probed; next auto cycle should soft-check only.
+            now = time.time()
+            conn = server.db_conn()
+            conn.execute(
+                "UPDATE accounts SET last_generation_probe_at=? WHERE id IN (?, ?)",
+                (now, first_id, second_id),
+            )
+            conn.commit()
+            conn.close()
+
+            with (
+                patch.object(
+                    server.CLIENT,
+                    "fetch_account_point_detail",
+                    return_value={"rest_point": 100, "daily_point": 30, "bonus_point": 0},
+                ),
+                patch.object(
+                    server,
+                    "probe_account_generation_health",
+                    return_value={"ok": True, "asset_count": 1},
+                ) as probe_mock,
+                patch.object(server, "account_needs_daily_checkin", return_value=False),
+            ):
+                job = server.create_pool_maintenance_job(
+                    clean_risk=False,
+                    supplement=False,
+                    target_healthy=1,
+                    max_register=0,
+                    force_generation_probe=False,
+                )
+                server.run_pool_maintenance_job(int(job["id"]))
+            self.assertEqual(probe_mock.call_count, 0)
+        finally:
+            server.CFG = original_cfg
+
     def test_pool_maintenance_daily_checkin_logs_in_once_per_day(self):
         account_id = self.seed_account_with_capabilities(email=f"checkin-job-{time.time_ns()}@example.com")
         fake_session = server.OreateSession(

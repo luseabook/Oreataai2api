@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Annotated, Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
@@ -197,12 +197,14 @@ DEFAULT_CONFIG = {
         "min_accounts": 3,
         "maintain_target": 5,
         "valid_threshold_pct": 1.0,
-        "maintain_check_interval": 300,
+        "maintain_check_interval": 3600,
         "registration_concurrency": 3,
         "auto_maintain_max_register": 5,
         "auto_checkin_enabled": True,
         "checkin_timezone": "Asia/Shanghai",
         "generation_probe_prompt": "账号健康检测：请生成白色背景上的一个蓝色圆点",
+        "generation_probe_interval_sec": 86400,
+        "generation_probe_max_per_cycle": 3,
     },
     "gateway": {
         "default_rate_limit_per_minute": 60,
@@ -2555,7 +2557,14 @@ def init_db():
     add_column_if_missing(conn, "accounts", "reserve_target_points", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "accounts", "balance_updated_at", "REAL")
     add_column_if_missing(conn, "accounts", "last_checkin_at", "REAL")
+    add_column_if_missing(conn, "accounts", "last_generation_probe_at", "REAL")
     add_column_if_missing(conn, "pool_maintenance_jobs", "checked_in", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(
+        conn,
+        "pool_maintenance_jobs",
+        "force_generation_probe",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
     add_column_if_missing(conn, "tasks", "model_name", "TEXT")
     add_column_if_missing(conn, "tasks", "scene_id", "TEXT")
     add_column_if_missing(conn, "tasks", "resolution", "TEXT")
@@ -2697,6 +2706,8 @@ class PoolSettingsIn(BaseModel):
     maintain_check_interval: Optional[Annotated[int, Field(strict=True, ge=0)]] = None
     registration_concurrency: Optional[Annotated[int, Field(strict=True, ge=1, le=8)]] = None
     auto_maintain_max_register: Optional[Annotated[int, Field(strict=True, ge=0, le=50)]] = None
+    generation_probe_interval_sec: Optional[Annotated[int, Field(strict=True, ge=0)]] = None
+    generation_probe_max_per_cycle: Optional[Annotated[int, Field(strict=True, ge=0, le=200)]] = None
     auto_checkin_enabled: Optional[bool] = None
     checkin_timezone: Optional[str] = None
 
@@ -2706,6 +2717,8 @@ class PoolSettingsIn(BaseModel):
         "maintain_check_interval",
         "registration_concurrency",
         "auto_maintain_max_register",
+        "generation_probe_interval_sec",
+        "generation_probe_max_per_cycle",
         mode="before",
     )
     @classmethod
@@ -2823,6 +2836,7 @@ class PoolMaintenanceIn(BaseModel):
     supplement: bool = True
     target_healthy: Optional[int] = Field(default=None, ge=1, le=500)
     max_register: int = Field(default=10, ge=0, le=50)
+    force_generation_probe: bool = True
 
 
 class AccountReserveTargetIn(BaseModel):
@@ -5173,6 +5187,50 @@ def generation_probe_options(account: sqlite3.Row) -> Dict[str, Any]:
     return options
 
 
+def mark_account_generation_probe_at(account_id: int, ts: Optional[float] = None) -> None:
+    now = float(ts if ts is not None else time.time())
+    conn = db_conn()
+    try:
+        conn.execute(
+            "UPDATE accounts SET last_generation_probe_at=?, updated_at=? WHERE id=?",
+            (now, now, int(account_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def generation_probe_interval_seconds() -> float:
+    raw = CFG.get("pool", {}).get("generation_probe_interval_sec", 86400)
+    value = float_or_default(raw, 86400.0)
+    if not math.isfinite(value):
+        return 86400.0
+    return max(0.0, value)
+
+
+def generation_probe_max_per_cycle() -> int:
+    raw = CFG.get("pool", {}).get("generation_probe_max_per_cycle", 3)
+    value = int_or_default(raw, 3)
+    return max(0, min(200, value))
+
+
+def account_needs_generation_probe(account: Any) -> bool:
+    """Whether a verified/active account is due for an expensive generation probe."""
+    interval = generation_probe_interval_seconds()
+    if interval <= 0:
+        return False
+    last_raw = None
+    try:
+        last_raw = account["last_generation_probe_at"]
+    except Exception:
+        if isinstance(account, Mapping):
+            last_raw = account.get("last_generation_probe_at")
+    last = float_or_default(last_raw, 0.0)
+    if last <= 0:
+        return True
+    return (time.time() - last) >= interval
+
+
 def probe_account_generation_health(account: sqlite3.Row) -> Dict[str, Any]:
     options = generation_probe_options(account)
     prompt = str(
@@ -5189,6 +5247,7 @@ def probe_account_generation_health(account: sqlite3.Row) -> Dict[str, Any]:
     if not assets:
         raise RuntimeError("generation health probe completed without an image asset")
     mark_account_success(int(account["id"]))
+    mark_account_generation_probe_at(int(account["id"]))
     return {
         "ok": True,
         "model_name": options["model_name"],
@@ -6239,6 +6298,7 @@ def recover_interrupted_registration_jobs() -> int:
 
 
 POOL_MAINTENANCE_JOB_FIELDS = {
+    "force_generation_probe",
     "status",
     "total_accounts",
     "checked_accounts",
@@ -6273,6 +6333,7 @@ def pool_maintenance_job_payload(row: sqlite3.Row) -> Dict[str, Any]:
     item["items"] = results if isinstance(results, list) else []
     item["clean_risk"] = bool(item.get("clean_risk"))
     item["supplement"] = bool(item.get("supplement"))
+    item["force_generation_probe"] = bool(item.get("force_generation_probe"))
     return item
 
 
@@ -6282,6 +6343,7 @@ def create_pool_maintenance_job(
     supplement: bool = True,
     target_healthy: Optional[int] = None,
     max_register: int = 10,
+    force_generation_probe: bool = False,
 ) -> Dict[str, Any]:
     target = int(
         target_healthy
@@ -6318,11 +6380,11 @@ def create_pool_maintenance_job(
             INSERT INTO pool_maintenance_jobs(
                 status,total_accounts,checked_accounts,checked_in,healthy_before,healthy_after,
                 risk_found,invalid_found,isolated_accounts,clean_risk,supplement,
-                target_healthy,max_register,registration_target,registered,
+                target_healthy,max_register,force_generation_probe,registration_target,registered,
                 registration_failed,current_account_id,current_email,current_step,
                 items_json,error_message,created_at,updated_at
             )
-            VALUES('queued',?,0,0,?,?,0,0,0,?,?,?, ?,0,0,0,NULL,'','queued','[]','',?,?)
+            VALUES('queued',?,0,0,?,?,0,0,0,?,?,?,?,?,0,0,0,NULL,'','queued','[]','',?,?)
             """,
             (
                 len(rows),
@@ -6332,6 +6394,7 @@ def create_pool_maintenance_job(
                 int(bool(supplement)),
                 target,
                 register_limit,
+                int(bool(force_generation_probe)),
                 now,
                 now,
             ),
@@ -6468,6 +6531,13 @@ def run_pool_maintenance_job(job_id: int) -> None:
     supplement = bool(job["supplement"])
     target_healthy = int(job["target_healthy"])
     max_register = int(job["max_register"])
+    force_generation_probe = bool(job.get("force_generation_probe"))
+    probe_budget = (
+        10**9
+        if force_generation_probe
+        else generation_probe_max_per_cycle()
+    )
+    probes_run = 0
     rows = list_accounts()
     items = list(job.get("items") or [])
     checked_accounts = 0
@@ -6566,17 +6636,46 @@ def run_pool_maintenance_job(job_id: int) -> None:
                         )
                     )
                     row = account_row_by_id(account_id) or row
-                update_pool_maintenance_job(
-                    job_id,
-                    current_step="checking_generation",
+                should_probe = status == "pending_validation" or (
+                    probes_run < probe_budget
+                    and (force_generation_probe or account_needs_generation_probe(row))
                 )
-                if status == "pending_validation":
-                    validate_registered_account(account_id)
+                if should_probe:
+                    update_pool_maintenance_job(
+                        job_id,
+                        current_step="checking_generation",
+                    )
+                    if status == "pending_validation":
+                        validate_registered_account(account_id)
+                    else:
+                        session = CLIENT.session_from_account(row)
+                        detail = CLIENT.fetch_account_point_detail(session, row)
+                        update_account_balance_snapshot(account_id, detail)
+                        probe_account_generation_health(row)
+                    probes_run += 1
+                    items.append(
+                        maintenance_account_item(
+                            account_row_by_id(account_id) or row,
+                            category="generation_probe",
+                            action="probed",
+                        )
+                    )
                 else:
+                    # Soft check: refresh balance without spending generation points.
+                    update_pool_maintenance_job(
+                        job_id,
+                        current_step="checking_balance",
+                    )
                     session = CLIENT.session_from_account(row)
                     detail = CLIENT.fetch_account_point_detail(session, row)
                     update_account_balance_snapshot(account_id, detail)
-                    probe_account_generation_health(row)
+                    items.append(
+                        maintenance_account_item(
+                            account_row_by_id(account_id) or row,
+                            category="balance_check",
+                            action="balance_refreshed",
+                        )
+                    )
             except Exception as exc:
                 if upstream_error_code(exc) == "200001":
                     try:
@@ -6864,6 +6963,7 @@ def maybe_launch_scheduled_pool_maintenance() -> Optional[int]:
             supplement=True,
             target_healthy=None,
             max_register=pool_auto_maintain_max_register(),
+            force_generation_probe=False,
         )
     except HTTPException as exc:
         if int(getattr(exc, "status_code", 0) or 0) == 409:
@@ -10487,6 +10587,7 @@ def create_pool_maintenance_job_endpoint(
         supplement=body.supplement,
         target_healthy=body.target_healthy,
         max_register=body.max_register,
+        force_generation_probe=bool(body.force_generation_probe),
     )
     launch_pool_maintenance_job(job["id"])
     return {"ok": True, "job": job}

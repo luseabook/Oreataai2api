@@ -713,9 +713,13 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
     <div class="col"><label>维护目标数</label><input id="s-target" type="number" min="0" step="1" value="5"></div>
   </div>
   <div class="row" style="margin-top:8px">
-    <div class="col"><label>自动维护间隔（秒，0=关闭）</label><input id="s-maintain-interval" type="number" min="0" step="1" value="300"></div>
+    <div class="col"><label>自动维护间隔（秒，0=关闭）</label><input id="s-maintain-interval" type="number" min="0" step="1" value="3600"></div>
     <div class="col"><label>注册并发数（1-8）</label><input id="s-reg-concurrency" type="number" min="1" max="8" step="1" value="3"></div>
     <div class="col"><label>自动补号上限（0-50）</label><input id="s-auto-register-max" type="number" min="0" max="50" step="1" value="5"></div>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <div class="col"><label>生成探针间隔（秒，0=自动不探针）</label><input id="s-probe-interval" type="number" min="0" step="1" value="86400"></div>
+    <div class="col"><label>每轮自动探针上限（0-200）</label><input id="s-probe-max" type="number" min="0" max="200" step="1" value="3"></div>
   </div>
   <div class="row" style="margin-top:8px">
     <div class="col"><label>维护时自动签到</label>
@@ -726,6 +730,7 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
     </div>
     <div class="col"><label>签到日界时区</label><input id="s-checkin-timezone" value="Asia/Shanghai" placeholder="Asia/Shanghai"></div>
   </div>
+  <p class="reg-console-hint" style="margin:8px 0 0">说明：自动维护默认只刷新余额/签到；生成探针每个账号默认最多每天 1 次，且每轮最多 3 个。手动「体检并补号」仍可强制探针全部候选账号。</p>
   <div style="margin-top:16px"><button class="btn-primary" onclick="saveSettings()">保存设置</button></div>
   <pre id="settings-raw" style="margin-top:12px"></pre>
 
@@ -2070,7 +2075,7 @@ async function maintainPool(){
     showToast('已有号池维护任务正在执行','warn');
     return null;
   }
-  if(!(await showConfirm('将批量检测全部账号，并为每个候选账号发起一次低成本图片生成验证；风险和失效账号会被隔离，再按健康账号缺口自动补号。检测会消耗少量积分，是否继续？',{confirmText:'开始体检'}))) return null;
+  if(!(await showConfirm('将批量检测全部账号：刷新余额/签到，并对候选账号强制做一次低成本图片生成探针（会扣积分）；风险和失效账号会被隔离，再按健康账号缺口自动补号。是否继续？',{confirmText:'开始体检'}))) return null;
   const configuredTarget=Number(state.settings?.pool?.maintain_target);
   const target=Number.isSafeInteger(configuredTarget)&&configuredTarget>0?configuredTarget:5;
   const requestedMax=Number(document.getElementById('reg_count').value||1);
@@ -2918,9 +2923,11 @@ async function loadSettings(){
   document.getElementById('s-vid-model').value=s.oreate?.default_video_model||'';
   document.getElementById('s-min').value=s.pool?.min_accounts??3;
   document.getElementById('s-target').value=s.pool?.maintain_target??5;
-  document.getElementById('s-maintain-interval').value=s.pool?.maintain_check_interval??300;
+  document.getElementById('s-maintain-interval').value=s.pool?.maintain_check_interval??3600;
   document.getElementById('s-reg-concurrency').value=s.pool?.registration_concurrency??3;
   document.getElementById('s-auto-register-max').value=s.pool?.auto_maintain_max_register??5;
+  document.getElementById('s-probe-interval').value=s.pool?.generation_probe_interval_sec??86400;
+  document.getElementById('s-probe-max').value=s.pool?.generation_probe_max_per_cycle??3;
   document.getElementById('s-auto-checkin').value=s.pool?.auto_checkin_enabled===false?'false':'true';
   document.getElementById('s-checkin-timezone').value=s.pool?.checkin_timezone||'Asia/Shanghai';
   updateRegistrationConcurrencyHint();
@@ -2957,6 +2964,8 @@ async function saveSettings(){
     const maintainInterval=requiredIntegerValue('s-maintain-interval','自动维护间隔',0);
     const registrationConcurrency=requiredIntegerValue('s-reg-concurrency','注册并发数',1,8);
     const autoMaintainMaxRegister=requiredIntegerValue('s-auto-register-max','自动补号上限',0,50);
+    const probeInterval=requiredIntegerValue('s-probe-interval','生成探针间隔',0);
+    const probeMax=requiredIntegerValue('s-probe-max','每轮自动探针上限',0,200);
     const autoCheckinEnabled=document.getElementById('s-auto-checkin').value==='true';
     const checkinTimezone=document.getElementById('s-checkin-timezone').value.trim()||'Asia/Shanghai';
     if(maintainTarget < minAccounts) throw new Error('维护目标数不能小于最低账号数');
@@ -2980,6 +2989,8 @@ async function saveSettings(){
         maintain_check_interval:maintainInterval,
         registration_concurrency:registrationConcurrency,
         auto_maintain_max_register:autoMaintainMaxRegister,
+        generation_probe_interval_sec:probeInterval,
+        generation_probe_max_per_cycle:probeMax,
         auto_checkin_enabled:autoCheckinEnabled,
         checkin_timezone:checkinTimezone,
       },
