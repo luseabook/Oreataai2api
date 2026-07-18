@@ -4,6 +4,7 @@ import base64
 import copy
 import hashlib
 import hmac
+import html
 import json
 import math
 import os
@@ -17,11 +18,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 import zipfile
-from urllib.parse import parse_qs, quote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Callable, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 import re
@@ -72,6 +74,11 @@ from gateway.registration_events import (
     registration_event_message,
 )
 from gateway.yyds_mail import YydsClient
+from gateway.outlook_mail import (
+    MailRouter,
+    OutlookMailClient,
+    parse_outlook_import_text,
+)
 from gateway.media_utils import (
     IMAGE_UPLOAD_EXTENSIONS,
     MEDIA_UPLOAD_EXTENSIONS,
@@ -82,7 +89,12 @@ from gateway.media_utils import (
     parse_mp4_video_metadata,
     response_data_object,
 )
-from gateway.oreate_client import OreateClient, OreateSession, configure_oreate_client_defaults
+from gateway.oreate_client import (
+    OreateClient,
+    OreateSession,
+    configure_oreate_client_defaults,
+    extract_user_mirror_metadata,
+)
 from gateway.oreate_stream import (
     MEDIA_URL_RE,
     classify_history_error,
@@ -175,6 +187,7 @@ DEFAULT_CONFIG = {
         "provider": "yyds",
         "base_url": "https://maliapi.215.im/v1",
         "api_key": "",
+        "api_mode": "auto",
         "preferred_domains": [],
     },
     "pool": {
@@ -184,6 +197,8 @@ DEFAULT_CONFIG = {
         "maintain_check_interval": 300,
         "registration_concurrency": 3,
         "auto_maintain_max_register": 5,
+        "auto_checkin_enabled": True,
+        "checkin_timezone": "Asia/Shanghai",
         "generation_probe_prompt": "账号健康检测：请生成白色背景上的一个蓝色圆点",
     },
     "gateway": {
@@ -959,8 +974,13 @@ def build_failed_task_result_payload(task_id: int, account_id: Optional[int], er
 def extract_token_id_from_link(link: str) -> str:
     if not link:
         return ""
-    params = parse_qs(urlparse(link).query)
-    return params.get("tokenID", [""])[0]
+    cleaned = html.unescape(str(link)).replace("&amp;", "&")
+    params = parse_qs(urlparse(cleaned).query)
+    token = params.get("tokenID", [""])[0] or params.get("tokenId", [""])[0]
+    if token:
+        return str(token)
+    match = re.search(r"[?&]tokenID=([^&#\s\"'<>]+)", cleaned, re.I)
+    return unquote(match.group(1)) if match else ""
 
 
 def is_unsafe_admin_password(password: str) -> bool:
@@ -1594,24 +1614,6 @@ def build_video_config(options: Dict[str, Any], model: Optional[Dict[str, Any]] 
             "keepOriginalSound": bool(options.get("keep_original_sound")),
         }
     return config
-
-
-def extract_user_mirror_metadata(body: Any, fallback_email: str = "") -> Dict[str, Any]:
-    source = body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else body
-    source = source if isinstance(source, dict) else {}
-    basic = source.get("basicInfo") or source.get("userInfo") or {}
-    vip = source.get("vipInfo") or {}
-    if not isinstance(basic, dict):
-        basic = {}
-    if not isinstance(vip, dict):
-        vip = {}
-    vip_type = vip.get("vipType")
-    return {
-        "email": basic.get("email") or fallback_email or "",
-        "vip": "" if vip_type is None else str(vip_type),
-        "reg_ts": basic.get("createTime") or "",
-    }
-
 
 
 class UpstreamGenerationError(RuntimeError):
@@ -2470,6 +2472,26 @@ def init_db():
     add_column_if_missing(conn, "registration_jobs", "events_json", "TEXT NOT NULL DEFAULT '[]'")
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS outlook_mailboxes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL UNIQUE,
+            password TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            refresh_token TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'available',
+            last_error TEXT NOT NULL DEFAULT '',
+            leased_at REAL,
+            used_at REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outlook_mailboxes_status ON outlook_mailboxes(status, id)"
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS pool_maintenance_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             status TEXT NOT NULL DEFAULT 'queued',
@@ -2529,6 +2551,8 @@ def init_db():
     add_column_if_missing(conn, "accounts", "bonus_point", "INTEGER")
     add_column_if_missing(conn, "accounts", "reserve_target_points", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "accounts", "balance_updated_at", "REAL")
+    add_column_if_missing(conn, "accounts", "last_checkin_at", "REAL")
+    add_column_if_missing(conn, "pool_maintenance_jobs", "checked_in", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "tasks", "model_name", "TEXT")
     add_column_if_missing(conn, "tasks", "scene_id", "TEXT")
     add_column_if_missing(conn, "tasks", "resolution", "TEXT")
@@ -2670,6 +2694,8 @@ class PoolSettingsIn(BaseModel):
     maintain_check_interval: Optional[Annotated[int, Field(strict=True, ge=0)]] = None
     registration_concurrency: Optional[Annotated[int, Field(strict=True, ge=1, le=8)]] = None
     auto_maintain_max_register: Optional[Annotated[int, Field(strict=True, ge=0, le=50)]] = None
+    auto_checkin_enabled: Optional[bool] = None
+    checkin_timezone: Optional[str] = None
 
     @field_validator(
         "min_accounts",
@@ -2684,6 +2710,37 @@ class PoolSettingsIn(BaseModel):
         if value is None:
             raise PydanticCustomError("int_type", "Input should be a valid integer")
         return value
+
+    @field_validator("auto_checkin_enabled", mode="before")
+    @classmethod
+    def coerce_auto_checkin_enabled(cls, value: Any) -> Any:
+        if value is None:
+            raise PydanticCustomError("bool_type", "Input should be a valid boolean")
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        raise PydanticCustomError("bool_type", "Input should be a valid boolean")
+
+    @field_validator("checkin_timezone", mode="before")
+    @classmethod
+    def validate_checkin_timezone(cls, value: Any) -> Any:
+        if value is None:
+            raise PydanticCustomError("string_type", "Input should be a valid string")
+        text = str(value).strip()
+        if not text:
+            raise PydanticCustomError("string_type", "Input should be a valid string")
+        try:
+            ZoneInfo(text)
+        except Exception as exc:
+            raise PydanticCustomError("timezone_type", "Input should be a valid IANA timezone") from exc
+        return text
 
 
 class SettingsIn(BaseModel):
@@ -2743,6 +2800,15 @@ class AutoRegisterIn(BaseModel):
     count: int = Field(default=1, ge=1, le=50)
 
 
+class OutlookImportIn(BaseModel):
+    text: str = Field(min_length=1)
+    apply_detected_endpoint: bool = True
+
+
+class OutlookPurgeIn(BaseModel):
+    statuses: List[str] = Field(default_factory=lambda: ["used", "error"])
+
+
 class MaintainIn(BaseModel):
     force_register: bool = False
     max_register: int = Field(default=3, ge=0, le=50)
@@ -2759,13 +2825,306 @@ class AccountReserveTargetIn(BaseModel):
     reserve_target_points: Annotated[int, Field(strict=True, ge=0, le=1000000)]
 
 
+class AccountZombiePurgeIn(BaseModel):
+    confirm: bool = False
+
+
 configure_oreate_client_defaults(
     lambda: CFG["oreate"],
     decrypt_secret=decrypt_secret_value,
     tls_verify=tls_verify_enabled,
 )
 CLIENT = OreateClient()
-MAIL = YydsClient(lambda: CFG["mail"])
+
+
+def quarantine_burned_outlook_mailboxes() -> int:
+    """Mark Outlook pool rows that are already burned for Oreate as permanently disabled."""
+    now = time.time()
+    conn = db_conn()
+    try:
+        # Already present in accounts table => cannot re-register.
+        cursor = conn.execute(
+            """
+            UPDATE outlook_mailboxes
+            SET status='disabled',
+                last_error=CASE
+                    WHEN COALESCE(last_error,'')='' THEN 'burned: email already registered in accounts'
+                    ELSE last_error
+                END,
+                updated_at=?
+            WHERE status IN ('available', 'error', 'leased')
+              AND EXISTS (
+                  SELECT 1 FROM accounts a
+                  WHERE lower(a.email)=lower(outlook_mailboxes.email)
+              )
+            """,
+            (now,),
+        )
+        changed = int(cursor.rowcount or 0)
+        # Prior failed registration markers => do not reclaim.
+        cursor = conn.execute(
+            """
+            UPDATE outlook_mailboxes
+            SET status='disabled', updated_at=?
+            WHERE status IN ('available', 'error')
+              AND (
+                instr(lower(COALESCE(last_error,'')), 'signup_failed') > 0
+                OR instr(lower(COALESCE(last_error,'')), 'confirm_failed') > 0
+                OR instr(lower(COALESCE(last_error,'')), 'incorrect password') > 0
+                OR instr(lower(COALESCE(last_error,'')), '600005') > 0
+                OR instr(lower(COALESCE(last_error,'')), '600002') > 0
+                OR instr(lower(COALESCE(last_error,'')), 'without ouss') > 0
+                OR instr(lower(COALESCE(last_error,'')), 'link has expired') > 0
+                OR instr(lower(COALESCE(last_error,'')), 'verify_error') > 0
+                OR instr(lower(COALESCE(last_error,'')), 'verify_timeout') > 0
+                OR instr(lower(COALESCE(last_error,'')), 'manual_release') > 0
+              )
+            """,
+            (now,),
+        )
+        changed += int(cursor.rowcount or 0)
+        conn.commit()
+        return changed
+    finally:
+        conn.close()
+
+
+def claim_outlook_mailbox() -> Dict[str, Any]:
+    quarantine_burned_outlook_mailboxes()
+    conn = db_conn()
+    now = time.time()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT id, email, password, client_id, refresh_token
+            FROM outlook_mailboxes
+            WHERE status='available'
+              AND NOT EXISTS (
+                  SELECT 1 FROM accounts a
+                  WHERE lower(a.email)=lower(outlook_mailboxes.email)
+              )
+              AND COALESCE(last_error,'') NOT LIKE '%signup_failed%'
+              AND COALESCE(last_error,'') NOT LIKE '%confirm_failed%'
+              AND COALESCE(last_error,'') NOT LIKE '%Incorrect password%'
+              AND COALESCE(last_error,'') NOT LIKE '%600005%'
+              AND COALESCE(last_error,'') NOT LIKE '%600002%'
+              AND COALESCE(last_error,'') NOT LIKE '%without ouss%'
+              AND COALESCE(last_error,'') NOT LIKE '%manual_release%'
+            ORDER BY id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            raise RuntimeError("Outlook 邮箱池没有可用的未烧号邮箱，请导入新卡密")
+        updated = conn.execute(
+            """
+            UPDATE outlook_mailboxes
+            SET status='leased', leased_at=?, updated_at=?, last_error=''
+            WHERE id=? AND status='available'
+            """,
+            (now, now, row["id"]),
+        )
+        if updated.rowcount != 1:
+            conn.rollback()
+            raise RuntimeError("领取 Outlook 邮箱失败，请重试")
+        conn.commit()
+        return {
+            "id": int(row["id"]),
+            "email": str(row["email"]),
+            "password": decrypt_secret_value(row["password"], required=True),
+            "client_id": str(row["client_id"]),
+            "refresh_token": decrypt_secret_value(row["refresh_token"], required=True),
+        }
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def resolve_outlook_mailbox(token: str) -> Dict[str, Any]:
+    mailbox_id = int(str(token or "").strip())
+    conn = db_conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT id, email, password, client_id, refresh_token, status
+            FROM outlook_mailboxes
+            WHERE id=?
+            """,
+            (mailbox_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"outlook mailbox not found: {mailbox_id}")
+        return {
+            "id": int(row["id"]),
+            "email": str(row["email"]),
+            "password": decrypt_secret_value(row["password"], required=True),
+            "client_id": str(row["client_id"]),
+            "refresh_token": decrypt_secret_value(row["refresh_token"], required=True),
+            "status": str(row["status"] or ""),
+        }
+    finally:
+        conn.close()
+
+
+def finish_outlook_mailbox(token: str, status: str, error: str = "") -> None:
+    mailbox_id = int(str(token or "").strip())
+    normalized = str(status or "").strip().lower() or "error"
+    if normalized not in {"available", "used", "error", "disabled", "leased"}:
+        normalized = "error"
+    now = time.time()
+    used_at = now if normalized == "used" else None
+    conn = db_conn()
+    try:
+        conn.execute(
+            """
+            UPDATE outlook_mailboxes
+            SET status=?, last_error=?, used_at=COALESCE(?, used_at), updated_at=?
+            WHERE id=?
+            """,
+            (normalized, str(error or "")[:1000], used_at, now, mailbox_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def outlook_mailbox_stats() -> Dict[str, int]:
+    conn = db_conn()
+    try:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS count FROM outlook_mailboxes GROUP BY status"
+        ).fetchall()
+        stats = {"available": 0, "leased": 0, "used": 0, "error": 0, "disabled": 0, "total": 0}
+        for row in rows:
+            key = str(row["status"] or "")
+            count = int(row["count"] or 0)
+            stats["total"] += count
+            if key in stats:
+                stats[key] = count
+        return stats
+    finally:
+        conn.close()
+
+
+def import_outlook_mailboxes(
+    text: str,
+    *,
+    apply_detected_endpoint: bool = True,
+) -> Dict[str, Any]:
+    parsed = parse_outlook_import_text(text)
+    accounts = parsed.get("accounts") or []
+    now = time.time()
+    inserted = 0
+    updated = 0
+    skipped = 0
+    conn = db_conn()
+    try:
+        for account in accounts:
+            email = str(account.get("email") or "").strip().lower()
+            if not email:
+                skipped += 1
+                continue
+            password = encrypt_secret_value(account.get("password") or "")
+            refresh_token = encrypt_secret_value(account.get("refresh_token") or "")
+            client_id = str(account.get("client_id") or "").strip()
+            existing = conn.execute(
+                "SELECT id, status FROM outlook_mailboxes WHERE email=?",
+                (email,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO outlook_mailboxes(
+                        email, password, client_id, refresh_token, status,
+                        last_error, leased_at, used_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'available', '', NULL, NULL, ?, ?)
+                    """,
+                    (email, password, client_id, refresh_token, now, now),
+                )
+                inserted += 1
+                continue
+            next_status = str(existing["status"] or "available")
+            # Never revive permanently burned/disabled mailboxes on re-import.
+            if next_status == "error":
+                next_status = "available"
+            conn.execute(
+                """
+                UPDATE outlook_mailboxes
+                SET password=?, client_id=?, refresh_token=?, status=?,
+                    last_error=CASE WHEN ?='disabled' THEN last_error ELSE '' END,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (password, client_id, refresh_token, next_status, next_status, now, existing["id"]),
+            )
+            updated += 1
+        conn.commit()
+    finally:
+        conn.close()
+
+    config_updates: Dict[str, Any] = {}
+    if apply_detected_endpoint and accounts:
+        updates: Dict[str, Any] = {"provider": "outlook"}
+        detected_base = str(parsed.get("detected_base_url") or "").strip()
+        detected_key = str(parsed.get("detected_api_key") or "").strip()
+        if detected_base:
+            updates["base_url"] = detected_base
+        if detected_key:
+            updates["api_key"] = detected_key
+        if not str((CFG.get("mail") or {}).get("api_mode") or "").strip():
+            updates["api_mode"] = "auto"
+        CFG["mail"] = deep_merge(CFG.get("mail") or {}, updates)
+        save_config(CFG)
+        config_updates = {
+            "provider": "outlook",
+            "base_url": updates.get("base_url") or str((CFG.get("mail") or {}).get("base_url") or ""),
+        }
+        if detected_key:
+            config_updates["api_key"] = SECRET_PLACEHOLDER
+
+    return {
+        "ok": True,
+        "inserted": inserted,
+        "updated": updated,
+        "skipped": skipped,
+        "parse_errors": parsed.get("errors") or [],
+        "detected_base_url": parsed.get("detected_base_url") or "",
+        "config_updates": config_updates,
+        "stats": outlook_mailbox_stats(),
+    }
+
+
+def public_outlook_mailbox(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "email": row["email"],
+        "client_id": row["client_id"],
+        "status": row["status"],
+        "last_error": row["last_error"],
+        "leased_at": row["leased_at"],
+        "used_at": row["used_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "has_password": bool(row["password"]),
+        "has_refresh_token": bool(row["refresh_token"]),
+    }
+
+
+YYDS_MAIL = YydsClient(lambda: CFG["mail"])
+OUTLOOK_MAIL = OutlookMailClient(
+    lambda: CFG["mail"],
+    claim_mailbox=claim_outlook_mailbox,
+    resolve_mailbox=resolve_outlook_mailbox,
+    finish_mailbox=finish_outlook_mailbox,
+)
+MAIL = MailRouter(lambda: CFG["mail"], YYDS_MAIL, OUTLOOK_MAIL)
 
 
 def save_account(email: str, password: str, session: OreateSession, model_info=None, video_info=None, status="verified", source="auto") -> int:
@@ -4890,7 +5249,111 @@ def refresh_account_session_and_validate(account_id: int) -> Dict[str, Any]:
         status="pending_validation",
         source=str(account["source"] or "auto"),
     )
-    return validate_registered_account(account_id)
+    result = validate_registered_account(account_id)
+    mark_account_checkin_at(account_id)
+    return result
+
+
+def reactivate_account(account_id: int) -> Dict[str, Any]:
+    """Re-login and re-validate an isolated/invalid account so it can rejoin the pool.
+
+    Gateway ``disabled`` / ``invalid`` are local operational states (usually expired
+    session ``200001``), not proof that Oreate banned the mailbox.
+    """
+    account = account_row_by_id(account_id)
+    if account is None:
+        raise RuntimeError("account not found")
+    status = str(account["status"] or "")
+    if status not in {"disabled", "invalid", "pending_validation"}:
+        raise RuntimeError(f"account status '{status}' does not need reactivation")
+    validation = refresh_account_session_and_validate(account_id)
+    row = account_row_by_id(account_id)
+    if row is None:
+        raise RuntimeError("account disappeared after reactivation")
+    return {
+        "ok": str(row["status"] or "") in {"verified", "active"},
+        "status": str(row["status"] or ""),
+        "validation": validation,
+        "item": public_account(row),
+    }
+
+
+def account_is_zombie(row: sqlite3.Row) -> bool:
+    """Detect accounts that cannot form a usable Oreate session (no recoverable ouss)."""
+    status = str(row["status"] or "").strip().lower()
+    if status not in {"disabled", "invalid", "pending_validation"}:
+        return False
+    last_error = str(row["last_error"] or "").lower()
+    ouss = decrypt_secret_value(row["ouss"] if "ouss" in row.keys() else "", required=False)
+    if not str(ouss or "").strip():
+        return True
+    markers = (
+        "200001",
+        "user not login",
+        "without ouss",
+        "not fully activated",
+        "link has expired",
+        "600002",
+    )
+    return any(marker in last_error for marker in markers)
+
+
+def purge_zombie_accounts() -> Dict[str, Any]:
+    """Delete zombie pool accounts that are not usable for scheduling."""
+    conn = db_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, email, status, ouss, last_error
+            FROM accounts
+            WHERE status IN ('disabled', 'invalid', 'pending_validation')
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        candidates: List[sqlite3.Row] = [row for row in rows if account_is_zombie(row)]
+        if not candidates:
+            return {"ok": True, "deleted": 0, "skipped_active": 0, "emails": []}
+
+        deleted_ids: List[int] = []
+        deleted_emails: List[str] = []
+        skipped_active = 0
+        for row in candidates:
+            account_id = int(row["id"])
+            active = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM tasks
+                WHERE account_id=?
+                  AND status IN ('queued', 'running', 'submitted', 'hydrating')
+                """,
+                (account_id,),
+            ).fetchone()
+            if int((active["count"] if active else 0) or 0) > 0:
+                skipped_active += 1
+                continue
+            conn.execute("UPDATE tasks SET account_id=NULL WHERE account_id=?", (account_id,))
+            conn.execute("UPDATE task_attempts SET account_id=NULL WHERE account_id=?", (account_id,))
+            conn.execute("UPDATE usage_log SET account_id=NULL WHERE account_id=?", (account_id,))
+            conn.execute("DELETE FROM uploaded_media WHERE account_id=?", (account_id,))
+            conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+            deleted_ids.append(account_id)
+            deleted_emails.append(str(row["email"] or ""))
+        conn.commit()
+        return {
+            "ok": True,
+            "deleted": len(deleted_ids),
+            "skipped_active": skipped_active,
+            "ids": deleted_ids,
+            "emails": deleted_emails,
+        }
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
 
 
 def save_and_validate_registered_account(
@@ -4951,6 +5414,7 @@ def save_and_validate_registered_account(
             "result": validation,
         }
     )
+    mark_account_checkin_at(account_id)
     return account_id, "verified"
 
 
@@ -4979,6 +5443,101 @@ def pool_auto_maintain_max_register() -> int:
     return max(0, min(50, value))
 
 
+def pool_auto_checkin_enabled() -> bool:
+    value = CFG.get("pool", {}).get("auto_checkin_enabled", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
+def pool_checkin_timezone_name() -> str:
+    value = str(CFG.get("pool", {}).get("checkin_timezone") or "Asia/Shanghai").strip()
+    return value or "Asia/Shanghai"
+
+
+def pool_checkin_tzinfo() -> ZoneInfo:
+    name = pool_checkin_timezone_name()
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return ZoneInfo("Asia/Shanghai")
+
+
+def account_checkin_day_key(ts: float, tz: Optional[ZoneInfo] = None) -> str:
+    zone = tz or pool_checkin_tzinfo()
+    return datetime.fromtimestamp(float(ts), tz=zone).date().isoformat()
+
+
+def account_needs_daily_checkin(row: Any, now: Optional[float] = None) -> bool:
+    if not pool_auto_checkin_enabled():
+        return False
+    if isinstance(row, sqlite3.Row):
+        status = str(row["status"] or "")
+        last_raw = row["last_checkin_at"] if "last_checkin_at" in row.keys() else None
+    else:
+        status = str((row or {}).get("status") or "")
+        last_raw = (row or {}).get("last_checkin_at")
+    if status not in {"verified", "active"}:
+        return False
+    current = time.time() if now is None else float(now)
+    if last_raw in (None, ""):
+        return True
+    try:
+        last_ts = float(last_raw)
+    except (TypeError, ValueError):
+        return True
+    tz = pool_checkin_tzinfo()
+    return account_checkin_day_key(last_ts, tz) != account_checkin_day_key(current, tz)
+
+
+def mark_account_checkin_at(account_id: int, when: Optional[float] = None) -> None:
+    now = time.time() if when is None else float(when)
+    conn = db_conn()
+    try:
+        conn.execute(
+            "UPDATE accounts SET last_checkin_at=?, updated_at=? WHERE id=?",
+            (now, now, int(account_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def checkin_account_by_login(account_id: int) -> Dict[str, Any]:
+    """Login once to trigger upstream daily check-in and refresh local session/balance."""
+    account = account_row_by_id(account_id)
+    if account is None:
+        raise RuntimeError("account not found for daily check-in")
+    status = str(account["status"] or "")
+    if status not in {"verified", "active"}:
+        raise RuntimeError(f"account status '{status}' is not eligible for daily check-in")
+    password = decrypt_secret_value(account["password"], required=True)
+    email = str(account["email"] or "")
+    refreshed_session = CLIENT.login(email, password)
+    session = CLIENT.session_from_cookie_dict(refreshed_session.cookies)
+    model_info = json_value_from_db(account["model_info_json"])
+    video_info = json_value_from_db(account["video_info_json"])
+    save_account(
+        email,
+        password,
+        refreshed_session,
+        model_info=model_info if isinstance(model_info, dict) else None,
+        video_info=video_info if isinstance(video_info, dict) else None,
+        status=status,
+        source=str(account["source"] or "auto"),
+    )
+    detail = CLIENT.fetch_account_point_detail(session, account)
+    update_account_balance_snapshot(account_id, detail)
+    now = time.time()
+    mark_account_checkin_at(account_id, now)
+    return {
+        "ok": True,
+        "account_id": int(account_id),
+        "email": email,
+        "checked_in_at": now,
+        "balance": detail,
+    }
+
 
 def register_one_account(
     progress: Optional[Callable[[str, str], None]] = None,
@@ -4998,12 +5557,25 @@ def register_one_account(
     signup = CLIENT.signup_attempt(email, password)
     body = signup.get("response", {})
     status_code = signup.get("status_code")
-    signup_ok = status_code == 200 and body.get("status", {}).get("code") == 0
-    trace.append({"step": "signup_attempt", "status_code": status_code, "response": body})
+    upstream_code = body.get("status", {}).get("code") if isinstance(body, dict) else None
+    signup_ok = status_code == 200 and upstream_code == 0
+    trace.append(
+        {
+            "step": "signup_attempt",
+            "status_code": status_code,
+            "response": body,
+            "jt_coded": signup.get("jt_coded"),
+        }
+    )
     artifact = {}
     verification = {}
     account_id = None
     final_status = "signup_failed"
+    if not signup_ok:
+        # Upstream returns the same 100002 for bad jt and blocked disposable domains.
+        # When the helper already supplied a CODED jt, treat it as domain rejection.
+        if upstream_code == 100002 and signup.get("jt_coded"):
+            final_status = "email_domain_rejected"
 
     if signup_ok:
         send_email_count = body.get("data", {}).get("sendEmailCount") or body.get("sendEmailCount")
@@ -5049,103 +5621,151 @@ def register_one_account(
                 final_status = "verify_error"
         else:
             try:
-                # Oreate often reports sendEmailCount=1 but the first verification
-                # message does not actually land in YYDS. Force one resend before
-                # waiting for the verification artifact.
-                try:
-                    resend = CLIENT.resend_confirm_email(email)
-                    trace.append({"step": "resend_confirm_email", "response": resend})
-                except Exception as resend_error:
-                    trace.append({"step": "resend_confirm_email_error", "error": str(resend_error)})
+                wait_started_at = time.time()
+                send_count = int_or_default(send_email_count, 0)
+                total_can_send = int_or_default(
+                    body.get("data", {}).get("totalCanSendEmailCount") or body.get("totalCanSendEmailCount"),
+                    3,
+                )
+                # Only resend when upstream still has quota; otherwise we would keep
+                # matching stale inbox links from prior burned attempts.
+                if send_count < total_can_send:
+                    try:
+                        resend = CLIENT.resend_confirm_email(email)
+                        trace.append({"step": "resend_confirm_email", "response": resend})
+                        wait_started_at = time.time()
+                    except Exception as resend_error:
+                        trace.append({"step": "resend_confirm_email_error", "error": str(resend_error)})
+                else:
+                    trace.append(
+                        {
+                            "step": "resend_confirm_email_skipped",
+                            "sendEmailCount": send_count,
+                            "totalCanSendEmailCount": total_can_send,
+                        }
+                    )
 
-                artifact = MAIL.wait_verification_artifact(email, token, timeout_sec=180)
-                trace.append({"step": "wait_verification_artifact", "artifact": artifact})
-                if artifact.get("link") or artifact.get("code"):
-                    # Extract tokenID from the verification link and visit it
+                excluded_token_ids: List[str] = []
+                confirm_code = None
+                for verify_attempt in range(2):
+                    artifact = MAIL.wait_verification_artifact(
+                        email,
+                        token,
+                        timeout_sec=180,
+                        not_before=wait_started_at - 5,
+                        exclude_token_ids=excluded_token_ids,
+                    )
+                    trace.append(
+                        {
+                            "step": "wait_verification_artifact",
+                            "attempt": verify_attempt + 1,
+                            "artifact": artifact,
+                        }
+                    )
+                    if not (artifact.get("link") or artifact.get("code")):
+                        final_status = "verify_timeout"
+                        break
+
                     token_id = ""
                     link = artifact.get("link", "")
                     if link:
                         token_id = extract_token_id_from_link(link)
                         trace.append({"step": "extract_token_from_link", "tokenID": token_id, "link": link})
-                        # Visit the verification link (click it) - REQUIRED for email to be marked verified
                         try:
                             vr = requests.get(link, verify=tls_verify_enabled(), timeout=10, allow_redirects=True)
                             trace.append({"step": "visit_verification_link", "status": vr.status_code})
                         except Exception as e:
                             trace.append({"step": "visit_verification_link", "error": str(e)})
-                    
+
                     code = artifact.get("code", "")
                     if not token_id and code:
                         token_id = code
-                    
+
                     if not token_id:
-                        # Fallback: try check_email_verified
                         verification = CLIENT.check_email_verified(email, ticket_id)
                         trace.append({"step": "check_email_verified", "response": verification})
-                        token_id = verification.get("tokenID") or verification.get("data", {}).get("tokenID") or verification.get("tokenId")
-                    
-                    if token_id:
-                        confirm = CLIENT.confirm_email_register(email, token_id, ticket_id, password)
-                        verification["confirm"] = confirm
-                        trace.append({"step": "emailregisterconfirm", "response": confirm})
-                        confirm_code = confirm.get("response", {}).get("status", {}).get("code")
-                        if confirm.get("status_code") == 200 and confirm_code == 0:
-                            report("login_and_save", email)
-                            session = CLIENT.login(email, password)
-                            sess = CLIENT.session_from_cookie_dict(session.cookies)
-                            img = CLIENT.fetch_image_models(sess)
-                            vid = {
-                                "models": CLIENT.fetch_video_models(sess),
-                                "scenes": CLIENT.fetch_video_scenes(sess),
-                            }
-                            report("generation_validation", email)
-                            account_id, final_status = save_and_validate_registered_account(
-                                email,
-                                password,
-                                session,
-                                img,
-                                vid,
-                                trace,
-                            )
-                        else:
-                            try:
-                                report("login_and_save", email)
-                                session = CLIENT.login(email, password)
-                                sess = CLIENT.session_from_cookie_dict(session.cookies)
-                                img = CLIENT.fetch_image_models(sess)
-                                vid = {
-                                    "models": CLIENT.fetch_video_models(sess),
-                                    "scenes": CLIENT.fetch_video_scenes(sess),
-                                }
-                                report("generation_validation", email)
-                                account_id, final_status = save_and_validate_registered_account(
-                                    email,
-                                    password,
-                                    session,
-                                    img,
-                                    vid,
-                                    trace,
-                                )
-                                trace.append(
-                                    {
-                                        "step": "login_after_confirm_fallback",
-                                        "account_id": account_id,
-                                        "confirm_code": confirm_code,
-                                    }
-                                )
-                            except Exception as login_error:
-                                trace.append(
-                                    {
-                                        "step": "login_after_confirm_fallback_error",
-                                        "error": str(login_error),
-                                        "confirm_code": confirm_code,
-                                    }
-                                )
-                                final_status = "confirm_failed"
-                    else:
+                        token_id = (
+                            verification.get("tokenID")
+                            or verification.get("data", {}).get("tokenID")
+                            or verification.get("tokenId")
+                        )
+
+                    if not token_id:
                         final_status = "verify_pending"
-                else:
-                    final_status = "verify_timeout"
+                        break
+
+                    confirm = CLIENT.confirm_email_register(email, token_id, ticket_id, password)
+                    verification["confirm"] = confirm
+                    trace.append({"step": "emailregisterconfirm", "response": confirm})
+                    confirm_code = confirm.get("response", {}).get("status", {}).get("code")
+                    if confirm.get("status_code") == 200 and confirm_code == 0:
+                        report("login_and_save", email)
+                        session = CLIENT.login(email, password)
+                        sess = CLIENT.session_from_cookie_dict(session.cookies)
+                        img = CLIENT.fetch_image_models(sess)
+                        vid = {
+                            "models": CLIENT.fetch_video_models(sess),
+                            "scenes": CLIENT.fetch_video_scenes(sess),
+                        }
+                        report("generation_validation", email)
+                        account_id, final_status = save_and_validate_registered_account(
+                            email,
+                            password,
+                            session,
+                            img,
+                            vid,
+                            trace,
+                        )
+                        break
+
+                    # Expired/stale activation link: wait for a newer mail once.
+                    if confirm_code in {600002, "600002"} and verify_attempt == 0:
+                        excluded_token_ids.append(str(token_id))
+                        wait_started_at = time.time()
+                        if send_count < total_can_send:
+                            try:
+                                resend = CLIENT.resend_confirm_email(email)
+                                trace.append({"step": "resend_confirm_email_retry", "response": resend})
+                                wait_started_at = time.time()
+                            except Exception as resend_error:
+                                trace.append({"step": "resend_confirm_email_retry_error", "error": str(resend_error)})
+                        continue
+
+                    try:
+                        report("login_and_save", email)
+                        session = CLIENT.login(email, password)
+                        sess = CLIENT.session_from_cookie_dict(session.cookies)
+                        img = CLIENT.fetch_image_models(sess)
+                        vid = {
+                            "models": CLIENT.fetch_video_models(sess),
+                            "scenes": CLIENT.fetch_video_scenes(sess),
+                        }
+                        report("generation_validation", email)
+                        account_id, final_status = save_and_validate_registered_account(
+                            email,
+                            password,
+                            session,
+                            img,
+                            vid,
+                            trace,
+                        )
+                        trace.append(
+                            {
+                                "step": "login_after_confirm_fallback",
+                                "account_id": account_id,
+                                "confirm_code": confirm_code,
+                            }
+                        )
+                    except Exception as login_error:
+                        trace.append(
+                            {
+                                "step": "login_after_confirm_fallback_error",
+                                "error": str(login_error),
+                                "confirm_code": confirm_code,
+                            }
+                        )
+                        final_status = "confirm_failed"
+                    break
             except Exception as e:
                 artifact = {"error": str(e)}
                 trace.append({"step": "wait_verification_error", "error": str(e)})
@@ -5162,9 +5782,46 @@ def register_one_account(
         "verification": verification,
         "verification_artifact": artifact,
         "trace": trace,
-        "mailbox": {"address": email, "token": token},
+        "mailbox": {
+            "address": email,
+            "token": token,
+            "provider": mailbox.get("provider") or "",
+            "mailbox_id": mailbox.get("mailbox_id") or "",
+        },
     }
     record_mail_domain_outcome(str(mailbox.get("domain") or ""), final_status)
+    if str(mailbox.get("provider") or "").lower() == "outlook":
+        if final_status == "verified":
+            MAIL.finish_mailbox(str(token), "used")
+        elif final_status == "email_domain_rejected":
+            # Domain policy rejection is not mailbox-specific; return to pool.
+            MAIL.finish_mailbox(str(token), "available", final_status)
+        elif final_status in {
+            "signup_failed",
+            "confirm_failed",
+            "verify_error",
+            "verify_timeout",
+            "verify_pending",
+            "invalid",
+            "validation_failed",
+        }:
+            # These addresses are burned for Oreate; keep them out of the claim pool.
+            upstream_msg = ""
+            if isinstance(body, dict):
+                upstream_msg = str((body.get("status") or {}).get("msg") or "")
+            confirm_msg = ""
+            if isinstance(verification, dict):
+                confirm_body = verification.get("confirm") or {}
+                if isinstance(confirm_body, dict):
+                    confirm_msg = str(
+                        ((confirm_body.get("response") or {}).get("status") or {}).get("msg") or ""
+                    )
+            detail = " | ".join(
+                part for part in (final_status, upstream_msg, confirm_msg, str(artifact.get("error") or "")) if part
+            )
+            MAIL.finish_mailbox(str(token), "disabled", detail[:1000])
+        else:
+            MAIL.finish_mailbox(str(token), "error", final_status)
     report("completed", email)
     return result
 
@@ -5386,6 +6043,7 @@ def run_registration_job(job_id: int) -> None:
                 for _ in range(batch_size)
             ]
 
+        domain_rejected = False
         for raw in registered:
             result = public_registration_result(raw)
             results.append(result)
@@ -5397,6 +6055,8 @@ def run_registration_job(job_id: int) -> None:
             completed += 1
             email = str(result.get("email") or current_email)
             status = str(result.get("status") or "")
+            if status == "email_domain_rejected":
+                domain_rejected = True
             append_registration_job_event(
                 job_id,
                 step="account_done",
@@ -5419,6 +6079,31 @@ def run_registration_job(job_id: int) -> None:
                 current_email=email,
                 items=results,
             )
+
+        if domain_rejected:
+            message = (
+                "上游已拒绝当前临时邮箱域名（100002）。"
+                "Gmail 等常规邮箱仍可注册，但 YYDS 临时域名目前不可用；请更换可接收验证码的邮箱源后重试。"
+            )
+            append_registration_job_event(
+                job_id,
+                step="failed",
+                level="error",
+                status="email_domain_rejected",
+                message=message,
+            )
+            update_registration_job(
+                job_id,
+                status="failed",
+                current_step="failed",
+                error_message=message,
+                completed=completed,
+                succeeded=succeeded,
+                failed=failed,
+                current_index=completed,
+                items=results,
+            )
+            return
 
     final_status = "completed" if failed == 0 else "completed_with_errors"
     append_registration_job_event(
@@ -5491,6 +6176,7 @@ POOL_MAINTENANCE_JOB_FIELDS = {
     "status",
     "total_accounts",
     "checked_accounts",
+    "checked_in",
     "healthy_before",
     "healthy_after",
     "risk_found",
@@ -5564,13 +6250,13 @@ def create_pool_maintenance_job(
         cursor = conn.execute(
             """
             INSERT INTO pool_maintenance_jobs(
-                status,total_accounts,checked_accounts,healthy_before,healthy_after,
+                status,total_accounts,checked_accounts,checked_in,healthy_before,healthy_after,
                 risk_found,invalid_found,isolated_accounts,clean_risk,supplement,
                 target_healthy,max_register,registration_target,registered,
                 registration_failed,current_account_id,current_email,current_step,
                 items_json,error_message,created_at,updated_at
             )
-            VALUES('queued',?,0,?,?,0,0,0,?,?,?, ?,0,0,0,NULL,'','queued','[]','',?,?)
+            VALUES('queued',?,0,0,?,?,0,0,0,?,?,?, ?,0,0,0,NULL,'','queued','[]','',?,?)
             """,
             (
                 len(rows),
@@ -5719,6 +6405,7 @@ def run_pool_maintenance_job(job_id: int) -> None:
     rows = list_accounts()
     items = list(job.get("items") or [])
     checked_accounts = 0
+    checked_in = 0
     risk_found = 0
     invalid_found = 0
     isolated_accounts = 0
@@ -5757,6 +6444,7 @@ def run_pool_maintenance_job(job_id: int) -> None:
             update_pool_maintenance_job(
                 job_id,
                 checked_accounts=checked_accounts,
+                checked_in=checked_in,
                 risk_found=risk_found,
                 invalid_found=invalid_found,
                 isolated_accounts=isolated_accounts,
@@ -5772,6 +6460,14 @@ def run_pool_maintenance_job(job_id: int) -> None:
                     current_step="refreshing_session",
                 )
                 refresh_account_session_and_validate(account_id)
+                checked_in += 1
+                items.append(
+                    maintenance_account_item(
+                        account_row_by_id(account_id) or row,
+                        category="daily_checkin",
+                        action="checked_in",
+                    )
+                )
             except Exception as exc:
                 check_failures += 1
                 category, code = record_maintenance_account_failure(
@@ -5789,6 +6485,21 @@ def run_pool_maintenance_job(job_id: int) -> None:
             invalid_found += 1
         elif status in {"verified", "active", "pending_validation"}:
             try:
+                if status in {"verified", "active"} and account_needs_daily_checkin(row):
+                    update_pool_maintenance_job(
+                        job_id,
+                        current_step="daily_checkin",
+                    )
+                    checkin_account_by_login(account_id)
+                    checked_in += 1
+                    items.append(
+                        maintenance_account_item(
+                            account_row_by_id(account_id) or row,
+                            category="daily_checkin",
+                            action="checked_in",
+                        )
+                    )
+                    row = account_row_by_id(account_id) or row
                 update_pool_maintenance_job(
                     job_id,
                     current_step="checking_generation",
@@ -5808,6 +6519,14 @@ def run_pool_maintenance_job(job_id: int) -> None:
                             current_step="refreshing_session",
                         )
                         refresh_account_session_and_validate(account_id)
+                        checked_in += 1
+                        items.append(
+                            maintenance_account_item(
+                                account_row_by_id(account_id) or row,
+                                category="daily_checkin",
+                                action="checked_in",
+                            )
+                        )
                         exc = None
                     except Exception as refresh_exc:
                         exc = refresh_exc
@@ -5841,6 +6560,7 @@ def run_pool_maintenance_job(job_id: int) -> None:
             update_pool_maintenance_job(
                 job_id,
                 checked_accounts=checked_accounts,
+                checked_in=checked_in,
                 risk_found=risk_found,
                 invalid_found=invalid_found,
                 isolated_accounts=isolated_accounts,
@@ -5876,6 +6596,7 @@ def run_pool_maintenance_job(job_id: int) -> None:
         update_pool_maintenance_job(
             job_id,
             checked_accounts=checked_accounts,
+            checked_in=checked_in,
             risk_found=risk_found,
             invalid_found=invalid_found,
             isolated_accounts=isolated_accounts,
@@ -5974,6 +6695,7 @@ def run_pool_maintenance_job(job_id: int) -> None:
         status=final_status,
         healthy_after=final_summary["healthy"],
         checked_accounts=checked_accounts,
+        checked_in=checked_in,
         risk_found=risk_found,
         invalid_found=invalid_found,
         isolated_accounts=isolated_accounts,
@@ -9392,6 +10114,29 @@ def refresh_account_balance(account_id: int, _=Depends(require_admin)):
     return {"ok": True, "item": public_account(row)}
 
 
+@app.post("/api/accounts/{account_id}/reactivate")
+def reactivate_account_endpoint(account_id: int, _=Depends(require_admin)):
+    account = account_row_by_id(account_id)
+    if account is None:
+        raise HTTPException(404, "account not found")
+    try:
+        return reactivate_account(account_id)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "does not need reactivation" in message:
+            raise HTTPException(409, message) from exc
+        raise HTTPException(503, message) from exc
+    except Exception as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.post("/api/accounts/purge-zombies")
+def purge_zombie_accounts_endpoint(body: AccountZombiePurgeIn, _admin: str = Depends(require_admin)):
+    if not body.confirm:
+        raise HTTPException(400, "请确认清理僵尸号（confirm=true）")
+    return purge_zombie_accounts()
+
+
 @app.get("/api/models/capabilities")
 def admin_model_capabilities(_=Depends(require_admin)):
     return load_capabilities_from_pool()
@@ -9404,7 +10149,185 @@ def admin_models_refresh(_=Depends(require_admin)):
 
 @app.get("/api/mail/test")
 def mail_test(_=Depends(require_admin)):
-    return MAIL.test_connectivity()
+    result = MAIL.test_connectivity()
+    if isinstance(result, dict):
+        result = dict(result)
+        result["outlook_pool"] = outlook_mailbox_stats()
+    return result
+
+
+@app.get("/api/mail/outlook")
+def list_outlook_mailboxes_endpoint(
+    status: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 200,
+    _=Depends(require_admin),
+):
+    limit = max(1, min(int(limit or 200), 1000))
+    clauses = []
+    params: List[Any] = []
+    status_value = str(status or "").strip().lower()
+    if status_value and status_value != "all":
+        clauses.append("status=?")
+        params.append(status_value)
+    query = str(q or "").strip()
+    if query:
+        clauses.append("email LIKE ?")
+        params.append(f"%{query}%")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    conn = db_conn()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT id, email, password, client_id, refresh_token, status, last_error,
+                   leased_at, used_at, created_at, updated_at
+            FROM outlook_mailboxes
+            {where}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        items = [public_outlook_mailbox(row) for row in rows]
+    finally:
+        conn.close()
+    return {
+        "stats": outlook_mailbox_stats(),
+        "items": items,
+        "provider": str((CFG.get("mail") or {}).get("provider") or "yyds"),
+        "base_url": str((CFG.get("mail") or {}).get("base_url") or ""),
+        "api_mode": str((CFG.get("mail") or {}).get("api_mode") or "auto"),
+    }
+
+
+@app.post("/api/mail/outlook/import")
+def import_outlook_mailboxes_endpoint(body: OutlookImportIn, _=Depends(require_admin)):
+    return import_outlook_mailboxes(body.text, apply_detected_endpoint=body.apply_detected_endpoint)
+
+
+@app.post("/api/mail/outlook/import-file")
+async def import_outlook_mailboxes_file_endpoint(
+    file: UploadFile = File(...),
+    apply_detected_endpoint: bool = Form(True),
+    _=Depends(require_admin),
+):
+    filename = str(file.filename or "").strip()
+    suffix = Path(filename).suffix.lower() if filename else ""
+    if suffix and suffix not in {".txt", ".csv", ".log", ".text"}:
+        raise HTTPException(400, "仅支持导入 .txt / .csv 文本卡密文件")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "文件为空")
+    if len(raw) > 8 * 1024 * 1024:
+        raise HTTPException(400, "卡密文件过大（上限 8MB）")
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "latin-1"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            text = ""
+    else:
+        raise HTTPException(400, "无法识别文件编码，请另存为 UTF-8 文本后重试")
+    result = import_outlook_mailboxes(text, apply_detected_endpoint=apply_detected_endpoint)
+    result["filename"] = filename
+    if int(result.get("inserted") or 0) == 0 and int(result.get("updated") or 0) == 0:
+        raise HTTPException(
+            400,
+            "未识别到有效 Outlook 卡密行（需要 邮箱----密码----client_id----refresh_token 或完整 /get 链接）",
+        )
+    return result
+
+
+@app.post("/api/mail/outlook/purge")
+def purge_outlook_mailboxes_endpoint(body: OutlookPurgeIn, _=Depends(require_admin)):
+    allowed = {"available", "leased", "used", "error", "disabled"}
+    statuses = [str(item).strip().lower() for item in (body.statuses or []) if str(item).strip()]
+    statuses = [item for item in statuses if item in allowed]
+    if not statuses:
+        raise HTTPException(400, "请指定要清理的状态，例如 used / error")
+    placeholders = ",".join("?" for _ in statuses)
+    conn = db_conn()
+    try:
+        deleted = conn.execute(
+            f"DELETE FROM outlook_mailboxes WHERE status IN ({placeholders})",
+            statuses,
+        )
+        conn.commit()
+        count = int(deleted.rowcount or 0)
+    finally:
+        conn.close()
+    return {"ok": True, "deleted": count, "statuses": statuses, "stats": outlook_mailbox_stats()}
+
+
+@app.post("/api/mail/outlook/use-for-registration")
+def use_outlook_for_registration_endpoint(_=Depends(require_admin)):
+    mail_cfg = deep_merge(
+        CFG.get("mail") or {},
+        {
+            "provider": "outlook",
+            "api_mode": str((CFG.get("mail") or {}).get("api_mode") or "auto"),
+        },
+    )
+    CFG["mail"] = mail_cfg
+    save_config(CFG)
+    return {
+        "ok": True,
+        "provider": "outlook",
+        "stats": outlook_mailbox_stats(),
+        "base_url": str(mail_cfg.get("base_url") or ""),
+    }
+
+
+@app.get("/api/mail/outlook/{mailbox_id}/credentials")
+def outlook_mailbox_credentials(mailbox_id: int, _=Depends(require_admin)):
+    conn = db_conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT id, email, password, client_id, refresh_token
+            FROM outlook_mailboxes
+            WHERE id=?
+            """,
+            (mailbox_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(404, "outlook mailbox not found")
+    return {
+        "id": int(row["id"]),
+        "email": str(row["email"] or ""),
+        "password": decrypt_secret_value(row["password"]),
+        "client_id": str(row["client_id"] or ""),
+        "refresh_token": decrypt_secret_value(row["refresh_token"]),
+    }
+
+
+@app.post("/api/mail/outlook/{mailbox_id}/release")
+def release_outlook_mailbox_endpoint(mailbox_id: int, _=Depends(require_admin)):
+    conn = db_conn()
+    try:
+        row = conn.execute("SELECT id, status FROM outlook_mailboxes WHERE id=?", (mailbox_id,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(404, "outlook mailbox not found")
+    finish_outlook_mailbox(str(mailbox_id), "available", "manual_release")
+    return {"ok": True, "stats": outlook_mailbox_stats()}
+
+
+@app.delete("/api/mail/outlook/{mailbox_id}")
+def delete_outlook_mailbox_endpoint(mailbox_id: int, _=Depends(require_admin)):
+    conn = db_conn()
+    try:
+        deleted = conn.execute("DELETE FROM outlook_mailboxes WHERE id=?", (mailbox_id,))
+        conn.commit()
+        rowcount = deleted.rowcount
+    finally:
+        conn.close()
+    if rowcount != 1:
+        raise HTTPException(404, "outlook mailbox not found")
+    return {"ok": True, "stats": outlook_mailbox_stats()}
 
 
 @app.post("/api/register/one")
@@ -9419,6 +10342,14 @@ def register_batch(body: AutoRegisterIn, _=Depends(require_admin)):
 
 @app.post("/api/register/jobs", status_code=202)
 def create_registration_job_endpoint(body: AutoRegisterIn, _=Depends(require_admin)):
+    provider = str((CFG.get("mail") or {}).get("provider") or "yyds").strip().lower()
+    if provider in {"outlook", "out", "hotmail", "msoauth2", "oauth2"}:
+        available = int(outlook_mailbox_stats().get("available") or 0)
+        if available < int(body.count):
+            raise HTTPException(
+                400,
+                f"Outlook 可用邮箱不足：需要 {body.count}，当前可用 {available}。请先导入卡密。",
+            )
     job = create_registration_job(body.count)
     launch_registration_job(job["id"])
     return {"ok": True, "job": job}

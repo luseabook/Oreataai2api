@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import secrets
@@ -100,37 +101,49 @@ class YydsClient:
 
     def extract_verify_link(self, message: Dict[str, Any]) -> str:
         blobs = []
-        for key in ("subject", "html", "text", "body", "content"):
+        for key in ("subject", "html", "text", "body", "content", "bodyPreview"):
             value = message.get(key)
             if isinstance(value, list):
                 blobs.extend([str(x) for x in value])
+            elif isinstance(value, dict) and "content" in value:
+                blobs.append(str(value.get("content") or ""))
             elif isinstance(value, str):
                 blobs.append(value)
-        joined = "\n".join(blobs)
-        m = re.search(r'https://www\.oreateai\.com[^\s"\'<>]*confirm[^\s"\'<>]*', joined, re.I)
-        if m:
-            return m.group(0)
-        m = re.search(r'https://www\.oreateai\.com[^\s"\'<>]*verify[^\s"\'<>]*', joined, re.I)
-        if m:
-            return m.group(0)
-        m = re.search(r'https://www\.oreateai\.com[^\s"\'<>]*\?[^\s"\'<>]*tokenID=[^\s"\'<>]*', joined, re.I)
-        if m:
-            return m.group(0)
+        joined = html.unescape("\n".join(blobs))
+        patterns = (
+            r'https://(?:www\.)?oreateai\.com[^\s"\'<>]*confirm[^\s"\'<>]*',
+            r'https://(?:www\.)?oreateai\.com[^\s"\'<>]*verify[^\s"\'<>]*',
+            r'https://(?:www\.)?oreateai\.com[^\s"\'<>]*[?&][^\s"\'<>]*tokenID=[^\s"\'<>]*',
+            r'https://(?:www\.)?oreateai\.com[^\s"\'<>]*tokenID=[^\s"\'<>]*',
+        )
+        for pattern in patterns:
+            m = re.search(pattern, joined, re.I)
+            if m:
+                return html.unescape(m.group(0)).rstrip(").,;]")
         return ""
 
     def extract_verify_code(self, message: Dict[str, Any]) -> str:
         blobs = []
-        for key in ("subject", "html", "text", "body", "content"):
+        for key in ("subject", "html", "text", "body", "content", "bodyPreview"):
             value = message.get(key)
             if isinstance(value, list):
                 blobs.extend([str(x) for x in value])
+            elif isinstance(value, dict) and "content" in value:
+                blobs.append(str(value.get("content") or ""))
             elif isinstance(value, str):
                 blobs.append(value)
-        joined = "\n".join(blobs)
+        joined = html.unescape("\n".join(blobs))
         m = re.search(r'\b(\d{6})\b', joined)
         return m.group(1) if m else ""
 
-    def wait_verification_artifact(self, address: str, token: str, timeout_sec: int = 180) -> Dict[str, str]:
+    def wait_verification_artifact(
+        self,
+        address: str,
+        token: str,
+        timeout_sec: int = 180,
+        **kwargs: Any,
+    ) -> Dict[str, str]:
+        # kwargs (not_before/exclude_token_ids) are Outlook-specific and ignored here.
         seen = set()
         deadline = time.time() + timeout_sec
         while time.time() < deadline:

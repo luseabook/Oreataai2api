@@ -460,6 +460,7 @@ class GatewayHardeningTests(unittest.TestCase):
         task_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
         usage_cols = {r["name"] for r in conn.execute("PRAGMA table_info(usage_log)").fetchall()}
         api_key_cols = {r["name"] for r in conn.execute("PRAGMA table_info(api_keys)").fetchall()}
+        job_cols = {r["name"] for r in conn.execute("PRAGMA table_info(pool_maintenance_jobs)").fetchall()}
         client_table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='clients'").fetchone()
         conn.close()
 
@@ -468,6 +469,8 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn("daily_point", account_cols)
         self.assertIn("bonus_point", account_cols)
         self.assertIn("balance_updated_at", account_cols)
+        self.assertIn("last_checkin_at", account_cols)
+        self.assertIn("checked_in", job_cols)
         self.assertIn("balance_before_json", task_cols)
         self.assertIn("balance_after_json", task_cols)
         self.assertIn("balance_before_rest_point", task_cols)
@@ -701,9 +704,13 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertIn('id="s-maintain-interval"', html)
         self.assertIn('id="s-reg-concurrency"', html)
         self.assertIn('id="s-auto-register-max"', html)
+        self.assertIn('id="s-auto-checkin"', html)
+        self.assertIn('id="s-checkin-timezone"', html)
         self.assertIn("maintain_check_interval:maintainInterval", html)
         self.assertIn("registration_concurrency:registrationConcurrency", html)
         self.assertIn("auto_maintain_max_register:autoMaintainMaxRegister", html)
+        self.assertIn("auto_checkin_enabled:autoCheckinEnabled", html)
+        self.assertIn("checkin_timezone:checkinTimezone", html)
 
     def test_admin_pool_console_uses_single_register_cta_and_event_log(self):
         html = server.ADMIN_HTML
@@ -824,6 +831,92 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(len(results), 5)
         self.assertGreaterEqual(max_active, 2)
         self.assertLessEqual(max_active, 3)
+
+    def test_account_needs_daily_checkin_respects_shanghai_day_boundary(self):
+        account_id = self.seed_account_with_capabilities(email=f"checkin-need-{time.time_ns()}@example.com")
+        row = server.account_row_by_id(account_id)
+        self.assertTrue(server.account_needs_daily_checkin(row))
+
+        # Same Shanghai calendar day should not need another check-in.
+        same_day = 1_752_800_000.0  # around 2025-07-18 in Asia/Shanghai
+        server.mark_account_checkin_at(account_id, same_day)
+        row = server.account_row_by_id(account_id)
+        self.assertFalse(server.account_needs_daily_checkin(row, now=same_day + 3600))
+
+        # Next Shanghai calendar day should need check-in again.
+        next_day = same_day + 26 * 3600
+        self.assertTrue(server.account_needs_daily_checkin(row, now=next_day))
+
+    def test_pool_maintenance_daily_checkin_logs_in_once_per_day(self):
+        account_id = self.seed_account_with_capabilities(email=f"checkin-job-{time.time_ns()}@example.com")
+        fake_session = server.OreateSession(
+            email="checkin@example.com",
+            password="plain-password",
+            cookies={"OUID": "ouid-secret", "ouss": "ouss-secret"},
+        )
+
+        def _run_job():
+            job = server.create_pool_maintenance_job(
+                clean_risk=False,
+                supplement=False,
+                target_healthy=1,
+                max_register=0,
+            )
+            server.run_pool_maintenance_job(int(job["id"]))
+            return server.get_pool_maintenance_job(int(job["id"]))
+
+        with (
+            patch.object(server.CLIENT, "login", return_value=fake_session) as login_mock,
+            patch.object(
+                server.CLIENT,
+                "fetch_account_point_detail",
+                return_value={"rest_point": 130, "daily_point": 30, "bonus_point": 0},
+            ),
+            patch.object(
+                server,
+                "probe_account_generation_health",
+                return_value={"ok": True, "asset_count": 1},
+            ),
+        ):
+            first = _run_job()
+            self.assertEqual(first["status"], "completed")
+            self.assertEqual(first["checked_in"], 1)
+            self.assertEqual(login_mock.call_count, 1)
+
+            second = _run_job()
+            self.assertEqual(second["status"], "completed")
+            self.assertEqual(second["checked_in"], 0)
+            self.assertEqual(login_mock.call_count, 1)
+
+        row = server.account_row_by_id(account_id)
+        self.assertIsNotNone(row["last_checkin_at"])
+        self.assertEqual(int(row["rest_point"] or 0), 130)
+
+        # Force previous day and ensure maintenance logs in again.
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET last_checkin_at=? WHERE id=?",
+            (time.time() - 36 * 3600, account_id),
+        )
+        conn.commit()
+        conn.close()
+
+        with (
+            patch.object(server.CLIENT, "login", return_value=fake_session) as login_mock,
+            patch.object(
+                server.CLIENT,
+                "fetch_account_point_detail",
+                return_value={"rest_point": 160, "daily_point": 30, "bonus_point": 0},
+            ),
+            patch.object(
+                server,
+                "probe_account_generation_health",
+                return_value={"ok": True, "asset_count": 1},
+            ),
+        ):
+            third = _run_job()
+        self.assertEqual(third["checked_in"], 1)
+        self.assertEqual(login_mock.call_count, 1)
 
     def test_scheduled_pool_maintenance_skips_when_job_already_active(self):
         job = server.create_pool_maintenance_job(
@@ -2448,6 +2541,210 @@ class GatewayHardeningTests(unittest.TestCase):
 
         self.assertFalse(fake.post_called)
 
+    def test_signup_attempt_requires_coded_jt_and_sets_bid_cookie(self):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"status": {"code": 0, "msg": "Success"}, "data": {"isRegister": True}}
+
+        class FakeSession:
+            def __init__(self):
+                self.cookies = {}
+                self.posts = []
+
+            def get(self, url, **kwargs):
+                return FakeResponse()
+
+            def post(self, url, **kwargs):
+                self.posts.append({"url": url, "json": kwargs.get("json")})
+                return FakeResponse()
+
+        fake = FakeSession()
+        client = server.OreateClient()
+        with (
+            patch.object(client, "new_session", return_value=fake),
+            patch.object(
+                client,
+                "get_ticket",
+                return_value={"ticketID": "ticket-1", "pk": "-----BEGIN PUBLIC KEY-----\nMFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBANnFake\n-----END PUBLIC KEY-----"},
+            ),
+            patch.object(client, "encrypt_password", return_value="enc-pass"),
+            patch(
+                "gateway.oreate_client.generate_banti_artifacts",
+                side_effect=[
+                    {"jt": "31$eyJub3QtY29kZWQifQ==", "cookies": {"__bid_n": "bad-bid"}},
+                    {"jt": "31$CODED--v30abc", "cookies": {"__bid_n": "good-bid"}},
+                ],
+            ) as helper,
+        ):
+            result = client.signup_attempt("user@example.com", "Aa1@abcd12")
+
+        self.assertEqual(helper.call_count, 2)
+        self.assertEqual(fake.cookies["__bid_n"], "good-bid")
+        self.assertEqual(result["payload"]["jt"], "31$CODED--v30abc")
+        self.assertTrue(result["jt_coded"])
+        self.assertEqual(result["response"]["status"]["code"], 0)
+
+    def test_registration_marks_coded_jt_100002_as_email_domain_rejected(self):
+        with (
+            patch.object(
+                server.MAIL,
+                "create_mailbox",
+                return_value={
+                    "address": "burn@temp.xyz",
+                    "token": "mail-token",
+                    "domain": "temp.xyz",
+                    "mailbox_id": "mb-1",
+                },
+            ),
+            patch.object(
+                server.CLIENT,
+                "signup_attempt",
+                return_value={
+                    "status_code": 200,
+                    "jt_coded": True,
+                    "ticket": {"ticketID": "t1"},
+                    "payload": {"jt": "31$CODED--v30abc"},
+                    "response": {
+                        "status": {"code": 100002, "msg": "Invalid parameter"},
+                        "data": {
+                            "signupStatus": 1,
+                            "signinStatus": 0,
+                            "confirmEmailStatus": 0,
+                            "registerStatus": 1,
+                        },
+                    },
+                },
+            ),
+            patch.object(server, "record_mail_domain_outcome"),
+        ):
+            result = server.register_one_account()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "email_domain_rejected")
+
+    def test_outlook_mailbox_import_and_claim(self):
+        text = "\n".join(
+            [
+                "http://43.153.39.164:8899/get?key=91amail.com&email=one@outlook.com----pass1----9e5f94bc-e8a4-4e73-b8be-63364c29d753----rt-one",
+                "two@outlook.com----pass2----9e5f94bc-e8a4-4e73-b8be-63364c29d753----rt-two",
+            ]
+        )
+        imported = server.import_outlook_mailboxes(text, apply_detected_endpoint=True)
+        self.assertEqual(imported["inserted"], 2)
+        self.assertEqual(imported["stats"]["available"], 2)
+        self.assertEqual(server.CFG["mail"]["provider"], "outlook")
+        self.assertEqual(server.CFG["mail"]["base_url"], "http://43.153.39.164:8899")
+
+        claimed = server.claim_outlook_mailbox()
+        self.assertEqual(claimed["email"], "one@outlook.com")
+        self.assertEqual(claimed["password"], "pass1")
+        stats = server.outlook_mailbox_stats()
+        self.assertEqual(stats["available"], 1)
+        self.assertEqual(stats["leased"], 1)
+
+        response = self.client.get("/api/mail/outlook", headers=self.admin_headers())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["stats"]["total"], 2)
+
+    def test_outlook_claim_skips_burned_and_import_keeps_disabled(self):
+        server.import_outlook_mailboxes(
+            "\n".join(
+                [
+                    "burned@outlook.com----p1----9e5f94bc-e8a4-4e73-b8be-63364c29d753----rt1",
+                    "fresh@outlook.com----p2----9e5f94bc-e8a4-4e73-b8be-63364c29d753----rt2",
+                    "overlap@outlook.com----p3----9e5f94bc-e8a4-4e73-b8be-63364c29d753----rt3",
+                ]
+            ),
+            apply_detected_endpoint=False,
+        )
+        conn = server.db_conn()
+        try:
+            conn.execute(
+                "UPDATE outlook_mailboxes SET last_error=? WHERE email=?",
+                ("signup_failed | Incorrect password", "burned@outlook.com"),
+            )
+            conn.execute(
+                """
+                INSERT INTO accounts(
+                    email, password, status, source, created_at, updated_at
+                ) VALUES (?, ?, 'active', 'manual', ?, ?)
+                """,
+                ("overlap@outlook.com", "x", 1.0, 1.0),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        claimed = server.claim_outlook_mailbox()
+        self.assertEqual(claimed["email"], "fresh@outlook.com")
+        conn = server.db_conn()
+        try:
+            statuses = {
+                str(row["email"]): str(row["status"])
+                for row in conn.execute(
+                    "SELECT email, status FROM outlook_mailboxes WHERE email IN (?, ?)",
+                    ("burned@outlook.com", "overlap@outlook.com"),
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        self.assertEqual(statuses["burned@outlook.com"], "disabled")
+        self.assertEqual(statuses["overlap@outlook.com"], "disabled")
+
+        reimport = server.import_outlook_mailboxes(
+            "burned@outlook.com----p1----9e5f94bc-e8a4-4e73-b8be-63364c29d753----rt1",
+            apply_detected_endpoint=False,
+        )
+        self.assertEqual(reimport["updated"], 1)
+        conn = server.db_conn()
+        try:
+            row = conn.execute(
+                "SELECT status FROM outlook_mailboxes WHERE email=?",
+                ("burned@outlook.com",),
+            ).fetchone()
+            self.assertEqual(row["status"], "disabled")
+        finally:
+            conn.close()
+
+    def test_outlook_mailbox_import_file_auto_detects_lines(self):
+        payload = (
+            "http://43.153.39.164:8899/get?key=91amail.com&email="
+            "fileuser@outlook.com----passfile----9e5f94bc-e8a4-4e73-b8be-63364c29d753----rt-file\n"
+            "not-a-valid-line\n"
+        ).encode("utf-8")
+        response = self.client.post(
+            "/api/mail/outlook/import-file",
+            headers=self.admin_headers(),
+            files={"file": ("卡密信息.txt", payload, "text/plain")},
+            data={"apply_detected_endpoint": "true"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["inserted"], 1)
+        self.assertEqual(body["filename"], "卡密信息.txt")
+        self.assertEqual(body["stats"]["available"], 1)
+        self.assertEqual(server.CFG["mail"]["provider"], "outlook")
+
+    def test_outlook_mailbox_credentials_reveal_password(self):
+        imported = server.import_outlook_mailboxes(
+            "cred@outlook.com----secretpass----9e5f94bc-e8a4-4e73-b8be-63364c29d753----rt-cred",
+            apply_detected_endpoint=False,
+        )
+        self.assertEqual(imported["inserted"], 1)
+        listed = self.client.get("/api/mail/outlook", headers=self.admin_headers())
+        self.assertEqual(listed.status_code, 200)
+        item = listed.json()["items"][0]
+        self.assertTrue(item["has_password"])
+        self.assertNotIn("secretpass", json.dumps(item))
+        creds = self.client.get(
+            f"/api/mail/outlook/{item['id']}/credentials",
+            headers=self.admin_headers(),
+        )
+        self.assertEqual(creds.status_code, 200)
+        self.assertEqual(creds.json()["password"], "secretpass")
+
     def test_video_text_or_image_config_is_nested_like_web(self):
         config = server.build_video_config(
             {
@@ -3090,6 +3387,29 @@ class GatewayHardeningTests(unittest.TestCase):
             fallback_email="fallback@example.test",
         )
 
+        self.assertEqual(metadata["email"], "user@example.test")
+        self.assertEqual(metadata["vip"], "0")
+        self.assertEqual(metadata["reg_ts"], 1783500000)
+
+    def test_fetch_user_mirror_metadata_uses_client_helper_not_empty_fallback(self):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "data": {
+                        "basicInfo": {"email": "user@example.test", "createTime": 1783500000},
+                        "vipInfo": {"vipType": 0},
+                    }
+                }
+
+        class FakeSession:
+            def get(self, *args, **kwargs):
+                return FakeResponse()
+
+        client = server.OreateClient()
+        metadata = client.fetch_user_mirror_metadata(FakeSession())
         self.assertEqual(metadata["email"], "user@example.test")
         self.assertEqual(metadata["vip"], "0")
         self.assertEqual(metadata["reg_ts"], 1783500000)
@@ -4399,6 +4719,77 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(response.json()["account_id"], ready_id)
         self.assertTrue(selected_accounts)
         self.assertTrue(all(account_id == ready_id for account_id in selected_accounts))
+
+    def test_admin_can_reactivate_disabled_account(self):
+        account_id = self.seed_account_with_capabilities(email=f"reactivate-{time.time_ns()}@example.com")
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET status='disabled', last_error=? WHERE id=?",
+            ("200001: user not login", account_id),
+        )
+        conn.commit()
+        conn.close()
+
+        def _fake_refresh(aid):
+            now = time.time()
+            conn = server.db_conn()
+            conn.execute(
+                "UPDATE accounts SET status='verified', last_error=NULL, failure_count=0, updated_at=? WHERE id=?",
+                (now, aid),
+            )
+            conn.commit()
+            conn.close()
+            return {"ok": True, "model_name": "GPT Image 2.0", "asset_count": 1}
+
+        with patch.object(
+            server,
+            "refresh_account_session_and_validate",
+            side_effect=_fake_refresh,
+        ) as refresh_mock:
+            response = self.client.post(
+                f"/api/accounts/{account_id}/reactivate",
+                headers=self.admin_headers(),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "verified")
+        self.assertEqual(payload["item"]["status"], "verified")
+        refresh_mock.assert_called_once_with(account_id)
+
+    def test_admin_can_purge_zombie_accounts_without_touching_verified(self):
+        zombie_id = self.seed_account_with_capabilities(email=f"zombie-{time.time_ns()}@example.com")
+        keep_id = self.seed_account_with_capabilities(email=f"keep-{time.time_ns()}@example.com")
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET status='disabled', ouss='', last_error=? WHERE id=?",
+            ("200001: user not login", zombie_id),
+        )
+        conn.commit()
+        conn.close()
+
+        denied = self.client.post("/api/accounts/purge-zombies", json={}, headers=self.admin_headers())
+        self.assertEqual(denied.status_code, 400)
+
+        response = self.client.post(
+            "/api/accounts/purge-zombies",
+            json={"confirm": True},
+            headers=self.admin_headers(),
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        self.assertGreaterEqual(payload["deleted"], 1)
+        self.assertIn(zombie_id, payload["ids"])
+
+        conn = server.db_conn()
+        zombie = conn.execute("SELECT id FROM accounts WHERE id=?", (zombie_id,)).fetchone()
+        kept = conn.execute("SELECT id,status FROM accounts WHERE id=?", (keep_id,)).fetchone()
+        conn.close()
+        self.assertIsNone(zombie)
+        self.assertIsNotNone(kept)
+        self.assertEqual(kept["status"], "verified")
 
     def test_admin_can_refresh_account_balance_and_list_safe_snapshot(self):
         account_id = self.seed_account_with_capabilities(email=f"balance-{time.time_ns()}@example.com")

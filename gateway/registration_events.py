@@ -33,6 +33,8 @@ def registration_event_message(step: str, *, level: str = "info", status: str = 
         return "注册成功"
     if level == "error":
         status_key = str(status or "").strip().lower()
+        if status_key == "email_domain_rejected":
+            return "注册失败（上游拒绝当前临时邮箱域名）"
         if status_key:
             return f"注册失败（{status_key}）"
         return "注册失败"

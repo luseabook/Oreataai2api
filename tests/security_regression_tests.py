@@ -1353,6 +1353,14 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
     def test_token_id_is_extracted_from_verification_link(self):
         link = "https://www.oreateai.com/passport/confirm?tokenID=abc123&x=1"
         self.assertEqual(server.extract_token_id_from_link(link), "abc123")
+        modern = (
+            "https://www.oreateai.com/home/vertical/aiImage"
+            "?email=a%40outlook.com&amp;tokenID=72428279-b47a-4cbb-ad9e-14130d2c22a9"
+        )
+        self.assertEqual(
+            server.extract_token_id_from_link(modern),
+            "72428279-b47a-4cbb-ad9e-14130d2c22a9",
+        )
 
     def test_normalizes_image_and_video_capabilities(self):
         caps = server.normalize_capabilities(self.sample_image_info(), self.sample_video_info())
@@ -2320,6 +2328,9 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertIn("localStorage", html)
         self.assertIn("Authorization", html)
         self.assertIn("/api/admin/login", html)
+        # Multipart uploads must not force Content-Type: application/json.
+        self.assertIn("authHeaders({multipart:true})", html)
+        self.assertIn("if(!options.multipart) headers['Content-Type']='application/json';", html)
 
     def test_admin_html_contains_credentials_and_capability_controls(self):
         html = server.ADMIN_HTML
@@ -2342,8 +2353,13 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertIn("复制密码", html)
         self.assertIn("连接暂时中断，正在重试", html)
         self.assertIn("体检并补号", html)
+        self.assertIn("清理僵尸号", html)
+        self.assertIn("/api/accounts/purge-zombies", html)
         self.assertIn("/api/pool/maintenance/jobs", html)
         self.assertIn('id="maintenance-progress"', html)
+        self.assertIn('id="tab-outlook"', html)
+        self.assertIn("/api/mail/outlook/import-file", html)
+        self.assertIn("loadOutlookMailboxes", html)
         self.assertNotIn("s-admin-pwd", html)
 
     def test_admin_html_escapes_untrusted_usage_account_and_client_values(self):

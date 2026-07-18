@@ -15,7 +15,11 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from banti_token_generator import generate_banti_artifacts, generate_jt_token
+from banti_token_generator import (
+    generate_banti_artifacts,
+    generate_jt_token,
+    is_coded_jt_token,
+)
 from gateway.media_utils import (
     IMAGE_UPLOAD_EXTENSIONS,
     VIDEO_UPLOAD_EXTENSIONS,
@@ -39,6 +43,24 @@ TlsVerifyFn = Callable[[], bool]
 _DEFAULT_OREATE_CONFIG: Optional[OreateConfigFn] = None
 _DEFAULT_DECRYPT_SECRET: Optional[DecryptSecretFn] = None
 _DEFAULT_TLS_VERIFY: Optional[TlsVerifyFn] = None
+
+
+def extract_user_mirror_metadata(body: Any, fallback_email: str = "") -> Dict[str, Any]:
+    """Build web ZCe mirror fields (email/vip/reg_ts) from getuserinfo payload."""
+    source = body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else body
+    source = source if isinstance(source, dict) else {}
+    basic = source.get("basicInfo") or source.get("userInfo") or {}
+    vip = source.get("vipInfo") or {}
+    if not isinstance(basic, dict):
+        basic = {}
+    if not isinstance(vip, dict):
+        vip = {}
+    vip_type = vip.get("vipType")
+    return {
+        "email": basic.get("email") or fallback_email or "",
+        "vip": "" if vip_type is None else str(vip_type),
+        "reg_ts": basic.get("createTime") or "",
+    }
 
 
 def configure_oreate_client_defaults(
@@ -179,21 +201,54 @@ class OreateClient:
         enc = pub.encrypt(password.encode(), padding.PKCS1v15())
         return base64.b64encode(enc).decode()
 
+    def _acquire_signup_banti_artifacts(self, attempts: int = 6) -> Dict[str, Any]:
+        """Signup rejects classic A0 jt fallbacks; require CODED helper tokens + bid cookie."""
+        last_error: Optional[Exception] = None
+        for _ in range(max(1, int(attempts))):
+            try:
+                artifacts = generate_banti_artifacts()
+            except Exception as exc:  # pragma: no cover - exercised via mocked helpers
+                last_error = exc
+                continue
+            jt = artifacts.get("jt")
+            cookies = artifacts.get("cookies") if isinstance(artifacts.get("cookies"), dict) else {}
+            bid = str(cookies.get("__bid_n") or "").strip()
+            if is_coded_jt_token(jt) and bid:
+                return {
+                    "jt": jt,
+                    "cookies": cookies,
+                    "version": artifacts.get("version"),
+                }
+            last_error = RuntimeError("banti helper returned non-coded signup jt")
+        raise RuntimeError(f"banti signup artifacts unavailable: {last_error}")
+
+    def _apply_banti_cookies(self, s: requests.Session, cookies: Mapping[str, Any]) -> None:
+        for name, value in cookies.items():
+            if value in (None, ""):
+                continue
+            self._set_cookie_unique(s, str(name), str(value))
+
     def signup_attempt(self, email: str, password: str, jt: Any = None) -> Dict[str, Any]:
         s = self.new_session()
         ticket = self.get_ticket(s)
         enc_password = self.encrypt_password(ticket["pk"], password)
-        jt_token = jt if jt is not None else generate_jt_token()
+        artifacts: Dict[str, Any]
+        if jt is not None:
+            artifacts = {"jt": jt, "cookies": {}}
+        else:
+            artifacts = self._acquire_signup_banti_artifacts()
+            self._apply_banti_cookies(s, artifacts.get("cookies") or {})
         payload = {
             "email": email,
             "password": enc_password,
             "ticketID": ticket["ticketID"],
             "fr": self._cfg()["default_fr"],
-            "jt": jt_token,
+            "jt": artifacts["jt"],
         }
+        headers = {**self.headers, "content-type": "application/json"}
         r = s.post(
             self.base + "/passport/api/emailsignupin",
-            headers={**self.headers, "content-type": "application/json"},
+            headers=headers,
             json=payload,
             timeout=self.timeout,
         )
@@ -201,12 +256,31 @@ class OreateClient:
             body = r.json()
         except Exception:
             body = {"raw": r.text[:2000]}
+
+        # One refresh helps when helper briefly returns a stale/non-coded token path.
+        if jt is None and isinstance(body, dict) and (body.get("status") or {}).get("code") == 100002:
+            artifacts = self._acquire_signup_banti_artifacts()
+            self._apply_banti_cookies(s, artifacts.get("cookies") or {})
+            payload["jt"] = artifacts["jt"]
+            r = s.post(
+                self.base + "/passport/api/emailsignupin",
+                headers=headers,
+                json=payload,
+                timeout=self.timeout,
+            )
+            try:
+                body = r.json()
+            except Exception:
+                body = {"raw": r.text[:2000]}
+
+        cookies = s.cookies.get_dict() if hasattr(s.cookies, "get_dict") else dict(s.cookies)
         return {
             "status_code": r.status_code,
             "ticket": ticket,
             "payload": payload,
             "response": body,
-            "cookies": s.cookies.get_dict(),
+            "cookies": cookies,
+            "jt_coded": is_coded_jt_token(payload.get("jt")),
         }
 
     def check_email_verified(self, email: str, ticket_id: str) -> Dict[str, Any]:
@@ -273,7 +347,13 @@ class OreateClient:
         body = r.json()
         if body.get("status", {}).get("code") != 0:
             raise RuntimeError(f"emaillogin failed: {body}")
-        return OreateSession(email=email, password=password, cookies=s.cookies.get_dict())
+        cookies = s.cookies.get_dict()
+        if not str(cookies.get("ouss") or "").strip():
+            raise RuntimeError(
+                "emaillogin succeeded without ouss cookie; account is not fully activated "
+                "or the password/session cannot establish a usable login"
+            )
+        return OreateSession(email=email, password=password, cookies=cookies)
 
     def session_from_account(self, account: sqlite3.Row) -> requests.Session:
         s = self.new_session()

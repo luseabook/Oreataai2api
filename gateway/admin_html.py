@@ -15,7 +15,7 @@ body.login-mode{overflow:hidden;background:#0f1419}
 .nav a{color:#1d1d1f;text-decoration:none;font-size:14px;padding:6px 16px;border-radius:8px;transition:.2s;cursor:pointer}
 .nav a:hover{background:#f0f0f0}
 .nav .badge{background:#1d1d1f;color:#fff;font-size:11px;padding:2px 8px;border-radius:12px;margin-left:4px}
-.container{max-width:1680px;margin:0 auto;padding:24px 32px;width:100%}
+.container{max-width:1920px;margin:0 auto;padding:24px 28px;width:100%}
 .login-screen{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;padding:24px;overflow:auto;
   background:
     radial-gradient(ellipse 80% 60% at 18% 12%,rgba(56,189,168,.22),transparent 55%),
@@ -61,13 +61,15 @@ button:active{transform:scale(.96)}
 .btn-sm{padding:6px 14px;font-size:12px;border-radius:8px}
 .table-wrap{overflow-x:auto;border-radius:10px;border:1px solid #e5e5e5}
 table{width:100%;border-collapse:collapse;font-size:13px}
-.accounts-table{min-width:1480px}
+.accounts-table{min-width:1760px}
 th{background:#f5f5f7;padding:10px 12px;text-align:left;font-weight:500;border-bottom:1px solid #e5e5e5;white-space:nowrap}
 td{padding:10px 12px;border-bottom:1px solid #f0f0f0;vertical-align:middle}
 .accounts-table td{white-space:nowrap}
 .accounts-table td.email-cell{max-width:260px;overflow:hidden;text-overflow:ellipsis}
 .accounts-table td.password-cell,.accounts-table td.health-cell{white-space:normal}
-.accounts-table td.actions-cell{white-space:nowrap}
+.accounts-table td.actions-cell{white-space:nowrap;min-width:300px;position:sticky;right:0;background:#fff;box-shadow:-8px 0 12px rgba(0,0,0,.05);z-index:2}
+.accounts-table th:last-child{position:sticky;right:0;background:#f5f5f7;min-width:300px;box-shadow:-8px 0 12px rgba(0,0,0,.05);z-index:3}
+.accounts-table tr:hover td.actions-cell{background:#fafafa}
 .row-actions{display:inline-flex;gap:6px;align-items:center;flex-wrap:nowrap}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:#fafafa}
@@ -242,6 +244,7 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
 <div class="nav">
   <h1>OreateAI Gateway</h1>
   <a onclick="switchTab('pool')">号池 <span class="badge" id="pool-count">0</span></a>
+  <a onclick="switchTab('outlook')">Out 邮箱 <span class="badge" id="outlook-count">0</span></a>
   <a onclick="switchTab('generate')">生成</a>
   <a onclick="switchTab('tasks')">任务</a>
   <a onclick="switchTab('apikeys')">API Keys</a>
@@ -278,8 +281,11 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
     <div class="col"><label>注册数量</label><input id="reg_count" type="number" min="1" max="50" step="1" value="1"></div>
     <div><button id="reg-start" class="btn-primary" onclick="startRegistrationFromControls()">开始注册</button></div>
     <div><button id="maintenance-start" class="btn-secondary" onclick="maintainPool()">体检并补号</button></div>
+    <div><button class="btn-danger" onclick="purgeZombieAccounts()">清理僵尸号</button></div>
     <div><button class="btn-secondary" onclick="toggleImport()">导入账号</button></div>
+    <div><button class="btn-secondary" onclick="switchTab('outlook')">Out 邮箱管理</button></div>
     <div id="reg-concurrency-hint" class="reg-console-hint">并发：-</div>
+    <div id="outlook-pool-hint" class="reg-console-hint">Outlook 池：-</div>
   </div>
   <div id="registration-result-banner" class="reg-result-banner hidden"></div>
   <div id="maintenance-result-banner" class="reg-result-banner hidden"></div>
@@ -299,6 +305,64 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
         <th>ID</th><th>邮箱</th><th>密码</th><th>状态</th><th>健康</th><th>来源</th><th>OUID</th><th>余额 / 可用</th><th>活动任务预留</th><th>储备目标</th><th>更新时间</th><th>创建时间</th><th>操作</th>
       </tr></thead>
       <tbody id="accounts-tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Tab: Out 邮箱 -->
+<div id="tab-outlook" class="section hidden">
+  <h2>📬 Out 邮箱管理</h2>
+  <p class="reg-console-hint" style="margin:0 0 12px">导入 Outlook/Hotmail 卡密到邮箱池，供注册任务取用。支持 txt 自动识别，也可粘贴。</p>
+  <div class="stats" style="margin-bottom:14px">
+    <div class="stat-card"><div class="num" id="out-st-available">-</div><div class="label">可用</div></div>
+    <div class="stat-card"><div class="num" id="out-st-leased">-</div><div class="label">占用中</div></div>
+    <div class="stat-card"><div class="num" id="out-st-used">-</div><div class="label">已使用</div></div>
+    <div class="stat-card"><div class="num" id="out-st-error">-</div><div class="label">异常</div></div>
+    <div class="stat-card"><div class="num" id="out-st-total">-</div><div class="label">总计</div></div>
+  </div>
+  <div class="row" style="margin-bottom:12px;align-items:center;gap:8px;flex-wrap:wrap">
+    <div id="out-provider-hint" class="reg-console-hint">注册源：-</div>
+    <div><button class="btn-primary" onclick="useOutlookForRegistration()">设为注册邮箱源</button></div>
+    <div><button class="btn-secondary" onclick="loadOutlookMailboxes()">刷新列表</button></div>
+    <div><button class="btn-secondary" onclick="purgeOutlookMailboxes(['used','error'])">清理已用/异常</button></div>
+  </div>
+  <div class="row" style="margin-bottom:12px;align-items:flex-end;gap:8px;flex-wrap:wrap">
+    <div class="col" style="min-width:220px">
+      <label>导入卡密 txt</label>
+      <input id="outlook-import-file" type="file" accept=".txt,text/plain,.csv" onchange="importOutlookMailFile(this)">
+    </div>
+    <div id="outlook-import-filename" class="reg-console-hint"></div>
+    <div id="outlook-import-result" class="reg-console-hint"></div>
+  </div>
+  <details style="margin-bottom:14px">
+    <summary style="cursor:pointer;font-size:13px;color:#6e6e73">粘贴导入（可选）</summary>
+    <div style="margin-top:8px">
+      <textarea id="outlook-import-text" rows="5" style="width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px" placeholder="http://host:8899/get?key=xxx&email=name@outlook.com----password----client_id----refresh_token"></textarea>
+      <div class="row" style="margin-top:8px">
+        <div><button class="btn-primary" onclick="importOutlookMailboxes()">导入粘贴内容</button></div>
+      </div>
+    </div>
+  </details>
+  <div class="row" style="margin-bottom:10px;gap:8px;flex-wrap:wrap;align-items:flex-end">
+    <div class="col"><label>状态</label>
+      <select id="out-filter-status" onchange="loadOutlookMailboxes()">
+        <option value="all">全部</option>
+        <option value="available">可用</option>
+        <option value="leased">占用中</option>
+        <option value="used">已使用</option>
+        <option value="error">异常</option>
+        <option value="disabled">禁用</option>
+      </select>
+    </div>
+    <div class="col" style="flex:2"><label>搜索邮箱</label><input id="out-filter-q" placeholder="邮箱关键词" onkeydown="if(event.key==='Enter')loadOutlookMailboxes()"></div>
+    <div><button class="btn-secondary" onclick="loadOutlookMailboxes()">筛选</button></div>
+  </div>
+  <div class="table-wrap">
+    <table class="accounts-table">
+      <thead><tr>
+        <th>ID</th><th>邮箱</th><th>密码</th><th>状态</th><th>Client ID</th><th>错误</th><th>领取时间</th><th>使用时间</th><th>更新时间</th><th>操作</th>
+      </tr></thead>
+      <tbody id="outlook-tbody"><tr><td colspan="10" style="color:#86868b">加载中…</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -616,13 +680,29 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
     <div class="col"><label>默认图片模型</label><input id="s-img-model" value=""></div>
     <div class="col"><label>默认视频模型</label><input id="s-vid-model" value=""></div>
   </div>
-  <h3 style="margin-top:20px;font-size:14px">📧 YYDS 邮箱配置</h3>
+  <h3 style="margin-top:20px;font-size:14px">📧 注册邮箱配置</h3>
   <div class="row" style="margin-top:8px">
-    <div class="col"><label>API 地址</label><input id="s-mail-url" value="https://maliapi.215.im/v1"></div>
-    <div class="col" style="flex:2"><label>API Key</label><input id="s-mail-key" type="password" autocomplete="off" placeholder="mail api key"></div>
+    <div class="col"><label>邮箱来源</label>
+      <select id="s-mail-provider">
+        <option value="outlook">Outlook（卡密 / msOauth2api）</option>
+        <option value="yyds">YYDS 临时邮箱</option>
+      </select>
+    </div>
+    <div class="col"><label>取件模式</label>
+      <select id="s-mail-mode">
+        <option value="auto">自动（/get → mail-new → Graph 直连）</option>
+        <option value="get">仅 /get 卡密接口</option>
+        <option value="msoauth2">仅 msOauth2api /api/mail-new</option>
+        <option value="graph">仅 Microsoft Graph 直连</option>
+      </select>
+    </div>
   </div>
   <div class="row" style="margin-top:8px">
-    <div class="col" style="flex:3"><label>首选域名（逗号分隔）</label><input id="s-mail-domains" placeholder="domain1.xyz,domain2.xyz"></div>
+    <div class="col"><label>API 地址</label><input id="s-mail-url" value="https://maliapi.215.im/v1"></div>
+    <div class="col" style="flex:2"><label>API Key / Password</label><input id="s-mail-key" type="password" autocomplete="off" placeholder="mail api key"></div>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <div class="col" style="flex:3"><label>YYDS 首选域名（逗号分隔，仅 YYDS 生效）</label><input id="s-mail-domains" placeholder="domain1.xyz,domain2.xyz"></div>
   </div>
   <h3 style="margin-top:20px;font-size:14px">📦 号池配置</h3>
   <div class="row" style="margin-top:8px">
@@ -633,6 +713,15 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
     <div class="col"><label>自动维护间隔（秒，0=关闭）</label><input id="s-maintain-interval" type="number" min="0" step="1" value="300"></div>
     <div class="col"><label>注册并发数（1-8）</label><input id="s-reg-concurrency" type="number" min="1" max="8" step="1" value="3"></div>
     <div class="col"><label>自动补号上限（0-50）</label><input id="s-auto-register-max" type="number" min="0" max="50" step="1" value="5"></div>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <div class="col"><label>维护时自动签到</label>
+      <select id="s-auto-checkin">
+        <option value="true">开启（每日登录一次）</option>
+        <option value="false">关闭</option>
+      </select>
+    </div>
+    <div class="col"><label>签到日界时区</label><input id="s-checkin-timezone" value="Asia/Shanghai" placeholder="Asia/Shanghai"></div>
   </div>
   <div style="margin-top:16px"><button class="btn-primary" onclick="saveSettings()">保存设置</button></div>
   <pre id="settings-raw" style="margin-top:12px"></pre>
@@ -694,8 +783,10 @@ async function copyText(t) {
   textarea.remove();
   if(!copied) throw new Error('浏览器未允许写入剪贴板');
 }
-function authHeaders(){
-  const headers = {'Content-Type':'application/json'};
+function authHeaders(options={}){
+  const headers = {};
+  // Multipart uploads must omit Content-Type so the browser can set the boundary.
+  if(!options.multipart) headers['Content-Type']='application/json';
   if (adminToken) headers.Authorization = 'Bearer ' + adminToken;
   return headers;
 }
@@ -763,7 +854,7 @@ async function restoreBackup(){
   form.append('file', file);
   const r=await fetch(BASE + '/api/admin/restore', {
     method:'POST',
-    headers: adminToken ? {Authorization:'Bearer ' + adminToken} : {},
+    headers: authHeaders({multipart:true}),
     body: form
   });
   const data=await r.json().catch(()=>({}));
@@ -774,9 +865,10 @@ async function restoreBackup(){
   showLogin('恢复完成，请重新登录');
 }
 function switchTab(name) {
-  document.querySelectorAll('#tab-pool,#tab-generate,#tab-tasks,#tab-apikeys,#tab-docs,#tab-settings').forEach(el => {
+  document.querySelectorAll('#tab-pool,#tab-outlook,#tab-generate,#tab-tasks,#tab-apikeys,#tab-docs,#tab-settings').forEach(el => {
     el.classList.toggle('hidden', el.id !== 'tab-'+name);
   });
+  if(name==='outlook') loadOutlookMailboxes();
 }
 
 // Init
@@ -789,6 +881,7 @@ async function init() {
   document.getElementById('status-text').textContent = '加载中...';
   try {
     await Promise.all([loadAccounts(), loadTasks(), loadApiKeys(), loadUsage(), loadUploads(), loadCostReport(), loadAuditLogs(), loadSettings()]);
+    refreshOutlookPoolHint();
     await loadCapabilities();
   } catch (e) {
     document.getElementById('status-text').textContent = '未授权';
@@ -913,10 +1006,11 @@ function listPageSummary(page){
 }
 let state = {
   accounts:[],tasks:[],apikeys:[],clients:[],usage:[],uploads:[],costReport:[],auditLogs:[],
-  accountCredentials:{},revealedAccountPasswords:{},registrationJob:null,maintenanceJob:null,
+  accountCredentials:{},revealedAccountPasswords:{},outlookCredentials:{},revealedOutlookPasswords:{},
+  registrationJob:null,maintenanceJob:null,
   registrationLogPinned:false,maintenanceLogPinned:false,
   capacity:null,
-  settings:{},capabilities:{image:{models:[]},video:{models:[],scenes:[]}},
+  settings:{},outlookMailboxes:[],capabilities:{image:{models:[]},video:{models:[],scenes:[]}},
   lists:{
     tasks:createListPageState(50),
     usage:createListPageState(50),
@@ -1069,6 +1163,7 @@ const ADMIN_LABELS=Object.freeze({
     disabled:'已停用',
     expired:'已过期',
     signup_failed:'注册失败',
+    email_domain_rejected:'邮箱域名被拒',
     confirm_failed:'验证失败',
   }),
   healthStatus:Object.freeze({
@@ -1286,10 +1381,47 @@ function renderAccounts(){
       </td>
       <td style="font-size:11px">${balanceUpdatedAt}</td>
       <td style="font-size:11px">${new Date((a.created_at||0)*1000).toLocaleString()}</td>
-      <td class="actions-cell"><div class="row-actions"><button class="btn-sm btn-secondary" onclick="generateWith(${a.id})">生成</button><button class="btn-sm btn-secondary" onclick="refreshAccountBalance(${a.id})">刷新余额</button></div></td>
+      <td class="actions-cell"><div class="row-actions"><button class="btn-sm btn-secondary" onclick="generateWith(${a.id})">生成</button><button class="btn-sm btn-secondary" onclick="refreshAccountBalance(${a.id})">刷新余额</button>${(a.status==='disabled'||a.status==='invalid'||a.status==='pending_validation')?`<button class="btn-sm btn-primary" onclick="reactivateAccount(${a.id})">重新激活</button>`:''}</div></td>
     </tr>`;
   }).join('');
   document.getElementById('pool-count').textContent = state.accounts.filter(a=>a.health_status==='healthy').length;
+}
+async function reactivateAccount(accountId){
+  const ok=await showConfirm(`重新激活账号 #${accountId}？将重新登录并做一次低成本图片生成验证。`);
+  if(!ok) return;
+  const status=document.getElementById('status-text');
+  try{
+    if(status) status.textContent=`正在重新激活账号 #${accountId}…`;
+    const data=await api('POST',`/api/accounts/${accountId}/reactivate`);
+    await loadAccounts();
+    const st=data?.status || '-';
+    if(status) status.textContent=`账号 #${accountId} 激活结果：${st}`;
+    showToast(data?.ok?`账号 #${accountId} 已重新进入号池`:`账号 #${accountId} 激活未通过（${st}）`, data?.ok?'ok':'warn');
+  }catch(error){
+    if(status) status.textContent='重新激活失败';
+    showToast(`重新激活失败：${error?.message || String(error)}`,'err');
+  }
+}
+async function purgeZombieAccounts(){
+  const ok=await showConfirm(
+    '清理僵尸号？将删除已隔离/失效且无法形成可用登录态（无 ouss / 200001）的账号，已验证账号不会动。',
+    {confirmText:'确认清理',danger:true}
+  );
+  if(!ok) return;
+  const status=document.getElementById('status-text');
+  try{
+    if(status) status.textContent='正在清理僵尸号…';
+    const data=await api('POST','/api/accounts/purge-zombies',{confirm:true});
+    await loadAccounts();
+    const deleted=Number(data?.deleted||0);
+    const skipped=Number(data?.skipped_active||0);
+    const msg=`已清理僵尸号 ${deleted} 个`+(skipped?`，跳过活动任务中 ${skipped} 个`:'');
+    if(status) status.textContent=msg;
+    showToast(msg, deleted?'ok':'warn');
+  }catch(error){
+    if(status) status.textContent='清理僵尸号失败';
+    showToast('清理僵尸号失败：'+(error?.message||String(error)),'err');
+  }
 }
 async function saveReserveTarget(accountId){
   const input=document.getElementById(`reserve-target-${accountId}`);
@@ -1466,6 +1598,211 @@ function renderRegistrationEventLog(events){
   }).join('');
   return `<div id="registration-event-log" class="reg-event-log">${rows}</div>`;
 }
+function outlookStatusLabel(status){
+  return ({available:'可用',leased:'占用中',used:'已使用',error:'异常',disabled:'禁用'})[String(status||'').toLowerCase()] || (status||'-');
+}
+function renderOutlookStats(stats={}, provider='', baseUrl=''){
+  const s=stats||{};
+  const set=(id,val)=>{const el=document.getElementById(id); if(el) el.textContent=String(val??0);};
+  set('out-st-available', s.available||0);
+  set('out-st-leased', s.leased||0);
+  set('out-st-used', s.used||0);
+  set('out-st-error', s.error||0);
+  set('out-st-total', s.total||0);
+  const badge=document.getElementById('outlook-count');
+  if(badge) badge.textContent=String(s.available||0);
+  const hint=document.getElementById('outlook-pool-hint');
+  if(hint){
+    const active=String(provider||'').toLowerCase()==='outlook';
+    hint.textContent=`Outlook 池：可用 ${s.available||0} / 总计 ${s.total||0}`+(active?'（当前注册源）':'');
+  }
+  const providerHint=document.getElementById('out-provider-hint');
+  if(providerHint){
+    const active=String(provider||'').toLowerCase()==='outlook';
+    providerHint.textContent=`注册源：${active?'Outlook':'YYDS / 其他'} · API ${baseUrl||'-'}`;
+  }
+}
+async function refreshOutlookPoolHint(){
+  try{
+    const data=await api('GET','/api/mail/outlook?limit=1');
+    renderOutlookStats(data?.stats||{}, data?.provider || state.settings?.mail?.provider || 'yyds', data?.base_url||'');
+  }catch(error){
+    const el=document.getElementById('outlook-pool-hint');
+    if(el) el.textContent='Outlook 池：加载失败';
+  }
+}
+function renderOutlookTable(){
+  const tbody=document.getElementById('outlook-tbody');
+  if(!tbody) return;
+  if(!state.outlookMailboxes.length){
+    tbody.innerHTML='<tr><td colspan="10" style="color:#86868b">暂无邮箱，请先导入卡密 txt</td></tr>';
+    return;
+  }
+  tbody.innerHTML=state.outlookMailboxes.map(item=>{
+    const st=String(item.status||'');
+    const tag=st==='available'?'tag-green':st==='error'?'tag-red':st==='leased'?'tag-blue':'';
+    const passwordVisible=Boolean(state.revealedOutlookPasswords[item.id]);
+    const credential=state.outlookCredentials[item.id];
+    const passwordText=!item.has_password?'未保存':passwordVisible?(credential?.password||'读取中…'):'••••••••';
+    return `<tr>
+      <td>${item.id}</td>
+      <td>${escapeHtml(item.email||'')}</td>
+      <td class="password-cell">
+        <div class="password-value">${escapeHtml(passwordText)}</div>
+        ${item.has_password?`<div class="password-actions"><button class="copy-btn" onclick="toggleOutlookPassword(${item.id})">${passwordVisible?'隐藏密码':'查看密码'}</button><button class="copy-btn" onclick="copyOutlookPassword(${item.id})">复制密码</button></div>`:''}
+      </td>
+      <td><span class="tag ${tag}">${escapeHtml(outlookStatusLabel(st))}</span></td>
+      <td style="font-size:11px">${escapeHtml((item.client_id||'').slice(0,13))}…</td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;font-size:11px">${escapeHtml(item.last_error||'-')}</td>
+      <td style="font-size:11px">${item.leased_at?new Date(item.leased_at*1000).toLocaleString():'-'}</td>
+      <td style="font-size:11px">${item.used_at?new Date(item.used_at*1000).toLocaleString():'-'}</td>
+      <td style="font-size:11px">${item.updated_at?new Date(item.updated_at*1000).toLocaleString():'-'}</td>
+      <td>
+        <button class="btn-secondary btn-sm" onclick="releaseOutlookMailbox(${item.id})">释放</button>
+        <button class="btn-secondary btn-sm" onclick="deleteOutlookMailbox(${item.id})">删除</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+async function loadOutlookMailboxes(){
+  const tbody=document.getElementById('outlook-tbody');
+  const status=document.getElementById('out-filter-status')?.value || 'all';
+  const q=document.getElementById('out-filter-q')?.value || '';
+  const params=new URLSearchParams({limit:'500'});
+  if(status && status!=='all') params.set('status', status);
+  if(String(q).trim()) params.set('q', String(q).trim());
+  try{
+    const data=await api('GET',`/api/mail/outlook?${params.toString()}`);
+    state.outlookMailboxes=data.items||[];
+    renderOutlookStats(data.stats||{}, data.provider||'', data.base_url||'');
+    renderOutlookTable();
+  }catch(error){
+    if(tbody) tbody.innerHTML=`<tr><td colspan="10" style="color:#c62828">${escapeHtml(error?.message||String(error))}</td></tr>`;
+  }
+}
+async function loadOutlookCredentials(mailboxId){
+  if(state.outlookCredentials[mailboxId]) return state.outlookCredentials[mailboxId];
+  const credentials=await api('GET',`/api/mail/outlook/${mailboxId}/credentials`);
+  state.outlookCredentials[mailboxId]=credentials;
+  return credentials;
+}
+async function toggleOutlookPassword(mailboxId){
+  try{
+    if(!state.outlookCredentials[mailboxId]) await loadOutlookCredentials(mailboxId);
+    state.revealedOutlookPasswords[mailboxId]=!state.revealedOutlookPasswords[mailboxId];
+    renderOutlookTable();
+  }catch(error){
+    showToast(`读取密码失败：${error?.message || String(error)}`,'err');
+  }
+}
+async function copyOutlookPassword(mailboxId){
+  try{
+    const credentials=await loadOutlookCredentials(mailboxId);
+    await copyText(credentials.password || '');
+  }catch(error){
+    showToast(`复制密码失败：${error?.message || String(error)}`,'err');
+  }
+}
+function showOutlookImportResult(data, filename=''){
+  const resultEl=document.getElementById('outlook-import-result');
+  const nameEl=document.getElementById('outlook-import-filename');
+  const errors=Array.isArray(data?.parse_errors)?data.parse_errors.length:0;
+  const msg=`导入完成${filename?`（${filename}）`:''}：新增 ${data.inserted||0}，更新 ${data.updated||0}，可用 ${data.stats?.available||0}`+(errors?`，未识别 ${errors} 行`:'');
+  if(resultEl) resultEl.textContent=msg;
+  if(nameEl && filename) nameEl.textContent=`已选：${filename}`;
+  showToast(msg,'ok');
+}
+async function importOutlookMailboxes(){
+  const text=document.getElementById('outlook-import-text').value||'';
+  const resultEl=document.getElementById('outlook-import-result');
+  if(!text.trim()){
+    showToast('请先粘贴 Outlook 卡密，或直接选择 txt 文件','err');
+    return;
+  }
+  try{
+    const data=await api('POST','/api/mail/outlook/import',{text, apply_detected_endpoint:true});
+    showOutlookImportResult(data);
+    try{await loadSettings();}catch(_){ }
+    await loadOutlookMailboxes();
+  }catch(error){
+    const msg=error?.message || String(error);
+    if(resultEl) resultEl.textContent=msg;
+    showToast('导入失败：'+msg,'err');
+  }
+}
+async function importOutlookMailFile(input){
+  const file=input?.files?.[0];
+  const resultEl=document.getElementById('outlook-import-result');
+  if(!file) return;
+  const nameEl=document.getElementById('outlook-import-filename');
+  if(nameEl) nameEl.textContent=`正在识别：${file.name}`;
+  try{
+    const form=new FormData();
+    form.append('file', file);
+    form.append('apply_detected_endpoint', 'true');
+    const response=await fetch(BASE+'/api/mail/outlook/import-file',{
+      method:'POST',
+      headers:authHeaders({multipart:true}),
+      body:form,
+    });
+    const data=await response.json().catch(()=>({}));
+    if(response.status===401) throw new Error(formatApiError(data,'登录已失效'));
+    if(!response.ok) throw new Error(formatApiError(data,'导入失败'));
+    showOutlookImportResult(data, file.name);
+    try{await loadSettings();}catch(_){ }
+    await loadOutlookMailboxes();
+  }catch(error){
+    const msg=error?.message || String(error);
+    if(resultEl) resultEl.textContent=msg;
+    showToast('导入失败：'+msg,'err');
+  }finally{
+    if(input) input.value='';
+  }
+}
+async function releaseOutlookMailbox(id){
+  const ok=await showConfirm(`确定释放邮箱 #${id} 回可用池？`);
+  if(!ok) return;
+  try{
+    await api('POST',`/api/mail/outlook/${id}/release`);
+    showToast('已释放','ok');
+    await loadOutlookMailboxes();
+  }catch(error){
+    showToast('释放失败：'+(error?.message||String(error)),'err');
+  }
+}
+async function deleteOutlookMailbox(id){
+  const ok=await showConfirm(`确定删除邮箱 #${id}？此操作不可恢复。`);
+  if(!ok) return;
+  try{
+    await api('DELETE',`/api/mail/outlook/${id}`);
+    showToast('已删除','ok');
+    await loadOutlookMailboxes();
+  }catch(error){
+    showToast('删除失败：'+(error?.message||String(error)),'err');
+  }
+}
+async function purgeOutlookMailboxes(statuses){
+  const label=(statuses||[]).join('/');
+  const ok=await showConfirm(`确定清理状态为 ${label} 的 Out 邮箱？`);
+  if(!ok) return;
+  try{
+    const data=await api('POST','/api/mail/outlook/purge',{statuses:statuses||['used','error']});
+    showToast(`已清理 ${data.deleted||0} 个`,'ok');
+    await loadOutlookMailboxes();
+  }catch(error){
+    showToast('清理失败：'+(error?.message||String(error)),'err');
+  }
+}
+async function useOutlookForRegistration(){
+  try{
+    const data=await api('POST','/api/mail/outlook/use-for-registration');
+    showToast('已切换注册源为 Outlook','ok');
+    try{await loadSettings();}catch(_){ }
+    renderOutlookStats(data.stats||{}, data.provider||'outlook', data.base_url||'');
+  }catch(error){
+    showToast('切换失败：'+(error?.message||String(error)),'err');
+  }
+}
 function updateRegistrationConcurrencyHint(){
   const hint=document.getElementById('reg-concurrency-hint');
   if(!hint) return;
@@ -1594,6 +1931,7 @@ function maintenanceStepLabel(step){
     queued:'等待开始',
     scanning:'正在扫描号池',
     checking_account:'正在检测账号健康状态',
+    daily_checkin:'正在登录签到领取每日余额',
     checking_generation:'正在验证真实生成能力',
     refreshing_session:'正在刷新账号登录状态',
     gateway_risk:'生成环境异常，已停止检测',
@@ -1622,12 +1960,14 @@ function maintenanceItemLabel(item){
     gateway_risk:'生成环境异常',
     invalid:'失效账号',
     check_failed:'检测异常',
+    daily_checkin:'每日签到',
   })[item?.category] || item?.category || '账号';
   const action=({
     isolated:'已隔离',
     detected:'已发现',
     cooling:'已进入冷却',
     aborted:'已停止检测',
+    checked_in:'已签到',
   })[item?.action] || item?.action || '已处理';
   return `${item?.email||`账号 #${item?.account_id||'-'}`} · ${category} · ${action}`;
 }
@@ -1653,7 +1993,7 @@ function renderMaintenanceProgress(job,connectionMessage=''){
     <div class="registration-meta">
       当前步骤：${escapeHtml(maintenanceStepLabel(job.current_step))}
       ${job.current_email?` · 当前账号：${escapeHtml(job.current_email)}`:''}
-      <br>检测前健康 ${Number(job.healthy_before)||0} 个 · 风控 ${Number(job.risk_found)||0} 个 · 失效 ${Number(job.invalid_found)||0} 个 · 已隔离 ${Number(job.isolated_accounts)||0} 个
+      <br>检测前健康 ${Number(job.healthy_before)||0} 个 · 签到 ${Number(job.checked_in)||0} 个 · 风控 ${Number(job.risk_found)||0} 个 · 失效 ${Number(job.invalid_found)||0} 个 · 已隔离 ${Number(job.isolated_accounts)||0} 个
       <br>计划补号 ${Number(job.registration_target)||0} 个 · 成功 ${Number(job.registered)||0} 个 · 失败 ${Number(job.registration_failed)||0} 个 · 当前健康 ${Number(job.healthy_after)||0} 个
       ${connectionMessage?`<br>${escapeHtml(connectionMessage)}`:''}
       ${job.error_message?`<br><span style="color:#c62828">${escapeHtml(job.error_message)}</span>`:''}
@@ -1732,6 +2072,7 @@ async function maintainPool(){
 }
 function toggleImport(){document.getElementById('import-area').classList.toggle('hidden');}
 async function doImport(){const r=await api('POST','/api/accounts/import',{email:document.getElementById('imp-email').value,password:document.getElementById('imp-pwd').value});await loadAccounts();showToast(r.ok?'导入成功':'导入失败', r.ok?'ok':'err');}
+
 function generateWith(aid){switchTab('generate');document.getElementById('g-account').value=aid;}
 async function refreshAccountBalance(aid){await api('POST',`/api/accounts/${aid}/refresh-balance`);await loadAccounts();}
 
@@ -2553,6 +2894,8 @@ async function loadSettings(){
   document.getElementById('s-maintain-interval').value=s.pool?.maintain_check_interval??300;
   document.getElementById('s-reg-concurrency').value=s.pool?.registration_concurrency??3;
   document.getElementById('s-auto-register-max').value=s.pool?.auto_maintain_max_register??5;
+  document.getElementById('s-auto-checkin').value=s.pool?.auto_checkin_enabled===false?'false':'true';
+  document.getElementById('s-checkin-timezone').value=s.pool?.checkin_timezone||'Asia/Shanghai';
   updateRegistrationConcurrencyHint();
   try{
     const savedCount=Number(localStorage.getItem('oreate_reg_count'));
@@ -2560,12 +2903,15 @@ async function loadSettings(){
       document.getElementById('reg_count').value=savedCount;
     }
   }catch(_){ }
+  document.getElementById('s-mail-provider').value=(s.mail?.provider||'yyds').toLowerCase()==='yyds'?'yyds':'outlook';
+  document.getElementById('s-mail-mode').value=s.mail?.api_mode||'auto';
   document.getElementById('s-mail-url').value=s.mail?.base_url||'';
   document.getElementById('s-mail-key').value='';
-  document.getElementById('s-mail-key').placeholder=s.mail?.api_key==='__redacted__'?'留空不修改':'mail api key';
+  document.getElementById('s-mail-key').placeholder=s.mail?.api_key==='__redacted__'?'留空不修改':'mail api key / password';
   document.getElementById('s-mail-domains').value=(s.mail?.preferred_domains||[]).join(',');
   document.getElementById('cred-user').value=s.server?.admin_username||'';
   document.getElementById('settings-raw').textContent=JSON.stringify(s,null,2);
+  refreshOutlookPoolHint();
 }
 function requiredIntegerValue(id,label,min,max=null){
   const raw=document.getElementById(id).value.trim();
@@ -2584,6 +2930,8 @@ async function saveSettings(){
     const maintainInterval=requiredIntegerValue('s-maintain-interval','自动维护间隔',0);
     const registrationConcurrency=requiredIntegerValue('s-reg-concurrency','注册并发数',1,8);
     const autoMaintainMaxRegister=requiredIntegerValue('s-auto-register-max','自动补号上限',0,50);
+    const autoCheckinEnabled=document.getElementById('s-auto-checkin').value==='true';
+    const checkinTimezone=document.getElementById('s-checkin-timezone').value.trim()||'Asia/Shanghai';
     if(maintainTarget < minAccounts) throw new Error('维护目标数不能小于最低账号数');
     const doms=document.getElementById('s-mail-domains').value.split(',').map(s=>s.trim()).filter(Boolean);
     const body={
@@ -2594,6 +2942,8 @@ async function saveSettings(){
         default_video_model:document.getElementById('s-vid-model').value,
       },
       mail:{
+        provider:document.getElementById('s-mail-provider').value,
+        api_mode:document.getElementById('s-mail-mode').value,
         base_url:document.getElementById('s-mail-url').value,
         preferred_domains:doms,
       },
@@ -2603,6 +2953,8 @@ async function saveSettings(){
         maintain_check_interval:maintainInterval,
         registration_concurrency:registrationConcurrency,
         auto_maintain_max_register:autoMaintainMaxRegister,
+        auto_checkin_enabled:autoCheckinEnabled,
+        checkin_timezone:checkinTimezone,
       },
     };
     const mailKey=document.getElementById('s-mail-key').value.trim();

@@ -51,6 +51,11 @@ def A0(data_dict, salt="31$"):
     return salt + x0(u1(payload))
 
 
+def is_coded_jt_token(jt) -> bool:
+    """Current Oreate signup/login accepts helper tokens with the CODED wrapper."""
+    return isinstance(jt, str) and jt.startswith("31$CODED--")
+
+
 def generate_banti_artifacts_from_helper(timeout_sec=10):
     helper = Path(__file__).resolve().parent / "banti_jt_helper.js"
     if not helper.exists():
