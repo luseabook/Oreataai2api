@@ -90,6 +90,25 @@ tr:hover td{background:#fafafa}
 .pool-capacity-panel{border:1px solid #e5e5e5;background:#fafafa;border-radius:12px;padding:14px;margin-bottom:16px}
 .pool-capacity-panel .stats{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
 .pool-capacity-note{font-size:12px;color:#6e6e73;line-height:1.65;margin-top:10px}
+.avail-filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 14px}
+.avail-chip{border:1px solid #d2d2d7;background:#fff;border-radius:999px;padding:6px 12px;font-size:12px;cursor:pointer}
+.avail-chip.active{background:#1d1d1f;border-color:#1d1d1f;color:#fff}
+.avail-group{border:1px solid #e5e5e5;border-radius:12px;margin-bottom:10px;overflow:hidden;background:#fff}
+.avail-group-head{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px 14px;cursor:pointer}
+.avail-group-head:hover{background:#fafafa}
+.avail-group-title{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-weight:600}
+.avail-tag{font-size:11px;color:#6e6e73;border:1px solid #e5e5e5;border-radius:999px;padding:2px 8px;font-weight:500}
+.avail-meta{font-size:12px;color:#6e6e73}
+.avail-combos{display:none;border-top:1px solid #eee}
+.avail-group.open .avail-combos{display:block}
+.avail-row{display:grid;grid-template-columns:1.1fr 1.3fr .6fr .7fr .7fr .7fr;gap:8px;padding:10px 14px;border-top:1px solid #f2f2f2;font-size:12px;align-items:center}
+.avail-row:first-child{border-top:0}
+.avail-pill{display:inline-flex;min-width:52px;justify-content:center;padding:2px 8px;border-radius:999px;font-weight:600}
+.avail-pill.available{background:#e8f7ee;color:#0f7a45}
+.avail-pill.tight{background:#fff6dd;color:#9a6700}
+.avail-pill.unavailable{background:#eef0f3;color:#6b7280}
+.avail-note{font-size:12px;color:#6e6e73;margin-top:10px;line-height:1.6}
+@media (max-width:900px){.avail-row{grid-template-columns:1fr 1fr;}}
 .reserve-target-editor{display:flex;align-items:center;gap:6px;min-width:150px}
 .reserve-target-editor input{width:86px;padding:6px 8px;font-size:12px}
 .point-value{font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -247,6 +266,7 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
 <div class="nav">
   <h1>OreateAI Gateway</h1>
   <a onclick="switchTab('pool')">号池 <span class="badge" id="pool-count">0</span></a>
+  <a onclick="switchTab('models')">可用模型</a>
   <a onclick="switchTab('outlook')">Out 邮箱 <span class="badge" id="outlook-count">0</span></a>
   <a onclick="switchTab('generate')">生成</a>
   <a onclick="switchTab('tasks')">任务</a>
@@ -310,6 +330,32 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
       <tbody id="accounts-tbody"></tbody>
     </table>
   </div>
+</div>
+
+<!-- Tab: 可用模型 -->
+<div id="tab-models" class="section hidden">
+  <h2>可用模型</h2>
+  <p class="reg-console-hint" style="margin:0 0 12px">按上游价目展开组合，并用号池单账号可花积分判断能否接单。用户公开页：<a href="/models" target="_blank" rel="noopener">/models</a></p>
+  <div class="pool-capacity-panel">
+    <div class="stats">
+      <div class="stat-card"><div class="num" id="avail-known">-</div><div class="label">已知余额账号</div></div>
+      <div class="stat-card"><div class="num" id="avail-max">-</div><div class="label">单号最高可用</div></div>
+      <div class="stat-card"><div class="num" id="avail-reserved">-</div><div class="label">活动预留</div></div>
+      <div class="stat-card"><div class="num" id="avail-combo-count">-</div><div class="label">展示组合数</div></div>
+    </div>
+  </div>
+  <div class="avail-filters">
+    <button class="avail-chip active" data-avail-kind="all" onclick="setAvailKind('all')">全部</button>
+    <button class="avail-chip" data-avail-kind="image" onclick="setAvailKind('image')">图片</button>
+    <button class="avail-chip" data-avail-kind="video" onclick="setAvailKind('video')">视频</button>
+    <select id="avail-scene" class="avail-chip" onchange="renderModelAvailability()"></select>
+    <button class="avail-chip" id="avail-only-ok" onclick="toggleAvailOnlyOk()">仅可用</button>
+    <button class="avail-chip" id="avail-show-exp" onclick="toggleAvailShowExp()">显示未验证</button>
+    <button class="avail-chip" id="avail-include-disabled" onclick="toggleAvailIncludeDisabled()">含已关闭策略</button>
+    <button class="btn-secondary btn-sm" onclick="loadModelAvailability()">刷新</button>
+  </div>
+  <div id="avail-catalog"><div class="reg-console-hint">加载中…</div></div>
+  <p class="avail-note">可用性以单账号能否接单为准（不是总积分÷单价）。公开展示页不暴露账号数与容量数字。</p>
 </div>
 
 <!-- Tab: Out 邮箱 -->
@@ -660,6 +706,8 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
         <li><code>GET /v1/models</code>：模型列表</li>
         <li><code>GET /v1/models/{model}</code>：查询单个可用模型</li>
         <li><code>GET /v1/capabilities</code>：模型、比例、分辨率、时长与场景能力</li>
+        <li><code>GET /models</code>：公开可用模型展示页（不含账号信息）</li>
+        <li><code>GET /api/public/model-availability</code>：公开模型价目与可用性 JSON</li>
         <li><code>POST /v1/images/generations</code>：OpenAI 风格图片接口</li>
         <li><code>POST /v1/images/edits</code>：OpenAI multipart 图片编辑接口</li>
         <li><code>POST /v1/videos</code> / <code>/v1/videos/generations</code>：视频接口</li>
@@ -873,10 +921,11 @@ async function restoreBackup(){
   showLogin('恢复完成，请重新登录');
 }
 function switchTab(name) {
-  document.querySelectorAll('#tab-pool,#tab-outlook,#tab-generate,#tab-tasks,#tab-apikeys,#tab-docs,#tab-settings').forEach(el => {
+  document.querySelectorAll('#tab-pool,#tab-models,#tab-outlook,#tab-generate,#tab-tasks,#tab-apikeys,#tab-docs,#tab-settings').forEach(el => {
     el.classList.toggle('hidden', el.id !== 'tab-'+name);
   });
   if(name==='outlook') loadOutlookMailboxes();
+  if(name==='models') loadModelAvailability();
 }
 
 // Init
@@ -2107,6 +2156,121 @@ async function doImport(){const r=await api('POST','/api/accounts/import',{email
 
 function generateWith(aid){switchTab('generate');document.getElementById('g-account').value=aid;}
 async function refreshAccountBalance(aid){await api('POST',`/api/accounts/${aid}/refresh-balance`);await loadAccounts();}
+
+// === Available models ===
+const availState={kind:'all', onlyOk:true, showExp:false, includeDisabled:false, payload:null};
+const AVAIL_STATUS={available:'可用', tight:'紧张', unavailable:'不足'};
+function setAvailKind(kind){
+  availState.kind=kind;
+  document.querySelectorAll('[data-avail-kind]').forEach(el=>el.classList.toggle('active', el.dataset.availKind===kind));
+  renderModelAvailability();
+}
+function toggleAvailOnlyOk(){
+  availState.onlyOk=!availState.onlyOk;
+  document.getElementById('avail-only-ok').classList.toggle('active', availState.onlyOk);
+  renderModelAvailability();
+}
+function toggleAvailShowExp(){
+  availState.showExp=!availState.showExp;
+  document.getElementById('avail-show-exp').classList.toggle('active', availState.showExp);
+  renderModelAvailability();
+}
+function toggleAvailIncludeDisabled(){
+  availState.includeDisabled=!availState.includeDisabled;
+  document.getElementById('avail-include-disabled').classList.toggle('active', availState.includeDisabled);
+  loadModelAvailability();
+}
+function availParams(item){
+  const parts=[];
+  if(item.resolution) parts.push(String(item.resolution));
+  if(item.duration!=null) parts.push(item.duration+'s');
+  if(item.is_audio===true) parts.push('音频');
+  if(item.is_audio===false) parts.push('无音频');
+  return parts.join(' · ') || '-';
+}
+function filteredAvailItems(){
+  const scene=document.getElementById('avail-scene')?.value||'';
+  return (availState.payload?.items||[]).filter(item=>{
+    if(availState.kind!=='all' && item.kind!==availState.kind) return false;
+    if(availState.onlyOk && item.status==='unavailable') return false;
+    if(!availState.showExp && item.verification_status==='unverified') return false;
+    if(scene && item.kind==='video' && item.scene_id!==scene) return false;
+    return true;
+  });
+}
+function fillAvailScenes(){
+  const select=document.getElementById('avail-scene');
+  if(!select) return;
+  const scenes=new Map();
+  for(const item of (availState.payload?.items||[])){
+    if(item.kind==='video' && item.scene_id) scenes.set(item.scene_id, item.scene_name||item.scene_id);
+  }
+  const current=select.value;
+  select.innerHTML='<option value="">全部场景</option>'+[...scenes.entries()].map(([id,name])=>`<option value="${id}">${name}</option>`).join('');
+  if([...scenes.keys()].includes(current)) select.value=current;
+}
+function renderModelAvailability(){
+  const host=document.getElementById('avail-catalog');
+  if(!host) return;
+  const setText=(id,value)=>{const el=document.getElementById(id); if(el) el.textContent=value;};
+  const pool=availState.payload?.pool||{};
+  setText('avail-known', `${Number(pool.known_balance_accounts||0)}/${Number(pool.account_count||0)}`);
+  setText('avail-max', Number(pool.max_available_points||0).toLocaleString());
+  setText('avail-reserved', Number(pool.reserved_points||0).toLocaleString());
+  const items=filteredAvailItems();
+  setText('avail-combo-count', String(items.length));
+  if(!availState.payload){host.innerHTML='<div class="reg-console-hint">加载中…</div>';return;}
+  if(!items.length){host.innerHTML='<div class="reg-console-hint">当前筛选下没有组合</div>';return;}
+  const groups=new Map();
+  for(const item of items){
+    const key=item.kind+'::'+item.model_name;
+    if(!groups.has(key)) groups.set(key,{kind:item.kind,model_name:item.model_name,experimental:!!item.experimental,verification_status:item.verification_status,combos:[]});
+    const g=groups.get(key);
+    g.combos.push(item);
+    if(item.experimental) g.experimental=true;
+  }
+  host.innerHTML=[...groups.values()].map((group,index)=>{
+    const ok=group.combos.filter(c=>c.status==='available'||c.status==='tight').length;
+    const tags=[
+      `<span class="avail-tag">${group.kind==='image'?'图片':'视频'}</span>`,
+      group.verification_status==='live_verified'?'<span class="avail-tag">在线验证</span>':'',
+      group.experimental?'<span class="avail-tag">实验性</span>':'',
+    ].filter(Boolean).join('');
+    const rows=group.combos.map(item=>`<div class="avail-row">
+      <div>${item.kind==='video'?(item.scene_name||item.scene_id||'-'):'图片'}</div>
+      <div>${availParams(item)}</div>
+      <div>${item.point_cost}</div>
+      <div>${item.ready_accounts}</div>
+      <div>${item.task_capacity}</div>
+      <div><span class="avail-pill ${item.status}">${AVAIL_STATUS[item.status]||item.status}</span></div>
+    </div>`).join('');
+    return `<section class="avail-group ${index===0?'open':''}">
+      <div class="avail-group-head" onclick="this.parentElement.classList.toggle('open')">
+        <div class="avail-group-title"><span>${group.model_name}</span>${tags}</div>
+        <div class="avail-meta">可用 ${ok} / 共 ${group.combos.length} 组合</div>
+      </div>
+      <div class="avail-combos">
+        <div class="avail-row" style="font-weight:600;color:#6e6e73"><div>场景</div><div>参数</div><div>单价</div><div>可接账号</div><div>容量</div><div>状态</div></div>
+        ${rows}
+      </div>
+    </section>`;
+  }).join('');
+}
+async function loadModelAvailability(){
+  const host=document.getElementById('avail-catalog');
+  if(host) host.innerHTML='<div class="reg-console-hint">加载中…</div>';
+  document.getElementById('avail-only-ok')?.classList.toggle('active', availState.onlyOk);
+  document.getElementById('avail-show-exp')?.classList.toggle('active', availState.showExp);
+  document.getElementById('avail-include-disabled')?.classList.toggle('active', availState.includeDisabled);
+  try{
+    const q=availState.includeDisabled?'?include_disabled=true':'';
+    availState.payload=await api('GET','/api/pool/model-availability'+q);
+    fillAvailScenes();
+    renderModelAvailability();
+  }catch(e){
+    if(host) host.innerHTML=`<div class="reg-console-hint">加载失败：${e.message||e}</div>`;
+  }
+}
 
 // === Generate ===
 async function loadCapabilities(){

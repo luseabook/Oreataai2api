@@ -540,6 +540,39 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertTrue(scenes["motion"]["experimental"])
         self.assertFalse(scenes["motion"]["enabled"])
 
+    def test_model_availability_admin_and_public_endpoints(self):
+        self.seed_account_with_capabilities()
+        admin = self.client.get(
+            "/api/pool/model-availability",
+            headers=self.admin_headers(),
+        )
+        self.assertEqual(admin.status_code, 200)
+        admin_payload = admin.json()
+        self.assertTrue(admin_payload.get("ok"))
+        self.assertIn("pool", admin_payload)
+        self.assertIn("known_balance_accounts", admin_payload["pool"])
+        self.assertTrue(admin_payload.get("items"))
+        self.assertIn("ready_accounts", admin_payload["items"][0])
+
+        public = self.client.get("/api/public/model-availability")
+        self.assertEqual(public.status_code, 200)
+        public_payload = public.json()
+        self.assertNotIn("pool", public_payload)
+        self.assertTrue(public_payload.get("items"))
+        for item in public_payload["items"]:
+            self.assertNotIn("ready_accounts", item)
+            self.assertNotIn("task_capacity", item)
+            self.assertIn(item["status"], {"available", "tight", "unavailable"})
+
+        page = self.client.get("/models")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("可用模型", page.text)
+        self.assertNotIn("OreateAI", page.text)
+        self.assertNotIn("可接账号", page.text)
+
+        denied = self.client.get("/api/pool/model-availability")
+        self.assertEqual(denied.status_code, 401)
+
     def test_generate_rejects_experimental_scene_before_upstream_call(self):
         self.seed_account_with_capabilities()
         self.seed_api_key("scene-key")

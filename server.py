@@ -59,6 +59,14 @@ from gateway.runtime import (
 )
 from gateway.watermark import WatermarkImageError, watermark_free_image_bytes
 from gateway.admin_html import ADMIN_HTML
+from gateway.model_availability import (
+    attach_spendable_availability,
+    expand_capability_cost_rows,
+    group_items_by_model,
+    public_availability_items,
+    sort_availability_items,
+)
+from gateway.models_public_html import MODELS_PUBLIC_HTML
 from gateway.mail_identity import (
     MAIL_DOMAIN_STATS,
     MAIL_DOMAIN_STATS_LOCK,
@@ -3332,6 +3340,48 @@ def build_pool_capacity_snapshot() -> Dict[str, Any]:
         "daily_point_gain_total": len(rows) * daily_gain,
         "tiers": tiers,
     }
+
+
+def build_model_availability_catalog(
+    *,
+    include_disabled: bool = False,
+    public: bool = False,
+) -> Dict[str, Any]:
+    """Expand model cost combos and score them against current pool spendable points."""
+    try:
+        capabilities = load_capabilities_from_pool()
+    except HTTPException:
+        capabilities = {"image": {"models": []}, "video": {"models": [], "scenes": []}}
+    base_rows = expand_capability_cost_rows(capabilities, include_disabled=include_disabled)
+    pool_rows = pool_capacity_rows()
+    known_rows = [row for row in pool_rows if account_balance_value(row) is not None]
+    unique_costs = sorted({int(item["point_cost"]) for item in base_rows if item.get("point_cost") is not None})
+    spendable_for_cost: Dict[int, List[int]] = {}
+    for cost in unique_costs:
+        spendable_for_cost[cost] = [
+            max(0, int_or_default(account_spendable_points(row, cost), 0)) for row in known_rows
+        ]
+    items = sort_availability_items(attach_spendable_availability(base_rows, spendable_for_cost))
+    available_values = [max(0, int_or_default(account_available_points(row), 0)) for row in known_rows]
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "updated_at": time.time(),
+        "items": items,
+        "groups": group_items_by_model(items),
+    }
+    if public:
+        public_items = public_availability_items(items)
+        payload["items"] = public_items
+        payload["groups"] = group_items_by_model(public_items)
+        return payload
+    payload["pool"] = {
+        "account_count": len(pool_rows),
+        "known_balance_accounts": len(known_rows),
+        "reserved_points": sum(account_active_reserved_points(row) for row in known_rows),
+        "available_points": sum(available_values),
+        "max_available_points": max(available_values, default=0),
+    }
+    return payload
 
 
 TASK_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "expired"}
@@ -10337,6 +10387,20 @@ def pool_capacity(_=Depends(require_admin)):
     return build_pool_capacity_snapshot()
 
 
+@app.get("/api/pool/model-availability")
+def pool_model_availability(
+    include_disabled: bool = False,
+    _=Depends(require_admin),
+):
+    return build_model_availability_catalog(include_disabled=bool(include_disabled), public=False)
+
+
+@app.get("/api/public/model-availability")
+def public_model_availability(include_disabled: bool = False):
+    """User-facing catalog: costs + abstract availability, no account/pool counts."""
+    return build_model_availability_catalog(include_disabled=bool(include_disabled), public=True)
+
+
 @app.put("/api/accounts/{account_id}/reserve-target")
 def update_account_reserve_target(
     account_id: int,
@@ -10928,26 +10992,32 @@ async def ws_endpoint(ws: WebSocket):
 
 
 
+def _html_security_headers() -> Dict[str, str]:
+    return {
+        "Content-Security-Policy": (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: https://cdn.oreateai.com; "
+            "media-src 'self' https://cdn.oreateai.com; "
+            "connect-src 'self' ws: wss:; "
+            "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+        ),
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    }
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
-    return HTMLResponse(
-        ADMIN_HTML,
-        headers={
-            "Content-Security-Policy": (
-                "default-src 'self'; "
-                "script-src 'self' 'unsafe-inline'; "
-                "style-src 'self' 'unsafe-inline'; "
-                "img-src 'self' data: https://cdn.oreateai.com; "
-                "media-src 'self' https://cdn.oreateai.com; "
-                "connect-src 'self' ws: wss:; "
-                "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
-            ),
-            "X-Content-Type-Options": "nosniff",
-            "X-Frame-Options": "DENY",
-            "Referrer-Policy": "no-referrer",
-            "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
-        },
-    )
+    return HTMLResponse(ADMIN_HTML, headers=_html_security_headers())
+
+
+@app.get("/models", response_class=HTMLResponse)
+def models_public_page():
+    return HTMLResponse(MODELS_PUBLIC_HTML, headers=_html_security_headers())
 
 
 if __name__ == "__main__":
