@@ -831,6 +831,25 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertEqual(self.config_path.read_bytes(), original_bytes)
         self.assertEqual(list(self.config_path.parent.glob(f".{self.config_path.name}.*.tmp")), [])
 
+    def test_save_config_writes_through_symlink_without_replacing_link(self):
+        temp_root = Path(self.tmp.name)
+        real_path = temp_root / "state-config.json"
+        link_path = temp_root / "linked-config.json"
+        real_path.write_text(json.dumps(server.CFG, ensure_ascii=False, indent=2), encoding="utf-8")
+        if link_path.exists() or link_path.is_symlink():
+            link_path.unlink()
+        try:
+            link_path.symlink_to(real_path)
+        except OSError as exc:
+            self.skipTest(f"symlinks unavailable: {exc}")
+        with patch.object(server, "CONFIG_PATH", link_path):
+            candidate = server.deep_merge(server.CFG, {"server": {"port": 18991}})
+            server.save_config(candidate)
+        self.assertTrue(link_path.is_symlink())
+        self.assertEqual(link_path.resolve(), real_path.resolve())
+        saved = json.loads(real_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["server"]["port"], 18991)
+
     def test_admin_html_validates_numeric_settings_and_formats_api_errors(self):
         html = server.ADMIN_HTML
 

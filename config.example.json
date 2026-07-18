@@ -90,7 +90,33 @@
     "sync_wait_seconds": 0,
     "sync_wait_max_seconds": 120,
     "worker_shutdown_timeout_seconds": 30,
-    "running_task_stale_seconds": 300
+    "running_task_stale_seconds": 300,
+    "scene_policies": {
+      "text_or_image": {
+        "enabled": true,
+        "experimental": false,
+        "verification_status": "live_verified",
+        "risk_level": "low"
+      },
+      "reference": {
+        "enabled": false,
+        "experimental": true,
+        "verification_status": "unverified",
+        "risk_level": "high"
+      },
+      "frame_based": {
+        "enabled": true,
+        "experimental": true,
+        "verification_status": "live_verified",
+        "risk_level": "high"
+      },
+      "motion": {
+        "enabled": false,
+        "experimental": true,
+        "verification_status": "unverified",
+        "risk_level": "high"
+      }
+    }
   },
   "openai_compat": {
     "image_sync_timeout_seconds": 120,

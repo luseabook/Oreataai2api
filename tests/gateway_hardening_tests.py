@@ -534,8 +534,11 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertFalse(scenes["reference"]["enabled"])
         self.assertTrue(scenes["reference"]["experimental"])
         self.assertEqual(scenes["reference"]["verification_status"], "unverified")
-        self.assertFalse(scenes["frame_based"]["enabled"])
+        self.assertTrue(scenes["frame_based"]["enabled"])
+        self.assertTrue(scenes["frame_based"]["experimental"])
+        self.assertEqual(scenes["frame_based"]["verification_status"], "live_verified")
         self.assertTrue(scenes["motion"]["experimental"])
+        self.assertFalse(scenes["motion"]["enabled"])
 
     def test_generate_rejects_experimental_scene_before_upstream_call(self):
         self.seed_account_with_capabilities()

@@ -251,9 +251,9 @@ DEFAULT_CONFIG = {
                 "risk_level": "high",
             },
             "frame_based": {
-                "enabled": False,
+                "enabled": True,
                 "experimental": True,
-                "verification_status": "unverified",
+                "verification_status": "live_verified",
                 "risk_level": "high",
             },
             "motion": {
@@ -295,14 +295,26 @@ def load_config() -> Dict[str, Any]:
     return json.loads(json.dumps(DEFAULT_CONFIG))
 
 
+def config_persist_path() -> Path:
+    """Resolve the real config file path so symlink deployments are not replaced."""
+    path = CONFIG_PATH
+    try:
+        if path.is_symlink() or path.exists():
+            return path.resolve()
+    except OSError:
+        pass
+    return path
+
+
 def save_config(cfg: Dict[str, Any]) -> None:
     with CONFIG_LOCK:
         serialized = json.dumps(cfg, ensure_ascii=False, indent=2)
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        target = config_persist_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
         fd, temp_name = tempfile.mkstemp(
-            prefix=f".{CONFIG_PATH.name}.",
+            prefix=f".{target.name}.",
             suffix=".tmp",
-            dir=str(CONFIG_PATH.parent),
+            dir=str(target.parent),
         )
         temp_path = Path(temp_name)
         try:
@@ -312,7 +324,7 @@ def save_config(cfg: Dict[str, Any]) -> None:
                 handle.write(serialized)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_path, CONFIG_PATH)
+            os.replace(temp_path, target)
         finally:
             if fd >= 0:
                 os.close(fd)
@@ -426,7 +438,16 @@ def policy_defaults_for_scene(scene_id: str) -> Dict[str, Any]:
         "verification_status": "live_verified",
         "risk_level": "low",
     }
-    if scene_id in {"reference", "frame_based", "motion"}:
+    if scene_id == "frame_based":
+        defaults.update(
+            {
+                "enabled": True,
+                "experimental": True,
+                "verification_status": "live_verified",
+                "risk_level": "high",
+            }
+        )
+    elif scene_id in {"reference", "motion"}:
         defaults.update(
             {
                 "enabled": False,
