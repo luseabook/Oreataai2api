@@ -663,6 +663,11 @@ class OutlookMailClient:
             max(15, self._int_cfg("empty_mailbox_fail_after_sec", 75)),
             max(1, int(timeout_sec)),
         )
+        # Mailbox has old mail / unrelated mail but no fresh Oreate activation letter.
+        no_fresh_fail_after = min(
+            max(20, self._int_cfg("no_fresh_mail_fail_after_sec", 90)),
+            max(1, int(timeout_sec)),
+        )
         # Bad refresh_token/client_id should not burn the full verification window.
         credential_fail_after = min(
             max(5, self._int_cfg("credential_fail_after_sec", 20)),
@@ -676,6 +681,7 @@ class OutlookMailClient:
         min_ts = float(not_before) if not_before is not None else (started - 60.0)
         graph_ok_seen = False
         max_message_count = 0
+        stale_oreate_count = 0
         credential_error = ""
         credential_fail_since: Optional[float] = None
         while time.time() < deadline:
@@ -709,9 +715,13 @@ class OutlookMailClient:
 
                 for message in messages:
                     received_ts = self._message_received_ts(message)
-                    if received_ts and received_ts < min_ts:
-                        continue
                     blob = _message_blobs(message)
+                    subject = str(message.get("subject") or message.get("title") or "")
+                    is_oreate = "oreate" in blob.lower() or "oreate" in subject.lower()
+                    if received_ts and received_ts < min_ts:
+                        if is_oreate:
+                            stale_oreate_count += 1
+                        continue
                     fingerprint = blob[:1000]
                     if not fingerprint or fingerprint in seen_fingerprints:
                         continue
@@ -735,6 +745,13 @@ class OutlookMailClient:
                     raise RuntimeError(
                         "outlook verification timeout: graph ok but mailbox empty "
                         f"(no mail after {int(elapsed)}s; activation mail not arrived)"
+                    )
+                # Graph works and inbox has mail, but nothing fresh/usable after signup+resend.
+                if graph_ok_seen and max_message_count > 0 and elapsed >= no_fresh_fail_after:
+                    raise RuntimeError(
+                        "outlook verification timeout: graph ok but no fresh Oreate activation mail "
+                        f"(scanned {max_message_count} messages, stale_oreate={stale_oreate_count}, "
+                        f"waited {int(elapsed)}s)"
                     )
                 # Graph credentials keep failing in auto mode (shop fallback also empty).
                 if (

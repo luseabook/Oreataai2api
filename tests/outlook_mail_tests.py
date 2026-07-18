@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from gateway.outlook_mail import (
@@ -263,6 +264,64 @@ class OutlookMailClientTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 client.wait_verification_artifact("pool@outlook.com", "1", timeout_sec=1)
         self.assertIn("mailbox empty", str(ctx.exception))
+
+    def test_wait_fails_fast_when_only_stale_oreate_mail_exists(self):
+        account = {
+            "id": 1,
+            "email": "pool@outlook.com",
+            "password": "x",
+            "client_id": "cid",
+            "refresh_token": "rt",
+        }
+        # Message must be older than not_before / min_ts so it is treated as stale.
+        clock = {"t": 1_752_000_000.0}
+        stale = {
+            "id": "m1",
+            "subject": "Welcome to Oreate AI",
+            "text": "verify https://www.oreateai.com/home/vertical/aiImage?tokenID=old-token",
+            "receivedDateTime": datetime.fromtimestamp(clock["t"] - 3600, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        client = OutlookMailClient(
+            lambda: {
+                "base_url": "http://example",
+                "api_key": "k",
+                "api_mode": "auto",
+                "no_fresh_mail_fail_after_sec": 20,
+            },
+            claim_mailbox=lambda: account,
+            resolve_mailbox=lambda token: account,
+        )
+
+        def fake_time():
+            return clock["t"]
+
+        def fake_sleep(seconds):
+            clock["t"] += float(seconds)
+
+        with patch.object(
+            client,
+            "probe_graph_mailbox",
+            return_value={
+                "ok": True,
+                "messages": [stale],
+                "message_count": 1,
+                "oreate_candidates": 1,
+                "error": "",
+            },
+        ), patch("gateway.outlook_mail.time.time", side_effect=fake_time), patch(
+            "gateway.outlook_mail.time.sleep", side_effect=fake_sleep
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                client.wait_verification_artifact(
+                    "pool@outlook.com",
+                    "1",
+                    timeout_sec=300,
+                    not_before=clock["t"] - 60,
+                )
+        self.assertIn("no fresh Oreate", str(ctx.exception))
+        self.assertLess(clock["t"] - 1_752_000_000.0, 50.0)
 
     def test_wait_fails_fast_when_mailbox_stays_empty(self):
         account = {

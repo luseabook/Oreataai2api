@@ -43,6 +43,7 @@
     "preferred_domains": [],
     "verification_timeout_sec": 300,
     "empty_mailbox_fail_after_sec": 75,
+    "no_fresh_mail_fail_after_sec": 90,
     "credential_fail_after_sec": 20
   },
   "pool": {

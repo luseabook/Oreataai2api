@@ -191,6 +191,7 @@ DEFAULT_CONFIG = {
         "preferred_domains": [],
         "verification_timeout_sec": 300,
         "empty_mailbox_fail_after_sec": 75,
+        "no_fresh_mail_fail_after_sec": 90,
         "credential_fail_after_sec": 20,
     },
     "pool": {
@@ -2929,7 +2930,10 @@ def claim_outlook_mailbox() -> Dict[str, Any]:
               AND COALESCE(last_error,'') NOT LIKE '%600002%'
               AND COALESCE(last_error,'') NOT LIKE '%without ouss%'
               AND COALESCE(last_error,'') NOT LIKE '%manual_release%'
-            ORDER BY id ASC
+              AND COALESCE(last_error,'') NOT LIKE '%no fresh Oreate%'
+              AND COALESCE(last_error,'') NOT LIKE '%no Oreate activation mail%'
+              AND COALESCE(last_error,'') NOT LIKE '%mailbox empty%'
+            ORDER BY id DESC
             LIMIT 1
             """
         ).fetchone()

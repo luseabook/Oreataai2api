@@ -2710,8 +2710,9 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(server.CFG["mail"]["base_url"], "http://43.153.39.164:8899")
 
         claimed = server.claim_outlook_mailbox()
-        self.assertEqual(claimed["email"], "one@outlook.com")
-        self.assertEqual(claimed["password"], "pass1")
+        # Prefer newest imported cards first so stale/burned older rows are not reused.
+        self.assertEqual(claimed["email"], "two@outlook.com")
+        self.assertEqual(claimed["password"], "pass2")
         stats = server.outlook_mailbox_stats()
         self.assertEqual(stats["available"], 1)
         self.assertEqual(stats["leased"], 1)
