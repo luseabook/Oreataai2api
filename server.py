@@ -206,6 +206,9 @@ DEFAULT_CONFIG = {
         "generation_probe_prompt": "账号健康检测：请生成白色背景上的一个蓝色圆点",
         "generation_probe_interval_sec": 86400,
         "generation_probe_max_per_cycle": 3,
+        # New accounts often hit upstream 212361 during registration probes;
+        # defer expensive generation validation to pool maintenance instead.
+        "registration_require_generation_probe": False,
     },
     "gateway": {
         "default_rate_limit_per_minute": 60,
@@ -5423,6 +5426,54 @@ def purge_zombie_accounts() -> Dict[str, Any]:
         conn.close()
 
 
+def registration_require_generation_probe() -> bool:
+    value = CFG.get("pool", {}).get("registration_require_generation_probe", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def mark_registered_account_verified(account_id: int) -> None:
+    now = time.time()
+    conn = db_conn()
+    try:
+        conn.execute(
+            """
+            UPDATE accounts
+            SET status='verified',
+                cooldown_until=NULL,
+                last_error=NULL,
+                updated_at=?
+            WHERE id=?
+            """,
+            (now, account_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def soft_validate_registered_account(account_id: int) -> Dict[str, Any]:
+    """Mark a freshly registered account usable without spending a generation probe."""
+    account = account_row_by_id(account_id)
+    if account is None:
+        raise RuntimeError("registered account could not be loaded for validation")
+    detail: Dict[str, Any] = {}
+    try:
+        session = CLIENT.session_from_account(account)
+        detail = CLIENT.fetch_account_point_detail(session, account)
+        update_account_balance_snapshot(account_id, detail)
+    except Exception as exc:
+        code = upstream_error_code(exc)
+        if code == "200001":
+            raise
+        # Balance refresh failures (including gateway risk) should not block
+        # an otherwise successful signup/login from entering the pool.
+        detail = {"error": account_failure_message(exc, code)}
+    mark_registered_account_verified(account_id)
+    return {"ok": True, "mode": "soft", "balance": detail}
+
+
 def save_and_validate_registered_account(
     email: str,
     password: str,
@@ -5447,6 +5498,39 @@ def save_and_validate_registered_account(
             "status": "pending_validation",
         }
     )
+    if not registration_require_generation_probe():
+        try:
+            validation = soft_validate_registered_account(account_id)
+        except Exception as exc:
+            code = upstream_error_code(exc)
+            mark_account_failure(account_id, exc)
+            if code == "200001":
+                isolate_account_from_pool(
+                    account_id,
+                    f"注册后会话检测失败：{account_failure_message(exc, code)}",
+                )
+            status = "invalid" if code == "200001" else "validation_failed"
+            trace.append(
+                {
+                    "step": "generation_validation",
+                    "status": status,
+                    "mode": "soft",
+                    "error_code": code,
+                    "error": account_failure_message(exc, code),
+                }
+            )
+            return account_id, status
+        trace.append(
+            {
+                "step": "generation_validation",
+                "status": "verified",
+                "mode": "soft",
+                "result": validation,
+            }
+        )
+        mark_account_checkin_at(account_id)
+        return account_id, "verified"
+
     try:
         validation = validate_registered_account(account_id)
     except Exception as exc:
@@ -5468,6 +5552,7 @@ def save_and_validate_registered_account(
             {
                 "step": "generation_validation",
                 "status": status,
+                "mode": "probe",
                 "error_code": code,
                 "error": account_failure_message(exc, code),
             }
@@ -5478,6 +5563,7 @@ def save_and_validate_registered_account(
         {
             "step": "generation_validation",
             "status": "verified",
+            "mode": "probe",
             "result": validation,
         }
     )
@@ -5901,7 +5987,7 @@ def register_one_account(
                 final_status = "verify_error"
 
     result = {
-        "ok": final_status == "verified",
+        "ok": final_status in {"verified", "validation_deferred"},
         "status": final_status,
         "account_id": account_id,
         "email": email,
@@ -5920,8 +6006,10 @@ def register_one_account(
     }
     record_mail_domain_outcome(str(mailbox.get("domain") or ""), final_status)
     if str(mailbox.get("provider") or "").lower() == "outlook":
-        if final_status == "verified":
-            MAIL.finish_mailbox(str(token), "used")
+        if final_status in {"verified", "validation_deferred"}:
+            # Account row was persisted; mailbox is consumed even if generation
+            # probe was deferred due to gateway risk control.
+            MAIL.finish_mailbox(str(token), "used", final_status if final_status != "verified" else "")
         elif final_status == "email_domain_rejected":
             # Domain policy rejection is not mailbox-specific; return to pool.
             MAIL.finish_mailbox(str(token), "available", final_status)
@@ -6176,14 +6264,17 @@ def run_registration_job(job_id: int) -> None:
         for raw in registered:
             result = public_registration_result(raw)
             results.append(result)
-            ok = bool(result.get("ok") or result.get("status") == "verified")
+            status = str(result.get("status") or "")
+            ok = bool(
+                result.get("ok")
+                or status in {"verified", "validation_deferred"}
+            )
             if ok:
                 succeeded += 1
             else:
                 failed += 1
             completed += 1
             email = str(result.get("email") or current_email)
-            status = str(result.get("status") or "")
             if status == "email_domain_rejected":
                 domain_rejected = True
             append_registration_job_event(

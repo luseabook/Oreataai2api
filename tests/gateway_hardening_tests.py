@@ -620,8 +620,8 @@ class GatewayHardeningTests(unittest.TestCase):
                 patch.object(server, "save_account", return_value=1) as save_account,
                 patch.object(
                     server,
-                    "validate_registered_account",
-                    return_value={"ok": True, "asset_count": 1},
+                    "soft_validate_registered_account",
+                    return_value={"ok": True, "mode": "soft"},
                 ),
             ):
                 result = server.auto_register_accounts(1)
@@ -1037,25 +1037,33 @@ class GatewayHardeningTests(unittest.TestCase):
         risk_error = server.UpstreamGenerationError(
             {"code": "212361", "message": "spam user"}
         )
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {"pool": {"registration_require_generation_probe": True}},
+        )
 
-        with (
-            patch.object(server, "save_account", return_value=7) as save_account,
-            patch.object(
-                server,
-                "validate_registered_account",
-                side_effect=risk_error,
-            ),
-            patch.object(server, "mark_account_failure") as mark_failure,
-            patch.object(server, "isolate_account_from_pool") as isolate,
-        ):
-            account_id, status = server.save_and_validate_registered_account(
-                "risk@example.com",
-                "password",
-                session,
-                self.sample_image_info(),
-                self.sample_video_info(),
-                trace,
-            )
+        try:
+            with (
+                patch.object(server, "save_account", return_value=7) as save_account,
+                patch.object(
+                    server,
+                    "validate_registered_account",
+                    side_effect=risk_error,
+                ),
+                patch.object(server, "mark_account_failure") as mark_failure,
+                patch.object(server, "isolate_account_from_pool") as isolate,
+            ):
+                account_id, status = server.save_and_validate_registered_account(
+                    "risk@example.com",
+                    "password",
+                    session,
+                    self.sample_image_info(),
+                    self.sample_video_info(),
+                    trace,
+                )
+        finally:
+            server.CFG = original_cfg
 
         self.assertEqual(account_id, 7)
         self.assertEqual(status, "validation_deferred")
@@ -1064,6 +1072,40 @@ class GatewayHardeningTests(unittest.TestCase):
         isolate.assert_not_called()
         self.assertEqual(trace[-1]["step"], "generation_validation")
         self.assertEqual(trace[-1]["status"], "validation_deferred")
+
+    def test_registered_account_skips_generation_probe_by_default(self):
+        session = server.OreateSession(
+            email="soft@example.com",
+            password="password",
+            cookies={"OUID": "ouid", "ouss": "ouss"},
+        )
+        trace = []
+        with (
+            patch.object(server, "save_account", return_value=11) as save_account,
+            patch.object(
+                server,
+                "soft_validate_registered_account",
+                return_value={"ok": True, "mode": "soft"},
+            ) as soft_validate,
+            patch.object(server, "validate_registered_account") as hard_validate,
+            patch.object(server, "mark_account_checkin_at") as mark_checkin,
+        ):
+            account_id, status = server.save_and_validate_registered_account(
+                "soft@example.com",
+                "password",
+                session,
+                self.sample_image_info(),
+                self.sample_video_info(),
+                trace,
+            )
+
+        self.assertEqual(account_id, 11)
+        self.assertEqual(status, "verified")
+        self.assertEqual(save_account.call_args.kwargs["status"], "pending_validation")
+        soft_validate.assert_called_once_with(11)
+        hard_validate.assert_not_called()
+        mark_checkin.assert_called_once_with(11)
+        self.assertEqual(trace[-1]["mode"], "soft")
 
     def test_upstream_error_code_ignores_numeric_email_domain_and_reads_status_code(self):
         error = RuntimeError(

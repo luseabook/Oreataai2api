@@ -57,7 +57,8 @@
     "checkin_timezone": "Asia/Shanghai",
     "generation_probe_prompt": "账号健康检测：请生成白色背景上的一个蓝色圆点",
     "generation_probe_interval_sec": 86400,
-    "generation_probe_max_per_cycle": 3
+    "generation_probe_max_per_cycle": 3,
+    "registration_require_generation_probe": false
   },
   "gateway": {
     "default_rate_limit_per_minute": 60,
