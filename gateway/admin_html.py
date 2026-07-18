@@ -58,7 +58,10 @@ button:active{transform:scale(.96)}
 .btn-primary{background:#1d1d1f;color:#fff}.btn-primary:hover{background:#000}
 .btn-secondary{background:#f0f0f0;color:#1d1d1f}.btn-secondary:hover{background:#e5e5e5}
 .btn-danger{background:#ff3b30;color:#fff}.btn-danger:hover{background:#d62d20}
+.btn-provider-active{background:#e8f5e9;color:#1b5e20;border:1px solid #81c784;box-shadow:inset 0 0 0 1px rgba(46,125,50,.12);cursor:default}
+.btn-provider-active:hover{background:#e8f5e9}
 .btn-sm{padding:6px 14px;font-size:12px;border-radius:8px}
+#out-provider-hint.is-active{color:#1b5e20;font-weight:600}
 .table-wrap{overflow-x:auto;border-radius:10px;border:1px solid #e5e5e5}
 table{width:100%;border-collapse:collapse;font-size:13px}
 .accounts-table{min-width:1760px}
@@ -322,9 +325,9 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
   </div>
   <div class="row" style="margin-bottom:12px;align-items:center;gap:8px;flex-wrap:wrap">
     <div id="out-provider-hint" class="reg-console-hint">注册源：-</div>
-    <div><button class="btn-primary" onclick="useOutlookForRegistration()">设为注册邮箱源</button></div>
+    <div><button id="out-use-provider-btn" class="btn-primary" onclick="useOutlookForRegistration()">设为注册邮箱源</button></div>
     <div><button class="btn-secondary" onclick="loadOutlookMailboxes()">刷新列表</button></div>
-    <div><button class="btn-secondary" onclick="purgeOutlookMailboxes(['used','error'])">清理已用/异常</button></div>
+    <div><button class="btn-secondary" onclick="purgeOutlookMailboxes(['used','error','disabled'], true)">清理已用/异常/已注册</button></div>
   </div>
   <div class="row" style="margin-bottom:12px;align-items:flex-end;gap:8px;flex-wrap:wrap">
     <div class="col" style="min-width:220px">
@@ -337,7 +340,7 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
   <details style="margin-bottom:14px">
     <summary style="cursor:pointer;font-size:13px;color:#6e6e73">粘贴导入（可选）</summary>
     <div style="margin-top:8px">
-      <textarea id="outlook-import-text" rows="5" style="width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px" placeholder="http://host:8899/get?key=xxx&email=name@outlook.com----password----client_id----refresh_token"></textarea>
+      <textarea id="outlook-import-text" rows="5" style="width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px" placeholder="支持：&#10;邮箱----密码----client_id----refresh_token&#10;邮箱----密码----https://host/api/mail-new?refresh_token=...&client_id=...&#10;http://host/get?key=xxx&email=邮箱----密码----client_id----refresh_token"></textarea>
       <div class="row" style="margin-top:8px">
         <div><button class="btn-primary" onclick="importOutlookMailboxes()">导入粘贴内容</button></div>
       </div>
@@ -1611,15 +1614,24 @@ function renderOutlookStats(stats={}, provider='', baseUrl=''){
   set('out-st-total', s.total||0);
   const badge=document.getElementById('outlook-count');
   if(badge) badge.textContent=String(s.available||0);
+  const active=String(provider||'').toLowerCase()==='outlook';
   const hint=document.getElementById('outlook-pool-hint');
   if(hint){
-    const active=String(provider||'').toLowerCase()==='outlook';
     hint.textContent=`Outlook 池：可用 ${s.available||0} / 总计 ${s.total||0}`+(active?'（当前注册源）':'');
   }
   const providerHint=document.getElementById('out-provider-hint');
   if(providerHint){
-    const active=String(provider||'').toLowerCase()==='outlook';
-    providerHint.textContent=`注册源：${active?'Outlook':'YYDS / 其他'} · API ${baseUrl||'-'}`;
+    providerHint.classList.toggle('is-active', active);
+    providerHint.textContent=active
+      ? `当前注册源：Outlook · API ${baseUrl||'-'}`
+      : `注册源：YYDS / 其他（未选 Outlook） · API ${baseUrl||'-'}`;
+  }
+  const providerBtn=document.getElementById('out-use-provider-btn');
+  if(providerBtn){
+    providerBtn.className=active?'btn-provider-active':'btn-primary';
+    providerBtn.textContent=active?'✓ 当前注册源：Outlook':'设为注册邮箱源';
+    providerBtn.disabled=active;
+    providerBtn.title=active?'已经是 Outlook 注册源':'切换注册任务使用 Outlook 邮箱池';
   }
 }
 async function refreshOutlookPoolHint(){
@@ -1781,23 +1793,38 @@ async function deleteOutlookMailbox(id){
     showToast('删除失败：'+(error?.message||String(error)),'err');
   }
 }
-async function purgeOutlookMailboxes(statuses){
-  const label=(statuses||[]).join('/');
-  const ok=await showConfirm(`确定清理状态为 ${label} 的 Out 邮箱？`);
+async function purgeOutlookMailboxes(statuses, includeRegistered=true){
+  const ok=await showConfirm(
+    includeRegistered
+      ? '确定清理已用/异常/禁用邮箱，并移除已注册入号池的卡密？此操作不可恢复。'
+      : `确定清理状态为 ${(statuses||[]).join('/')} 的 Out 邮箱？`
+  );
   if(!ok) return;
   try{
-    const data=await api('POST','/api/mail/outlook/purge',{statuses:statuses||['used','error']});
-    showToast(`已清理 ${data.deleted||0} 个`,'ok');
+    const data=await api('POST','/api/mail/outlook/purge',{
+      statuses:statuses||['used','error','disabled'],
+      include_registered:Boolean(includeRegistered),
+    });
+    const registered=Number(data.deleted_registered||0);
+    showToast(
+      registered>0
+        ? `已清理 ${data.deleted||0} 个（含已注册 ${registered}）`
+        : `已清理 ${data.deleted||0} 个`,
+      'ok'
+    );
     await loadOutlookMailboxes();
   }catch(error){
     showToast('清理失败：'+(error?.message||String(error)),'err');
   }
 }
 async function useOutlookForRegistration(){
+  const providerBtn=document.getElementById('out-use-provider-btn');
+  if(providerBtn?.disabled) return;
   try{
     const data=await api('POST','/api/mail/outlook/use-for-registration');
     showToast('已切换注册源为 Outlook','ok');
     try{await loadSettings();}catch(_){ }
+    if(state.settings?.mail) state.settings.mail.provider='outlook';
     renderOutlookStats(data.stats||{}, data.provider||'outlook', data.base_url||'');
   }catch(error){
     showToast('切换失败：'+(error?.message||String(error)),'err');

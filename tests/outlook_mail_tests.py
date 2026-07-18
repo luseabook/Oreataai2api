@@ -35,6 +35,32 @@ class OutlookMailParseTests(unittest.TestCase):
         self.assertEqual(parsed["email"], "a@outlook.com")
         self.assertEqual(parsed["refresh_token"], "refresh.token")
 
+    def test_parse_email_password_mail_new_url_line(self):
+        # Card shops often ship: email----password----https://host/api/mail-new?refresh_token=...&client_id=...
+        token = (
+            "M.C530_SN1.0.U.MsaArtifacts.-CrmKSj4JrHRZuZ6OralduN1yTrkj*7oI1sei81ki7ydpu8OioTC"
+            "4BMEuHxGsvRX*GhJq22qYUsYE!iGV3awG7h*Yit8M!l6a9pyIs3z8MEX*KVFpOUJ7ANeRAZ2mYBFreJL1c2cz"
+            "GdNEuP8Q4oQtwckbNyqo9SKGyoX!ZXzeELV5vBlo2S7!BAiqs4UAjv0XNxYKFNXKhOuIOY8qUspEAEiimLX"
+            "Tb1*WfXRf7*X0YHPz7LerwyFbG4SSHsIeRSpKzlQaxkRIIlvvH0aVCnoTPYnpLGeZeAzpCeDEucTS1D73b"
+            "Sa968e6X7ghzIEgw7KTbGCNrRlD*8pjgmZoDJ7eX!K2Glz6BUTJrMvsnJtunx30q3BbDlUaC*a3CDeIKm"
+            "Z3de8DVdRUSi7ZdlhLx1vlU27FZHzmnNejXZUxKqxBXWgN4WuIRnLTL*DHnY!08rQU5Q$$"
+        )
+        line = (
+            "KentGarcia166556@outlook.com----mqlzqoe3474246----"
+            "https://api.xiaoheifk.cn/api/mail-new?"
+            f"refresh_token={token}"
+            "&client_id=9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+            "&email=KentGarcia166556@outlook.com"
+            "&mailbox=INBOX&response_type=html&password=520521"
+        )
+        parsed = parse_outlook_import_line(line)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["email"], "KentGarcia166556@outlook.com")
+        self.assertEqual(parsed["password"], "mqlzqoe3474246")
+        self.assertEqual(parsed["client_id"], "9e5f94bc-e8a4-4e73-b8be-63364c29d753")
+        self.assertEqual(parsed["refresh_token"], token)
+        self.assertEqual(parsed["detected_base_url"], "https://api.xiaoheifk.cn")
+
     def test_parse_text_collects_accounts(self):
         text = "\n".join(
             [

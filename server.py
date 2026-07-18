@@ -2807,7 +2807,8 @@ class OutlookImportIn(BaseModel):
 
 
 class OutlookPurgeIn(BaseModel):
-    statuses: List[str] = Field(default_factory=lambda: ["used", "error"])
+    statuses: List[str] = Field(default_factory=lambda: ["used", "error", "disabled"])
+    include_registered: bool = True
 
 
 class MaintainIn(BaseModel):
@@ -10238,7 +10239,7 @@ async def import_outlook_mailboxes_file_endpoint(
     if int(result.get("inserted") or 0) == 0 and int(result.get("updated") or 0) == 0:
         raise HTTPException(
             400,
-            "未识别到有效 Outlook 卡密行（需要 邮箱----密码----client_id----refresh_token 或完整 /get 链接）",
+            "未识别到有效 Outlook 卡密行（需要 邮箱----密码----client_id----refresh_token、邮箱----密码----mail-new链接，或完整 /get 链接）",
         )
     return result
 
@@ -10248,20 +10249,71 @@ def purge_outlook_mailboxes_endpoint(body: OutlookPurgeIn, _=Depends(require_adm
     allowed = {"available", "leased", "used", "error", "disabled"}
     statuses = [str(item).strip().lower() for item in (body.statuses or []) if str(item).strip()]
     statuses = [item for item in statuses if item in allowed]
-    if not statuses:
+    include_registered = bool(body.include_registered)
+    if include_registered and "disabled" not in statuses:
+        statuses.append("disabled")
+    if not statuses and not include_registered:
         raise HTTPException(400, "请指定要清理的状态，例如 used / error")
-    placeholders = ",".join("?" for _ in statuses)
+    if include_registered:
+        # Mark already-registered pool rows so status-based cleanup can catch them too.
+        quarantine_burned_outlook_mailboxes()
+    placeholders = ",".join("?" for _ in statuses) if statuses else ""
     conn = db_conn()
     try:
-        deleted = conn.execute(
-            f"DELETE FROM outlook_mailboxes WHERE status IN ({placeholders})",
-            statuses,
-        )
-        conn.commit()
+        registered_count = 0
+        if include_registered:
+            registered_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS c
+                    FROM outlook_mailboxes
+                    WHERE EXISTS (
+                        SELECT 1 FROM accounts a
+                        WHERE lower(a.email)=lower(outlook_mailboxes.email)
+                    )
+                    """
+                ).fetchone()["c"]
+                or 0
+            )
+        if include_registered and statuses:
+            deleted = conn.execute(
+                f"""
+                DELETE FROM outlook_mailboxes
+                WHERE status IN ({placeholders})
+                   OR EXISTS (
+                        SELECT 1 FROM accounts a
+                        WHERE lower(a.email)=lower(outlook_mailboxes.email)
+                   )
+                """,
+                statuses,
+            )
+        elif include_registered:
+            deleted = conn.execute(
+                """
+                DELETE FROM outlook_mailboxes
+                WHERE EXISTS (
+                    SELECT 1 FROM accounts a
+                    WHERE lower(a.email)=lower(outlook_mailboxes.email)
+                )
+                """
+            )
+        else:
+            deleted = conn.execute(
+                f"DELETE FROM outlook_mailboxes WHERE status IN ({placeholders})",
+                statuses,
+            )
         count = int(deleted.rowcount or 0)
+        conn.commit()
     finally:
         conn.close()
-    return {"ok": True, "deleted": count, "statuses": statuses, "stats": outlook_mailbox_stats()}
+    return {
+        "ok": True,
+        "deleted": count,
+        "deleted_registered": registered_count,
+        "statuses": statuses,
+        "include_registered": include_registered,
+        "stats": outlook_mailbox_stats(),
+    }
 
 
 @app.post("/api/mail/outlook/use-for-registration")

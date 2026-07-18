@@ -2745,6 +2745,56 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertEqual(creds.status_code, 200)
         self.assertEqual(creds.json()["password"], "secretpass")
 
+    def test_outlook_purge_removes_used_error_and_registered(self):
+        server.import_outlook_mailboxes(
+            "\n".join(
+                [
+                    "keep@outlook.com----p1----9e5f94bc-e8a4-4e73-b8be-63364c29d753----rt1",
+                    "usedbox@outlook.com----p2----9e5f94bc-e8a4-4e73-b8be-63364c29d753----rt2",
+                    "errbox@outlook.com----p3----9e5f94bc-e8a4-4e73-b8be-63364c29d753----rt3",
+                    "registered@outlook.com----p4----9e5f94bc-e8a4-4e73-b8be-63364c29d753----rt4",
+                ]
+            ),
+            apply_detected_endpoint=False,
+        )
+        conn = server.db_conn()
+        try:
+            conn.execute(
+                "UPDATE outlook_mailboxes SET status='used' WHERE email=?",
+                ("usedbox@outlook.com",),
+            )
+            conn.execute(
+                "UPDATE outlook_mailboxes SET status='error', last_error=? WHERE email=?",
+                ("verify_timeout", "errbox@outlook.com"),
+            )
+            conn.execute(
+                """
+                INSERT INTO accounts(
+                    email, password, status, source, created_at, updated_at
+                ) VALUES (?, ?, 'verified', 'auto', ?, ?)
+                """,
+                ("registered@outlook.com", "x", 1.0, 1.0),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        response = self.client.post(
+            "/api/mail/outlook/purge",
+            headers=self.admin_headers(),
+            json={"statuses": ["used", "error", "disabled"], "include_registered": True},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertGreaterEqual(body["deleted"], 3)
+        self.assertGreaterEqual(body["deleted_registered"], 1)
+        self.assertEqual(body["stats"]["available"], 1)
+        self.assertEqual(body["stats"]["total"], 1)
+
+        listed = self.client.get("/api/mail/outlook", headers=self.admin_headers())
+        emails = {item["email"] for item in listed.json()["items"]}
+        self.assertEqual(emails, {"keep@outlook.com"})
+
     def test_video_text_or_image_config_is_nested_like_web(self):
         config = server.build_video_config(
             {

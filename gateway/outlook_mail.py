@@ -58,33 +58,29 @@ def _mail_http_get(url: str, params: Mapping[str, Any], timeout: int = 45) -> re
     return _mail_session().get(url, params=dict(params), timeout=timeout)
 
 
-def parse_outlook_import_line(line: str) -> Optional[Dict[str, str]]:
-    raw = str(line or "").strip()
-    if not raw or raw.startswith("#"):
-        return None
+def _extract_query_value(query: str, key: str) -> str:
+    """Extract one query value without parse_qs (+ → space) rewriting token chars."""
+    match = re.search(rf"(?:^|&){re.escape(key)}=([^&]*)", str(query or ""))
+    if not match:
+        return ""
+    return unquote(match.group(1)).strip()
 
-    detected_base = ""
-    detected_key = ""
-    payload = raw
 
-    if "://" in raw and ("email=" in raw or "/get" in raw):
-        parsed = urlparse(raw)
-        if parsed.scheme and parsed.netloc:
-            detected_base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
-        qs = parse_qs(parsed.query)
-        if qs.get("key"):
-            detected_key = unquote(str(qs["key"][0] or "")).strip()
-        if qs.get("email"):
-            payload = unquote(str(qs["email"][0] or "")).strip()
-
-    parts = payload.split("----")
-    if len(parts) < 4:
-        return None
-    email, password, client_id = parts[0].strip(), parts[1].strip(), parts[2].strip()
-    refresh_token = "----".join(parts[3:]).strip().rstrip("&?")
+def _account_from_parts(
+    email: str,
+    password: str,
+    client_id: str,
+    refresh_token: str,
+    *,
+    detected_base: str = "",
+    detected_key: str = "",
+) -> Optional[Dict[str, str]]:
+    email = str(email or "").strip()
+    password = str(password or "").strip()
+    client_id = str(client_id or "").strip()
+    refresh_token = str(refresh_token or "").strip().rstrip("&?")
     if "@" not in email or not password or not client_id or not refresh_token:
         return None
-
     return {
         "email": email,
         "password": password,
@@ -93,6 +89,75 @@ def parse_outlook_import_line(line: str) -> Optional[Dict[str, str]]:
         "detected_base_url": detected_base,
         "detected_api_key": detected_key,
     }
+
+
+def _parse_mail_new_url(url: str) -> Tuple[str, str, str, str]:
+    """Return (email, client_id, refresh_token, base_url) from a mail-new style URL."""
+    parsed = urlparse(str(url or "").strip())
+    base = ""
+    if parsed.scheme and parsed.netloc:
+        base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    query = parsed.query or ""
+    return (
+        _extract_query_value(query, "email"),
+        _extract_query_value(query, "client_id"),
+        _extract_query_value(query, "refresh_token"),
+        base,
+    )
+
+
+def parse_outlook_import_line(line: str) -> Optional[Dict[str, str]]:
+    raw = str(line or "").strip()
+    if not raw or raw.startswith("#"):
+        return None
+
+    # Format A: whole-line shop /get URL
+    # email=addr----pass----client_id----refresh_token
+    if re.match(r"^https?://", raw, re.I) and ("/get" in raw or "email=" in raw):
+        parsed = urlparse(raw)
+        detected_base = ""
+        detected_key = ""
+        if parsed.scheme and parsed.netloc:
+            detected_base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        query = parsed.query or ""
+        detected_key = _extract_query_value(query, "key")
+        payload = _extract_query_value(query, "email")
+        parts = payload.split("----")
+        if len(parts) >= 4:
+            return _account_from_parts(
+                parts[0],
+                parts[1],
+                parts[2],
+                "----".join(parts[3:]),
+                detected_base=detected_base,
+                detected_key=detected_key,
+            )
+
+    parts = raw.split("----")
+
+    # Format B: email----password----https://host/api/mail-new?refresh_token=...&client_id=...
+    if len(parts) >= 3 and re.match(r"^https?://", parts[2].strip(), re.I):
+        email = parts[0].strip()
+        password = parts[1].strip()
+        url = "----".join(parts[2:]).strip()
+        url_email, client_id, refresh_token, base = _parse_mail_new_url(url)
+        return _account_from_parts(
+            email or url_email,
+            password,
+            client_id,
+            refresh_token,
+            detected_base=base,
+        )
+
+    # Format C: email----password----client_id----refresh_token
+    if len(parts) < 4:
+        return None
+    return _account_from_parts(
+        parts[0],
+        parts[1],
+        parts[2],
+        "----".join(parts[3:]),
+    )
 
 
 def parse_outlook_import_text(text: str) -> Dict[str, Any]:
