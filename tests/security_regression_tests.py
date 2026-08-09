@@ -1691,7 +1691,10 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertNotIn("Aa1@secret123", json.dumps(events, ensure_ascii=False))
 
     def test_registration_job_api_returns_immediately_and_exposes_progress(self):
-        with patch.object(server, "launch_registration_job") as launch:
+        with (
+            patch.object(server, "launch_registration_job") as launch,
+            patch.dict(server.CFG["mail"], {"provider": "yyds"}),
+        ):
             created = self.client.post(
                 "/api/register/jobs",
                 headers=self.admin_headers(),
@@ -1740,9 +1743,9 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
             """
             INSERT INTO accounts(
                 email,password,status,source,ouid,ouss,model_info_json,video_info_json,
-                last_error,rest_point,balance_updated_at,created_at,updated_at
+                last_error,rest_point,balance_updated_at,last_checkin_at,created_at,updated_at
             )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             [
                 (
@@ -1756,6 +1759,7 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
                     "{}",
                     None,
                     100,
+                    now,
                     now,
                     now,
                     now,
@@ -1774,6 +1778,7 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
                     now,
                     now,
                     now,
+                    now,
                 ),
                 (
                     "invalid@example.com",
@@ -1786,6 +1791,7 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
                     "{}",
                     "200001: session expired",
                     100,
+                    now,
                     now,
                     now,
                     now,
@@ -1865,9 +1871,10 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
     def test_pool_maintenance_stops_on_gateway_risk_without_isolating_account(self):
         account_id = self.seed_account()
         conn = server.db_conn()
+        now = time.time()
         conn.execute(
-            "UPDATE accounts SET model_info_json=?, rest_point=? WHERE id=?",
-            (json.dumps(self.sample_image_info()), 100, account_id),
+            "UPDATE accounts SET model_info_json=?, rest_point=?, last_checkin_at=? WHERE id=?",
+            (json.dumps(self.sample_image_info()), 100, now, account_id),
         )
         conn.commit()
         conn.close()
@@ -1907,9 +1914,10 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
     def test_pool_maintenance_does_not_treat_generation_environment_as_account_risk(self):
         account_id = self.seed_account()
         conn = server.db_conn()
+        now = time.time()
         conn.execute(
-            "UPDATE accounts SET model_info_json=?, rest_point=? WHERE id=?",
-            (json.dumps(self.sample_image_info()), 100, account_id),
+            "UPDATE accounts SET model_info_json=?, rest_point=?, last_checkin_at=? WHERE id=?",
+            (json.dumps(self.sample_image_info()), 100, now, account_id),
         )
         conn.commit()
         conn.close()
@@ -2145,8 +2153,8 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
             patch.object(server.CLIENT, "fetch_video_scenes", return_value={"data": []}),
             patch.object(
                 server,
-                "validate_registered_account",
-                return_value={"ok": True, "asset_count": 1},
+                "soft_validate_registered_account",
+                return_value={"ok": True, "mode": "soft"},
             ) as validate,
         ):
             result = server.refresh_account_session_and_validate(account_id)
@@ -2251,15 +2259,18 @@ assertEqual(helpers.formatApiError({{}}, 'unauthorized'), 'unauthorized', '401 f
         self.assertEqual(completed["healthy_after"], 1)
         self.assertEqual(completed["invalid_found"], 0)
         self.assertEqual(completed["isolated_accounts"], 0)
-        self.assertEqual(completed["items"], [])
+        self.assertEqual(len(completed["items"]), 1)
+        self.assertEqual(completed["items"][0]["category"], "daily_checkin")
+        self.assertEqual(completed["items"][0]["action"], "checked_in")
         refresh.assert_called_once_with(account_id)
 
     def test_pool_maintenance_refreshes_live_expired_session_before_isolating(self):
         account_id = self.seed_account()
         conn = server.db_conn()
+        now = time.time()
         conn.execute(
-            "UPDATE accounts SET model_info_json=?, rest_point=? WHERE id=?",
-            (json.dumps(self.sample_image_info()), 100, account_id),
+            "UPDATE accounts SET model_info_json=?, rest_point=?, last_checkin_at=? WHERE id=?",
+            (json.dumps(self.sample_image_info()), 100, now, account_id),
         )
         conn.commit()
         conn.close()

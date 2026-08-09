@@ -762,7 +762,7 @@ button:disabled{cursor:not-allowed;opacity:.5;transform:none}
   </div>
   <div class="row" style="margin-top:8px">
     <div class="col"><label>自动维护间隔（秒，0=关闭）</label><input id="s-maintain-interval" type="number" min="0" step="1" value="3600"></div>
-    <div class="col"><label>注册并发数（1-8）</label><input id="s-reg-concurrency" type="number" min="1" max="8" step="1" value="3"></div>
+    <div class="col"><label>注册并发数（1-8）</label><input id="s-reg-concurrency" type="number" min="1" max="8" step="1" value="1"></div>
     <div class="col"><label>自动补号上限（0-50）</label><input id="s-auto-register-max" type="number" min="0" max="50" step="1" value="5"></div>
   </div>
   <div class="row" style="margin-top:8px">
@@ -945,7 +945,7 @@ async function init() {
     showLogin('登录已失效');
     return;
   }
-  const v = state.accounts.filter(a=>a.health_status==='healthy').length;
+  const v = state.accounts.filter(accountIsGenerateReady).length;
   document.getElementById('status-text').textContent = `就绪 — ${v} 可用账号`;
   document.getElementById('gw-url').textContent = location.origin + '/v1/generate';
   document.getElementById('gw-example').textContent =
@@ -1414,6 +1414,7 @@ function renderAccounts(){
     const reserveTargetPoints = Number(a.reserve_target_points||0);
     const balanceUpdatedAt = a.balance_updated_at ? new Date((a.balance_updated_at||0)*1000).toLocaleString() : '-';
     const healthMeta = `${adminLabel('riskStatus',a.risk_status||'clean')}${a.cooling ? ` · 剩余 ${a.cooldown_remaining_seconds || 0} 秒` : ''}`;
+    const readinessMarks = accountReadinessMarks(a);
     const credential=state.accountCredentials[a.id];
     const passwordVisible=Boolean(state.revealedAccountPasswords[a.id]);
     const passwordText=!a.has_password?'未保存':passwordVisible?(credential?.password||'读取中…'):'••••••••';
@@ -1425,7 +1426,7 @@ function renderAccounts(){
         ${a.has_password?`<div class="password-actions"><button class="copy-btn" onclick="toggleAccountPassword(${a.id})">${passwordVisible?'隐藏密码':'查看密码'}</button><button class="copy-btn" onclick="copyAccountPassword(${a.id})">复制密码</button></div>`:''}
       </td>
       <td><span class="tag ${sc}">${escapeHtml(adminLabel('accountStatus',a.status))}</span></td>
-      <td class="health-cell"><span class="tag ${hc}">${escapeHtml(adminLabel('healthStatus',a.health_status))}</span><div style="font-size:11px;color:#86868b;white-space:nowrap">${escapeHtml(healthMeta)}</div></td>
+      <td class="health-cell"><span class="tag ${hc}">${escapeHtml(adminLabel('healthStatus',a.health_status))}</span><div style="font-size:11px;color:#86868b;white-space:nowrap">${escapeHtml(healthMeta)}</div><div style="font-size:10px;color:#86868b;letter-spacing:0.5px;margin-top:2px">${readinessMarks}</div></td>
       <td>${escapeHtml(adminLabel('source',a.source))}</td>
       <td style="font-family:monospace;font-size:11px">${escapeHtml(a.ouid_preview||'')}</td>
       <td class="point-value">${restPoint}<small>可用 ${availablePoints}</small></td>
@@ -1438,26 +1439,45 @@ function renderAccounts(){
       </td>
       <td style="font-size:11px">${balanceUpdatedAt}</td>
       <td style="font-size:11px">${new Date((a.created_at||0)*1000).toLocaleString()}</td>
-      <td class="actions-cell"><div class="row-actions"><button class="btn-sm btn-secondary" onclick="generateWith(${a.id})">生成</button><button class="btn-sm btn-secondary" onclick="refreshAccountBalance(${a.id})">刷新余额</button>${(a.status==='disabled'||a.status==='invalid'||a.status==='pending_validation')?`<button class="btn-sm btn-primary" onclick="reactivateAccount(${a.id})">重新激活</button>`:''}</div></td>
+      <td class="actions-cell"><div class="row-actions"><button class="btn-sm btn-secondary" onclick="generateWith(${a.id})">生成</button><button class="btn-sm btn-secondary" onclick="refreshAccountBalance(${a.id})">刷新余额</button>${(!a.has_session || a.status==='disabled'||a.status==='invalid'||a.status==='pending_validation')?`<button class="btn-sm btn-primary" onclick="activateAccount(${a.id})">${a.has_session?'重新激活':'激活'}</button>`:''}</div></td>
     </tr>`;
   }).join('');
-  document.getElementById('pool-count').textContent = state.accounts.filter(a=>a.health_status==='healthy').length;
+  document.getElementById('pool-count').textContent = state.accounts.filter(accountIsGenerateReady).length;
 }
-async function reactivateAccount(accountId){
-  const ok=await showConfirm(`重新激活账号 #${accountId}？将重新登录并做一次低成本图片生成验证。`);
+function accountIsGenerateReady(a){
+  if(typeof a?.generate_ready === 'boolean') return a.generate_ready;
+  return a?.health_status==='healthy';
+}
+function accountReadinessMarks(a){
+  const mark=(ready,label)=>ready===true
+    ? `<span style="color:#34c759">${label}✓</span>`
+    : `<span style="color:#c7c7cc">${label}✗</span>`;
+  return `${mark(a.auth_ready===true,'A')} ${mark(a.points_ready===true,'P')} ${mark(accountIsGenerateReady(a),'G')}`;
+}
+async function activateAccount(accountId){
+  const ok=await showConfirm(`激活账号 #${accountId}？将用已存密码重新登录、写入会话，并刷新积分（不消耗生成探针）。`);
   if(!ok) return;
   const status=document.getElementById('status-text');
   try{
-    if(status) status.textContent=`正在重新激活账号 #${accountId}…`;
-    const data=await api('POST',`/api/accounts/${accountId}/reactivate`);
+    if(status) status.textContent=`正在激活账号 #${accountId}…`;
+    const data=await api('POST',`/api/accounts/${accountId}/activate`);
     await loadAccounts();
     const st=data?.status || '-';
-    if(status) status.textContent=`账号 #${accountId} 激活结果：${st}`;
-    showToast(data?.ok?`账号 #${accountId} 已重新进入号池`:`账号 #${accountId} 激活未通过（${st}）`, data?.ok?'ok':'warn');
+    const points=data?.item?.rest_point ?? data?.item?.available_points ?? '-';
+    if(status) status.textContent=`账号 #${accountId} 激活结果：${st}，积分 ${points}`;
+    showToast(
+      data?.ok
+        ? `账号 #${accountId} 已登录激活，积分 ${points}`
+        : `账号 #${accountId} 激活未完成（${st}）`,
+      data?.ok?'ok':'warn'
+    );
   }catch(error){
-    if(status) status.textContent='重新激活失败';
-    showToast(`重新激活失败：${error?.message || String(error)}`,'err');
+    if(status) status.textContent='激活失败';
+    showToast(`激活失败：${error?.message || String(error)}`,'err');
   }
+}
+async function reactivateAccount(accountId){
+  return activateAccount(accountId);
 }
 async function purgeZombieAccounts(){
   const ok=await showConfirm(
@@ -3088,7 +3108,7 @@ async function loadSettings(){
   document.getElementById('s-min').value=s.pool?.min_accounts??3;
   document.getElementById('s-target').value=s.pool?.maintain_target??5;
   document.getElementById('s-maintain-interval').value=s.pool?.maintain_check_interval??3600;
-  document.getElementById('s-reg-concurrency').value=s.pool?.registration_concurrency??3;
+  document.getElementById('s-reg-concurrency').value=s.pool?.registration_concurrency??1;
   document.getElementById('s-auto-register-max').value=s.pool?.auto_maintain_max_register??5;
   document.getElementById('s-probe-interval').value=s.pool?.generation_probe_interval_sec??86400;
   document.getElementById('s-probe-max').value=s.pool?.generation_probe_max_per_cycle??3;
@@ -3199,7 +3219,7 @@ async function changeCredentials(){
 function updateStats(){
   const a=state.accounts||[];
   document.getElementById('st-total').textContent=a.length;
-  document.getElementById('st-verified').textContent=a.filter(x=>x.health_status==='healthy').length;
+  document.getElementById('st-verified').textContent=a.filter(accountIsGenerateReady).length;
   document.getElementById('st-tasks').textContent=state.lists.tasks.total;
   document.getElementById('st-apikeys').textContent=(state.apikeys||[]).length;
 }

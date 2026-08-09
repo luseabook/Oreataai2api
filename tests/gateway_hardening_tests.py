@@ -1,3 +1,4 @@
+import base64
 import json
 import re
 import shutil
@@ -734,6 +735,74 @@ class GatewayHardeningTests(unittest.TestCase):
             if item.get("step") == "login_after_confirm_fallback"
         ]
         self.assertEqual(fallback_steps[0]["confirm_code"], 1001)
+
+    def test_register_outlook_graph_preflight_fails_before_signup(self):
+        with (
+            patch.object(
+                server.MAIL,
+                "create_mailbox",
+                return_value={
+                    "address": "bad@outlook.com",
+                    "token": "mail-token",
+                    "domain": "outlook.com",
+                    "mailbox_id": "mb-1",
+                    "provider": "outlook",
+                },
+            ),
+            patch.object(
+                server,
+                "resolve_outlook_mailbox",
+                return_value={"email": "bad@outlook.com", "refresh_token": "rt"},
+            ),
+            patch.object(
+                server.MAIL.outlook,
+                "probe_graph_mailbox",
+                return_value={"ok": False, "error": "invalid_grant", "message_count": 0},
+            ),
+            patch.object(server.MAIL, "finish_mailbox") as finish_mailbox,
+            patch.object(server.CLIENT, "signup_attempt") as signup,
+        ):
+            result = server.register_one_account()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "mailbox_preflight_failed")
+        signup.assert_not_called()
+        finish_mailbox.assert_called_once()
+        self.assertEqual(finish_mailbox.call_args.args[1], "disabled")
+        self.assertIn("graph_preflight_failed", finish_mailbox.call_args.args[2])
+
+    def test_login_after_register_retries_without_ouss_then_succeeds(self):
+        session = server.OreateSession(
+            email="retry@example.com",
+            password="pass",
+            cookies={"OUID": "ouid", "ouss": "ouss"},
+        )
+        errors = [
+            RuntimeError("emaillogin succeeded without ouss cookie"),
+            RuntimeError("emaillogin succeeded without ouss cookie"),
+            session,
+        ]
+        with (
+            patch.object(server.CLIENT, "login", side_effect=errors) as login,
+            patch.object(server.CLIENT, "session_from_cookie_dict", return_value=object()),
+            patch.object(server.CLIENT, "fetch_image_models", return_value={"models": []}),
+            patch.object(server.CLIENT, "fetch_video_models", return_value=[]),
+            patch.object(server.CLIENT, "fetch_video_scenes", return_value=[]),
+            patch.object(server.time, "sleep") as sleep,
+        ):
+            got_session, img, vid = server.login_and_fetch_capabilities_after_register(
+                "retry@example.com",
+                "pass",
+                [],
+                attempts=3,
+                base_backoff_sec=0.01,
+            )
+
+        self.assertIs(got_session, session)
+        self.assertEqual(login.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertIn("models", img)
+        self.assertIn("scenes", vid)
 
     def test_admin_settings_html_exposes_pool_auto_maintain_controls(self):
         html = server.ADMIN_HTML
@@ -4865,6 +4934,62 @@ class GatewayHardeningTests(unittest.TestCase):
 
         self.assertEqual(candidates, [])
 
+    def test_select_generation_account_skips_not_generate_ready_and_reports_details(self):
+        """Cooling / low_balance accounts are not selected; NO_ACCOUNT details expose readiness counters."""
+        cooling_id = self.seed_account_with_capabilities("gen-ready-cooling@example.com")
+        low_id = self.seed_account_with_capabilities("gen-ready-low@example.com")
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET rest_point=?, daily_point=0, bonus_point=?, cooldown_until=? WHERE id=?",
+            (100, 100, now + 600, cooling_id),
+        )
+        conn.execute(
+            "UPDATE accounts SET rest_point=?, daily_point=0, bonus_point=?, cooldown_until=NULL WHERE id=?",
+            (5, 5, low_id),
+        )
+        conn.commit()
+        conn.close()
+
+        with self.assertRaises(server.GatewayAPIError) as ctx:
+            server.select_generation_account(server.GatewayGenerateIn(**self.valid_image_request()))
+
+        self.assertEqual(ctx.exception.code, "NO_ACCOUNT_AVAILABLE")
+        details = ctx.exception.details
+        self.assertEqual(details["generate_ready_candidates"], 0)
+        self.assertGreaterEqual(details["skipped_not_generate_ready"], 1)
+        self.assertEqual(details["balance_misses"], 0)
+        # SQL still surfaces cooling? no — cooldown is filtered in candidate SQL.
+        # low_balance is not filtered by SQL, so it is skipped by generate_ready.
+        self.assertGreaterEqual(details["candidate_accounts"], 1)
+        self.assertFalse(server.account_generate_ready(server.fetch_account_row(low_id)))
+        # pick_account path also refuses non-generate_ready accounts.
+        self.assertIsNone(server.pick_account_for_generation("image"))
+
+    def test_select_generation_account_prefers_generate_ready_over_low_balance(self):
+        low_id = self.seed_account_with_capabilities("skip-low-gen@example.com")
+        ready_id = self.seed_account_with_capabilities("keep-ready-gen@example.com")
+        now = time.time()
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET rest_point=?, daily_point=0, bonus_point=?, updated_at=? WHERE id=?",
+            (3, 3, now + 50, low_id),
+        )
+        conn.execute(
+            "UPDATE accounts SET rest_point=?, daily_point=0, bonus_point=?, updated_at=? WHERE id=?",
+            (100, 100, now, ready_id),
+        )
+        conn.commit()
+        conn.close()
+
+        account, _, _, estimated = server.select_generation_account(
+            server.GatewayGenerateIn(**self.valid_image_request())
+        )
+        self.assertEqual(account["id"], ready_id)
+        self.assertEqual(estimated, 12)
+        self.assertTrue(server.account_generate_ready(account))
+        self.assertFalse(server.account_generate_ready(server.fetch_account_row(low_id)))
+
     def test_scheduler_skips_account_in_cooldown(self):
         cooling_id = self.seed_account_with_capabilities("cooling@example.com")
         ready_id = self.seed_account_with_capabilities("ready@example.com")
@@ -4931,7 +5056,7 @@ class GatewayHardeningTests(unittest.TestCase):
         conn.commit()
         conn.close()
 
-        def _fake_refresh(aid):
+        def _fake_activate(aid):
             now = time.time()
             conn = server.db_conn()
             conn.execute(
@@ -4939,14 +5064,22 @@ class GatewayHardeningTests(unittest.TestCase):
                 (now, aid),
             )
             conn.commit()
+            row = conn.execute("SELECT * FROM accounts WHERE id=?", (aid,)).fetchone()
             conn.close()
-            return {"ok": True, "model_name": "GPT Image 2.0", "asset_count": 1}
+            return {
+                "ok": True,
+                "status": "verified",
+                "mode": "login",
+                "has_session": True,
+                "validation": {"ok": True, "mode": "soft"},
+                "item": server.public_account(row),
+            }
 
         with patch.object(
             server,
-            "refresh_account_session_and_validate",
-            side_effect=_fake_refresh,
-        ) as refresh_mock:
+            "activate_account_login",
+            side_effect=_fake_activate,
+        ) as activate_mock:
             response = self.client.post(
                 f"/api/accounts/{account_id}/reactivate",
                 headers=self.admin_headers(),
@@ -4957,7 +5090,74 @@ class GatewayHardeningTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["status"], "verified")
         self.assertEqual(payload["item"]["status"], "verified")
-        refresh_mock.assert_called_once_with(account_id)
+        activate_mock.assert_called_once_with(account_id)
+
+    def test_admin_can_activate_verified_account_without_session(self):
+        account_id = self.seed_account_with_capabilities(email=f"activate-{time.time_ns()}@example.com")
+        conn = server.db_conn()
+        conn.execute(
+            "UPDATE accounts SET ouss='', point_balance_json=? WHERE id=?",
+            (
+                json.dumps(
+                    {
+                        "daily_point": None,
+                        "pro_point": None,
+                        "bonus_point": None,
+                        "rest_point": None,
+                    }
+                ),
+                account_id,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        session = server.OreateSession(
+            email="activate@example.com",
+            password="pass",
+            cookies={"OUID": "ouid-activate", "ouss": "ouss-activate"},
+        )
+
+        with (
+            patch.object(server.CLIENT, "login", return_value=session) as login,
+            patch.object(server.CLIENT, "session_from_cookie_dict", return_value=object()),
+            patch.object(server.CLIENT, "fetch_image_models", return_value={}),
+            patch.object(
+                server.CLIENT,
+                "fetch_video_models",
+                return_value={"data": {"models": []}},
+            ),
+            patch.object(
+                server.CLIENT,
+                "fetch_video_scenes",
+                return_value={"data": {"scenes": []}},
+            ),
+            patch.object(
+                server.CLIENT,
+                "fetch_account_point_detail",
+                return_value={
+                    "daily_point": 30,
+                    "bonus_point": 50,
+                    "rest_point": 80,
+                },
+            ),
+        ):
+            response = self.client.post(
+                f"/api/accounts/{account_id}/activate",
+                headers=self.admin_headers(),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["mode"], "login")
+        self.assertTrue(payload["has_session"])
+        self.assertEqual(payload["item"]["rest_point"], 80)
+        login.assert_called_once()
+        row = server.account_row_by_id(account_id)
+        self.assertEqual(server.decrypt_secret_value(row["ouss"]), "ouss-activate")
+        self.assertTrue(server.account_has_usable_session(row))
+        self.assertIn("activateAccount", server.ADMIN_HTML)
+        self.assertIn("/api/accounts/${accountId}/activate", server.ADMIN_HTML)
 
     def test_admin_can_purge_zombie_accounts_without_touching_verified(self):
         zombie_id = self.seed_account_with_capabilities(email=f"zombie-{time.time_ns()}@example.com")
@@ -6078,16 +6278,27 @@ if (!listPageSummary(page).includes('共 0 条')) throw new Error(`empty summary
         self.assertEqual(items["healthy@example.com"]["active_reserved_points"], 0)
         self.assertEqual(items["healthy@example.com"]["available_points"], 127)
         self.assertEqual(items["healthy@example.com"]["unprotected_spendable_points"], 127)
+        self.assertIs(items["healthy@example.com"]["auth_ready"], True)
+        self.assertIs(items["healthy@example.com"]["points_ready"], True)
+        self.assertIs(items["healthy@example.com"]["generate_ready"], True)
 
         self.assertEqual(items["cooling@example.com"]["health_status"], "cooling")
         self.assertTrue(items["cooling@example.com"]["cooling"])
         self.assertGreater(items["cooling@example.com"]["cooldown_remaining_seconds"], 0)
+        self.assertIs(items["cooling@example.com"]["auth_ready"], True)
+        self.assertIs(items["cooling@example.com"]["points_ready"], True)
+        self.assertIs(items["cooling@example.com"]["generate_ready"], False)
 
         self.assertEqual(items["low@example.com"]["health_status"], "low_balance")
         self.assertEqual(items["low@example.com"]["balance_status"], "low")
+        self.assertIs(items["low@example.com"]["auth_ready"], True)
+        self.assertIs(items["low@example.com"]["points_ready"], False)
+        self.assertIs(items["low@example.com"]["generate_ready"], False)
 
         self.assertEqual(items["risk@example.com"]["health_status"], "invalid")
         self.assertEqual(items["risk@example.com"]["risk_status"], "invalid")
+        self.assertIs(items["risk@example.com"]["auth_ready"], False)
+        self.assertIs(items["risk@example.com"]["generate_ready"], False)
 
     def test_gateway_account_status_reports_health_counts(self):
         self.seed_account_with_capabilities("healthy@example.com")
@@ -6113,6 +6324,11 @@ if (!listPageSummary(page).includes('共 0 条')) throw new Error(`empty summary
         self.assertEqual(payload["low_balance_accounts"], 1)
         self.assertEqual(payload["invalid_accounts"], 1)
         self.assertEqual(payload["risk_control_accounts"], 0)
+        # Seed accounts include encrypted ouid/ouss; only invalid fails auth_ready.
+        self.assertEqual(payload["auth_ready_accounts"], 3)
+        # low balance is not points_ready; risk still has seed rest_point=1000.
+        self.assertEqual(payload["points_ready_accounts"], 3)
+        self.assertEqual(payload["generate_ready_accounts"], 1)
 
     def test_healthz_readyz_and_metrics_report_operational_state(self):
         health = self.client.get("/healthz")
@@ -6174,6 +6390,7 @@ if (!listPageSummary(page).includes('共 0 条')) throw new Error(`empty summary
         payload = metrics.json()
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["accounts"]["healthy"], 1)
+        self.assertEqual(payload["accounts"]["generate_ready"], 1)
         self.assertEqual(payload["tasks"]["queued"], 1)
         self.assertEqual(payload["tasks"]["failed"], 1)
         self.assertEqual(payload["tasks"]["completed"], 1)
@@ -6953,3 +7170,120 @@ if (!listPageSummary(page).includes('共 0 条')) throw new Error(`empty summary
             create_chat.assert_not_called()
         finally:
             server.CFG = original_cfg
+
+    def test_gateway_generate_in_accepts_updream_video_fields(self):
+        body = server.GatewayGenerateIn(
+            kind="video",
+            prompt="hello",
+            audio=True,
+            input_reference="data:image/png;base64,AAA",
+            reference_images=["data:image/png;base64,BBB", self.uploaded_image()],
+            reference_videos=["data:video/mp4;base64,CCC"],
+        )
+        self.assertTrue(body.audio)
+        self.assertEqual(body.input_reference, "data:image/png;base64,AAA")
+        self.assertEqual(body.reference_images[0], "data:image/png;base64,BBB")
+        self.assertEqual(body.reference_images[1]["object"], "uploads/first.png")
+        self.assertEqual(body.reference_videos[0], "data:video/mp4;base64,CCC")
+
+    def test_effective_generation_options_maps_updream_audio_and_input_reference(self):
+        body = server.GatewayGenerateIn(
+            kind="video",
+            prompt="hello",
+            scene_id="text_or_image",
+            audio=True,
+            input_reference="data:image/png;base64,AAA",
+        )
+        options = server.effective_generation_options(body, {})
+        self.assertTrue(options["is_audio"])
+        self.assertEqual(options["image"], {"bosUrl": "data:image/png;base64,AAA"})
+
+        # An explicit is_audio field wins over the audio alias.
+        body2 = server.GatewayGenerateIn(
+            kind="video",
+            prompt="hello",
+            scene_id="text_or_image",
+            audio=True,
+            is_audio=False,
+        )
+        self.assertFalse(server.effective_generation_options(body2, {})["is_audio"])
+
+        # input_reference is not mapped to image for non-text_or_image scenes.
+        body3 = server.GatewayGenerateIn(
+            kind="video",
+            prompt="hello",
+            scene_id="reference",
+            input_reference="data:image/png;base64,AAA",
+        )
+        self.assertNotIn("image", server.effective_generation_options(body3, {}))
+
+        # An explicit image attachment wins over input_reference.
+        body4 = server.GatewayGenerateIn(
+            kind="video",
+            prompt="hello",
+            scene_id="text_or_image",
+            input_reference="data:image/png;base64,AAA",
+            image={"object": "uploads/a.png"},
+        )
+        self.assertEqual(server.effective_generation_options(body4, {})["image"], {"object": "uploads/a.png"})
+
+    def test_resolve_inline_attachment_references_uploads_data_uris_and_rejects_others(self):
+        png_bytes = b"\x89PNG-fake-image-bytes"
+        data_uri = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+        attachment = {
+            "fileName": "ref",
+            "fileExt": "png",
+            "originSize": len(png_bytes),
+            "object": "uploads/ref.png",
+            "bosUrl": "uploads/ref.png",
+            "status": "completed",
+        }
+        uploaded = []
+
+        def fake_upload(session, filename, data, content_type):
+            uploaded.append((filename, data, content_type))
+            return attachment
+
+        options = {
+            "image": {"bosUrl": data_uri},  # wrapper produced by input_reference mapping
+            "first_frame": data_uri,
+            "last_frame": {"object": "uploads/last.png"},  # uploaded object stays untouched
+            "reference_images": [data_uri, {"object": "uploads/ref2.png"}],
+            "reference_videos": [],
+            "motion_video": data_uri,
+            "character_image": {"bosUrl": data_uri},
+        }
+        with patch.object(server.CLIENT, "upload_file_bytes", side_effect=fake_upload):
+            server.resolve_inline_attachment_references(options, object())
+
+        self.assertEqual(options["image"], attachment)
+        self.assertEqual(options["first_frame"], attachment)
+        self.assertEqual(options["last_frame"], {"object": "uploads/last.png"})
+        self.assertEqual(options["reference_images"], [attachment, {"object": "uploads/ref2.png"}])
+        self.assertEqual(options["reference_videos"], [])
+        self.assertEqual(options["motion_video"], attachment)
+        self.assertEqual(options["character_image"], attachment)
+        self.assertEqual(len(uploaded), 5)
+        for filename, data, content_type in uploaded:
+            self.assertEqual(filename, "ref.png")
+            self.assertEqual(data, png_bytes)
+            self.assertEqual(content_type, "image/png")
+
+        # Idempotent: already-resolved dict objects are left alone.
+        with patch.object(server.CLIENT, "upload_file_bytes", side_effect=fake_upload) as upload_mock:
+            server.resolve_inline_attachment_references(options, object())
+        upload_mock.assert_not_called()
+        self.assertEqual(options["image"], attachment)
+
+        # Non-data-URI strings (URL / local path) are rejected.
+        with self.assertRaises(server.GatewayAPIError) as ctx:
+            server.resolve_inline_attachment_references({"image": "http://evil.example/x.png"}, object())
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(ctx.exception.code, "INVALID_ATTACHMENT_REFERENCE")
+        self.assertEqual(ctx.exception.details["field"], "image")
+
+        with self.assertRaises(server.GatewayAPIError) as ctx:
+            server.resolve_inline_attachment_references({"reference_images": ["/etc/passwd"]}, object())
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(ctx.exception.code, "INVALID_ATTACHMENT_REFERENCE")
+        self.assertEqual(ctx.exception.details["field"], "reference_images")

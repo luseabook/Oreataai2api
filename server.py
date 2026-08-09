@@ -52,6 +52,7 @@ from gateway.openai_compat import (
     video_size_to_ratio,
     video_size_to_resolution,
 )
+from gateway import account_health as account_health_mod
 from gateway.runtime import (
     SingleWorkerLock,
     validate_single_worker_configuration,
@@ -207,7 +208,7 @@ DEFAULT_CONFIG = {
         "maintain_target": 5,
         "valid_threshold_pct": 1.0,
         "maintain_check_interval": 3600,
-        "registration_concurrency": 3,
+        "registration_concurrency": 1,
         "auto_maintain_max_register": 5,
         "auto_checkin_enabled": True,
         "checkin_timezone": "Asia/Shanghai",
@@ -510,18 +511,31 @@ def clean_settings_update(data: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def account_has_usable_session(row: Any) -> bool:
+    """Whether the account row stores a recoverable ouss cookie for upstream calls."""
+    try:
+        raw = row["ouss"] if not isinstance(row, Mapping) else row.get("ouss")
+    except Exception:
+        raw = None
+    return bool(str(decrypt_secret_value(raw, required=False) or "").strip())
+
+
 def public_account(row: sqlite3.Row) -> Dict[str, Any]:
     item = dict(row)
     item["has_password"] = bool(decrypt_secret_value(item.get("password")))
+    item["has_session"] = account_has_usable_session(item)
     item["ouid_preview"] = decrypt_secret_value(item.get("ouid"))[:12]
+    now = time.time()
+    # Health fields need ouid/ouss + capability JSON before secrets are stripped.
+    has_caps = account_has_schedulable_capability(item)
+    health_fields = account_health_mod.account_health_fields(
+        item,
+        has_schedulable_capability=has_caps,
+        now=now,
+    )
+    item.update(health_fields)
     for key in ("password", "ouid", "ouss", "model_info_json", "video_info_json", "point_balance_json"):
         item.pop(key, None)
-    now = time.time()
-    item["cooling"] = account_cooldown_remaining_seconds(item, now) > 0
-    item["cooldown_remaining_seconds"] = int(account_cooldown_remaining_seconds(item, now))
-    item["balance_status"] = account_balance_status(item)
-    item["risk_status"] = account_risk_status(item)
-    item["health_status"] = account_health_status(item, now)
     item["active_reserved_points"] = account_active_reserved_points(item)
     item["available_points"] = account_available_points(item)
     item["unprotected_spendable_points"] = account_spendable_points(item, 1)
@@ -671,27 +685,7 @@ def normalize_account_point_detail(raw: Any) -> Dict[str, Any]:
 
 
 def account_balance_value(row: sqlite3.Row) -> Optional[int]:
-    item = dict(row)
-    if item.get("rest_point") not in (None, ""):
-        return int_or_default(item.get("rest_point"), 0)
-    if item.get("daily_point") not in (None, "") or item.get("bonus_point") not in (None, ""):
-        return int_or_default(item.get("daily_point"), 0) + int_or_default(item.get("bonus_point"), 0)
-    raw = json_value_from_db(item.get("point_balance_json")) or {}
-    source = raw.get("data") if isinstance(raw, dict) and isinstance(raw.get("data"), dict) else raw
-    if isinstance(source, dict):
-        if source.get("restPoint") not in (None, ""):
-            return int_or_default(source.get("restPoint"), 0)
-        if source.get("rest_point") not in (None, ""):
-            return int_or_default(source.get("rest_point"), 0)
-        if source.get("restpoint") not in (None, ""):
-            return int_or_default(source.get("restpoint"), 0)
-        if source.get("daily") not in (None, "") or source.get("bonus") not in (None, ""):
-            return int_or_default(source.get("daily"), 0) + int_or_default(source.get("bonus"), 0)
-        if source.get("dailyPoint") not in (None, "") or source.get("bonusPoint") not in (None, ""):
-            return int_or_default(source.get("dailyPoint"), 0) + int_or_default(source.get("bonusPoint"), 0)
-        if source.get("daily_point") not in (None, "") or source.get("bonus_point") not in (None, ""):
-            return int_or_default(source.get("daily_point"), 0) + int_or_default(source.get("bonus_point"), 0)
-    return None
+    return account_health_mod.account_balance_value(row)
 
 
 def account_active_reserved_points(row: sqlite3.Row) -> int:
@@ -736,50 +730,35 @@ def account_has_sufficient_balance(row: sqlite3.Row, estimated_point_cost: Optio
 
 
 def account_cooldown_remaining_seconds(row: sqlite3.Row, now: Optional[float] = None) -> float:
-    now = time.time() if now is None else now
-    cooldown_until = row.get("cooldown_until") if isinstance(row, dict) else row["cooldown_until"]
-    if cooldown_until in (None, ""):
-        return 0.0
-    try:
-        remaining = float(cooldown_until) - float(now)
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, remaining)
+    return account_health_mod.account_cooldown_remaining_seconds(row, now)
 
 
 def account_balance_status(row: sqlite3.Row) -> str:
-    balance = account_balance_value(row)
-    if balance is None:
-        return "unknown"
-    if balance <= 0:
-        return "empty"
-    if balance < 10:
-        return "low"
-    return "ok"
+    return account_health_mod.account_balance_status(row)
 
 
 def account_risk_status(row: sqlite3.Row) -> str:
-    status = str(row["status"] or "")
-    if status == "invalid":
-        return "invalid"
-    return "clean"
+    return account_health_mod.account_risk_status(row)
 
 
 def account_health_status(row: sqlite3.Row, now: Optional[float] = None) -> str:
-    status = str(row["status"] or "")
-    if status == "disabled":
-        return "disabled"
-    if status == "invalid":
-        return "invalid"
-    if status not in {"verified", "active"}:
-        return "pending"
-    if account_cooldown_remaining_seconds(row, now) > 0:
-        return "cooling"
-    if account_risk_status(row) == "risk_control":
-        return "risk_control"
-    if account_balance_status(row) in {"empty", "low"}:
-        return "low_balance"
-    return "healthy"
+    return account_health_mod.account_health_status(row, now)
+
+
+def account_auth_ready(row: sqlite3.Row) -> bool:
+    return account_health_mod.account_auth_ready(row)
+
+
+def account_points_ready(row: sqlite3.Row) -> bool:
+    return account_health_mod.account_points_ready(row)
+
+
+def account_generate_ready(row: sqlite3.Row, now: Optional[float] = None) -> bool:
+    return account_health_mod.account_generate_ready(
+        row,
+        has_schedulable_capability=account_has_schedulable_capability(row),
+        now=now,
+    )
 
 
 def account_has_schedulable_capability(row: sqlite3.Row) -> bool:
@@ -795,38 +774,11 @@ def account_is_ready_schedulable(row: sqlite3.Row) -> bool:
 
 
 def account_pool_summary(rows: List[sqlite3.Row], now: Optional[float] = None) -> Dict[str, int]:
-    current = time.time() if now is None else now
-    summary = {
-        "total": 0,
-        "verified": 0,
-        "healthy": 0,
-        "cooling": 0,
-        "low_balance": 0,
-        "invalid": 0,
-        "risk_control": 0,
-        "balance_known": 0,
-    }
-    for row in rows:
-        summary["total"] += 1
-        if str(row["status"] or "") in {"verified", "active"}:
-            summary["verified"] += 1
-        if account_balance_value(row) is not None:
-            summary["balance_known"] += 1
-        health = account_health_status(row, current)
-        schedulable = account_is_ready_schedulable(row)
-        if health == "risk_control":
-            pass
-        elif health == "healthy":
-            if schedulable:
-                summary["healthy"] += 1
-        elif health == "cooling":
-            if schedulable:
-                summary["cooling"] += 1
-        elif health in summary:
-            summary[health] += 1
-        if account_risk_status(row) == "risk_control":
-            summary["risk_control"] += 1
-    return summary
+    return account_health_mod.account_pool_summary(
+        rows,
+        now,
+        has_schedulable_capability=account_has_schedulable_capability,
+    )
 
 
 def task_metrics_summary(rows: List[sqlite3.Row]) -> Dict[str, Any]:
@@ -1338,7 +1290,20 @@ def effective_generation_options(body: Any, caps: Dict[str, Any]) -> Dict[str, A
             "duration": body.duration or CFG["oreate"]["default_video_duration"],
             "scene_id": body.scene_id or CFG["oreate"]["default_video_scene"],
         }
-        return copy_optional_body_fields(options, body, VIDEO_ATTACHMENT_OPTION_FIELDS)
+        options = copy_optional_body_fields(options, body, VIDEO_ATTACHMENT_OPTION_FIELDS)
+        if body.audio is not None and options.get("is_audio") is None:
+            options["is_audio"] = body.audio
+        if (
+            isinstance(body.input_reference, str)
+            and body.input_reference
+            and options.get("scene_id") == "text_or_image"
+            and not options.get("image")
+        ):
+            # Treat the updream input_reference (first image) as an uploaded-media
+            # object so request_uses_uploaded_media and build_video_config see it;
+            # the worker phase resolves the inline data URI before building config.
+            options["image"] = {"bosUrl": body.input_reference}
+        return options
     return {}
 
 
@@ -1652,6 +1617,100 @@ def build_video_config(options: Dict[str, Any], model: Optional[Dict[str, Any]] 
             "keepOriginalSound": bool(options.get("keep_original_sound")),
         }
     return config
+
+
+INLINE_ATTACHMENT_SINGLE_FIELDS = ("image", "first_frame", "last_frame", "motion_video", "character_image")
+INLINE_ATTACHMENT_LIST_FIELDS = ("reference_images", "reference_videos")
+
+
+def resolve_inline_attachment_references(options: Dict[str, Any], session: Any) -> Dict[str, Any]:
+    """Resolve inline (data URI) attachment references in options into uploaded attachment objects.
+
+    Runs on the worker path (submit_generation_for_account) before the video config/attachments
+    are built. For image/first_frame/last_frame/motion_video/character_image a bare string or a
+    {"bosUrl": <string>} wrapper from input_reference mapping is resolved; reference_images and
+    reference_videos are processed element-wise. Only strings starting with "data:" are uploaded
+    via CLIENT.upload_file_bytes and replaced with the returned attachment object; dict values
+    that already carry an uploaded object are left untouched (idempotent). Any other non-data-URI
+    string (URL, local path) is rejected to avoid SSRF.
+    """
+
+    def upload_inline(reference: str, field: str) -> Dict[str, Any]:
+        if not reference.startswith("data:"):
+            raise GatewayAPIError(
+                422,
+                "INVALID_ATTACHMENT_REFERENCE",
+                "attachment reference must be a data URI or an uploaded object",
+                {"field": field},
+            )
+        head, sep, payload = reference.partition(",")
+        if not sep:
+            raise GatewayAPIError(
+                422,
+                "INVALID_ATTACHMENT_REFERENCE",
+                "attachment reference is not a valid data URI",
+                {"field": field},
+            )
+        header = head[5:] if head.startswith("data:") else head
+        mime = (header.split(";", 1)[0] or "application/octet-stream").strip().lower()
+        if "base64" not in header.lower():
+            raise GatewayAPIError(
+                422,
+                "INVALID_ATTACHMENT_REFERENCE",
+                "attachment reference must be a base64 data URI",
+                {"field": field},
+            )
+        try:
+            data = base64.b64decode(payload)
+        except Exception as exc:
+            raise GatewayAPIError(
+                422,
+                "INVALID_ATTACHMENT_REFERENCE",
+                "attachment reference contains invalid base64 data",
+                {"field": field},
+            ) from exc
+        extension = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/jpg": "jpg",
+            "image/gif": "gif",
+            "image/webp": "webp",
+            "image/bmp": "bmp",
+            "image/svg+xml": "svg",
+            "video/mp4": "mp4",
+            "video/quicktime": "mov",
+            "video/webm": "webm",
+            "video/x-matroska": "mkv",
+            "audio/mpeg": "mp3",
+            "audio/wav": "wav",
+        }.get(mime, "bin")
+        return CLIENT.upload_file_bytes(session, f"ref.{extension}", data, mime)
+
+    for field in INLINE_ATTACHMENT_SINGLE_FIELDS:
+        value = options.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            options[field] = upload_inline(value, field)
+        elif isinstance(value, dict):
+            # Wrapper produced by input_reference -> image mapping, e.g. {"bosUrl": "data:..."}.
+            for key in ("bosUrl", "bos_url", "object", "bosObjectPath", "url"):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.startswith("data:"):
+                    options[field] = upload_inline(candidate, field)
+                    break
+    for field in INLINE_ATTACHMENT_LIST_FIELDS:
+        value = options.get(field)
+        if not isinstance(value, list):
+            continue
+        resolved: List[Any] = []
+        for item in value:
+            if isinstance(item, str):
+                resolved.append(upload_inline(item, field))
+            else:
+                resolved.append(item)
+        options[field] = resolved
+    return options
 
 
 class UpstreamGenerationError(RuntimeError):
@@ -2012,8 +2071,12 @@ def pick_account_for_generation(
     requested_account_id: Optional[int] = None,
     excluded_account_ids: Optional[Iterable[int]] = None,
 ) -> Optional[sqlite3.Row]:
+    """Return first SQL candidate that is explicitly generate_ready."""
     rows = candidate_accounts_for_generation(kind, requested_account_id, excluded_account_ids)
-    return rows[0] if rows else None
+    for row in rows:
+        if account_generate_ready(row):
+            return row
+    return None
 
 
 def select_generation_account(
@@ -2030,8 +2093,16 @@ def select_generation_account(
     )
     last_validation_error: Optional[GatewayAPIError] = None
     balance_misses: List[Dict[str, Any]] = []
+    skipped_not_generate_ready = 0
+    generate_ready_candidates = 0
     eligible: List[Tuple[int, int, int, sqlite3.Row, Dict[str, Any], Dict[str, Any], Optional[int]]] = []
     for candidate_index, account in enumerate(candidates):
+        # Explicit readiness gate (auth + not cooling + healthy + schedulable caps).
+        # Keeps task-cost balance checks separate via account_has_sufficient_balance.
+        if not account_generate_ready(account):
+            skipped_not_generate_ready += 1
+            continue
+        generate_ready_candidates += 1
         caps = capabilities_from_account(account)
         try:
             options = effective_generation_options(body, caps)
@@ -2060,7 +2131,13 @@ def select_generation_account(
             key=lambda item: (item[0], item[1], item[2]),
         )
         return account, caps, options, estimated_point_cost
-    if last_validation_error is not None and not balance_misses and candidates:
+    selection_details = {
+        "candidate_accounts": len(candidates),
+        "generate_ready_candidates": generate_ready_candidates,
+        "skipped_not_generate_ready": skipped_not_generate_ready,
+        "balance_misses": len(balance_misses),
+    }
+    if last_validation_error is not None and not balance_misses and generate_ready_candidates:
         if request_id:
             last_validation_error.request_id = request_id
         raise last_validation_error
@@ -2087,10 +2164,10 @@ def select_generation_account(
             "INSUFFICIENT_POOL_CAPACITY",
             "account pool does not have enough available points",
             {
+                **selection_details,
                 "required_points": required_points,
                 "max_available_points": max_available_points,
                 "known_balance_accounts": len(known_balances),
-                "candidate_accounts": len(candidates),
                 "reserved_points": sum(int_or_default(item.get("reserved_points"), 0) for item in balance_misses),
                 "estimated_ready_days": estimated_ready_days,
             },
@@ -2100,6 +2177,7 @@ def select_generation_account(
         503,
         "NO_ACCOUNT_AVAILABLE",
         "no verified account available with enough balance",
+        selection_details,
         request_id=request_id,
     )
 
@@ -5148,6 +5226,7 @@ def submit_generation_for_account(
         image_config = build_image_config(options)
         request_payload["imageConfig"] = image_config
     else:
+        resolve_inline_attachment_references(options, s)
         model = find_capability_model(caps.get("video", {}).get("models") or [], options.get("model_name") or "") or {}
         video_config = build_video_config(options, model)
         attachments = build_video_message_attachments(options)
@@ -5390,23 +5469,87 @@ def refresh_account_session_and_validate(account_id: int) -> Dict[str, Any]:
         status="pending_validation",
         source=str(account["source"] or "auto"),
     )
-    result = validate_registered_account(account_id)
+    if registration_require_generation_probe():
+        result = validate_registered_account(account_id)
+    else:
+        result = soft_validate_registered_account(account_id)
     mark_account_checkin_at(account_id)
     return result
 
 
+def activate_account_login(account_id: int) -> Dict[str, Any]:
+    """Login with stored password, persist cookies, and soft-verify without generation spend.
+
+    Used for accounts that were registered/imported as verified but never received a usable
+    ``ouss`` session (refresh-balance then stays empty / fails).
+    """
+    account = account_row_by_id(account_id)
+    if account is None:
+        raise RuntimeError("account not found")
+    email = str(account["email"] or "")
+    password = decrypt_secret_value(account["password"], required=True)
+    if not email or not password:
+        raise RuntimeError("account email/password is missing")
+    source = str(account["source"] or "auto")
+    last_error: Optional[BaseException] = None
+    refreshed_session: Optional[OreateSession] = None
+    for attempt in range(1, 4):
+        try:
+            refreshed_session = CLIENT.login(email, password)
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt >= 3:
+                break
+            time.sleep(1.5 * attempt)
+    if refreshed_session is None:
+        raise RuntimeError(f"login failed after 3 attempts: {last_error}") from last_error
+    session = CLIENT.session_from_cookie_dict(refreshed_session.cookies)
+    image_info = CLIENT.fetch_image_models(session)
+    video_info = {
+        "models": CLIENT.fetch_video_models(session),
+        "scenes": CLIENT.fetch_video_scenes(session),
+    }
+    saved_id = save_account(
+        email,
+        password,
+        refreshed_session,
+        model_info=image_info,
+        video_info=video_info,
+        status="pending_validation",
+        source=source,
+    )
+    validation = soft_validate_registered_account(int(saved_id))
+    mark_account_checkin_at(int(saved_id))
+    row = account_row_by_id(int(saved_id))
+    if row is None:
+        raise RuntimeError("account disappeared after activation login")
+    return {
+        "ok": str(row["status"] or "") in {"verified", "active"} and account_has_usable_session(row),
+        "status": str(row["status"] or ""),
+        "mode": "login",
+        "has_session": account_has_usable_session(row),
+        "validation": validation,
+        "item": public_account(row),
+    }
+
+
 def reactivate_account(account_id: int) -> Dict[str, Any]:
-    """Re-login and re-validate an isolated/invalid account so it can rejoin the pool.
+    """Re-login and re-validate an account so it can rejoin / stay usable in the pool.
 
     Gateway ``disabled`` / ``invalid`` are local operational states (usually expired
-    session ``200001``), not proof that Oreate banned the mailbox.
+    session ``200001``), not proof that Oreate banned the mailbox. Verified accounts
+    missing a usable login cookie can also be reactivated via the same path.
     """
     account = account_row_by_id(account_id)
     if account is None:
         raise RuntimeError("account not found")
     status = str(account["status"] or "")
-    if status not in {"disabled", "invalid", "pending_validation"}:
+    if status not in {"disabled", "invalid", "pending_validation", "verified", "active"}:
         raise RuntimeError(f"account status '{status}' does not need reactivation")
+    # Prefer soft login activation: generation probes spend points and often hit 212361.
+    if not registration_require_generation_probe():
+        return activate_account_login(account_id)
     validation = refresh_account_session_and_validate(account_id)
     row = account_row_by_id(account_id)
     if row is None:
@@ -5644,9 +5787,54 @@ def save_and_validate_registered_account(
 
 
 def registration_concurrency() -> int:
-    raw = CFG.get("pool", {}).get("registration_concurrency", 3)
-    value = int_or_default(raw, 3)
+    raw = CFG.get("pool", {}).get("registration_concurrency", 1)
+    value = int_or_default(raw, 1)
     return max(1, min(8, value))
+
+
+def login_and_fetch_capabilities_after_register(
+    email: str,
+    password: str,
+    trace: List[Dict[str, Any]],
+    *,
+    attempts: int = 3,
+    base_backoff_sec: float = 1.5,
+) -> Tuple[OreateSession, Dict[str, Any], Dict[str, Any]]:
+    """Login after email confirm with short retries for transient/without-ouss failures."""
+    last_error: Optional[BaseException] = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            session = CLIENT.login(email, password)
+            sess = CLIENT.session_from_cookie_dict(session.cookies)
+            image_info = CLIENT.fetch_image_models(sess)
+            video_info = {
+                "models": CLIENT.fetch_video_models(sess),
+                "scenes": CLIENT.fetch_video_scenes(sess),
+            }
+            trace.append(
+                {
+                    "step": "login_and_fetch_capabilities",
+                    "attempt": attempt,
+                    "ok": True,
+                }
+            )
+            return session, image_info, video_info
+        except Exception as exc:
+            last_error = exc
+            trace.append(
+                {
+                    "step": "login_and_fetch_capabilities",
+                    "attempt": attempt,
+                    "ok": False,
+                    "error": str(exc)[:500],
+                }
+            )
+            if attempt >= attempts:
+                break
+            time.sleep(base_backoff_sec * attempt)
+    raise RuntimeError(
+        f"login after register failed after {attempts} attempts: {last_error}"
+    ) from last_error
 
 
 def pool_auto_maintain_interval_seconds() -> float:
@@ -5796,14 +5984,14 @@ def register_one_account(
                 report("failed", email)
                 return {
                     "ok": False,
-                    "status": "verify_error",
+                    "status": "mailbox_preflight_failed",
                     "account_id": None,
                     "email": email,
                     "password": password,
                     "signup_status": None,
                     "signup_response": {},
                     "verification": {},
-                    "verification_artifact": {},
+                    "verification_artifact": {"error": detail},
                     "trace": trace,
                     "mailbox": {
                         "address": email,
@@ -5819,14 +6007,14 @@ def register_one_account(
             report("failed", email)
             return {
                 "ok": False,
-                "status": "verify_error",
+                "status": "mailbox_preflight_failed",
                 "account_id": None,
                 "email": email,
                 "password": password,
                 "signup_status": None,
                 "signup_response": {},
                 "verification": {},
-                "verification_artifact": {},
+                "verification_artifact": {"error": detail},
                 "trace": trace,
                 "mailbox": {
                     "address": email,
@@ -5877,13 +6065,9 @@ def register_one_account(
                     trace.append({"step": "emailregisterconfirm", "response": confirm})
                     if confirm.get("status_code") == 200 and confirm.get("response", {}).get("status", {}).get("code") == 0:
                         report("login_and_save", email)
-                        session = CLIENT.login(email, password)
-                        sess = CLIENT.session_from_cookie_dict(session.cookies)
-                        img = CLIENT.fetch_image_models(sess)
-                        vid = {
-                            "models": CLIENT.fetch_video_models(sess),
-                            "scenes": CLIENT.fetch_video_scenes(sess),
-                        }
+                        session, img, vid = login_and_fetch_capabilities_after_register(
+                            email, password, trace
+                        )
                         report("generation_validation", email)
                         account_id, final_status = save_and_validate_registered_account(
                             email,
@@ -5986,13 +6170,9 @@ def register_one_account(
                     confirm_code = confirm.get("response", {}).get("status", {}).get("code")
                     if confirm.get("status_code") == 200 and confirm_code == 0:
                         report("login_and_save", email)
-                        session = CLIENT.login(email, password)
-                        sess = CLIENT.session_from_cookie_dict(session.cookies)
-                        img = CLIENT.fetch_image_models(sess)
-                        vid = {
-                            "models": CLIENT.fetch_video_models(sess),
-                            "scenes": CLIENT.fetch_video_scenes(sess),
-                        }
+                        session, img, vid = login_and_fetch_capabilities_after_register(
+                            email, password, trace
+                        )
                         report("generation_validation", email)
                         account_id, final_status = save_and_validate_registered_account(
                             email,
@@ -6019,13 +6199,9 @@ def register_one_account(
 
                     try:
                         report("login_and_save", email)
-                        session = CLIENT.login(email, password)
-                        sess = CLIENT.session_from_cookie_dict(session.cookies)
-                        img = CLIENT.fetch_image_models(sess)
-                        vid = {
-                            "models": CLIENT.fetch_video_models(sess),
-                            "scenes": CLIENT.fetch_video_scenes(sess),
-                        }
+                        session, img, vid = login_and_fetch_capabilities_after_register(
+                            email, password, trace
+                        )
                         report("generation_validation", email)
                         account_id, final_status = save_and_validate_registered_account(
                             email,
@@ -8623,11 +8799,13 @@ class GatewayGenerateIn(BaseModel):
     duration: Optional[int] = None
     scene_id: Optional[str] = None
     account_id: Optional[int] = None
+    audio: Optional[bool] = None  # updream boolean alias for is_audio
+    input_reference: Optional[Any] = None  # data URI / URL string, or object / list of objects
     image: Optional[Dict[str, Any]] = None
     first_frame: Optional[Dict[str, Any]] = None
     last_frame: Optional[Dict[str, Any]] = None
-    reference_images: Optional[List[Dict[str, Any]]] = None
-    reference_videos: Optional[List[Dict[str, Any]]] = None
+    reference_images: Optional[List[Any]] = None  # strings (data URI/URL) or upload objects
+    reference_videos: Optional[List[Any]] = None  # strings (data URI/URL) or upload objects
     motion_video: Optional[Dict[str, Any]] = None
     character_image: Optional[Dict[str, Any]] = None
     ref_duration: Optional[Any] = None
@@ -9649,6 +9827,9 @@ def gateway_account_status(api_key_id: int = Depends(require_api_key)):
         "invalid_accounts": summary["invalid"],
         "risk_control_accounts": summary["risk_control"],
         "balance_known_accounts": summary["balance_known"],
+        "auth_ready_accounts": summary["auth_ready"],
+        "points_ready_accounts": summary["points_ready"],
+        "generate_ready_accounts": summary["generate_ready"],
     }
 
 
@@ -10458,6 +10639,20 @@ def refresh_account_balance(account_id: int, _=Depends(require_admin)):
         raise HTTPException(503, str(exc))
     row = update_account_balance_snapshot(account_id, detail)
     return {"ok": True, "item": public_account(row)}
+
+
+@app.post("/api/accounts/{account_id}/activate")
+def activate_account_endpoint(account_id: int, _=Depends(require_admin)):
+    """Soft-activate: password login, persist cookies, refresh balance (no generation spend)."""
+    account = account_row_by_id(account_id)
+    if account is None:
+        raise HTTPException(404, "account not found")
+    try:
+        return activate_account_login(account_id)
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 @app.post("/api/accounts/{account_id}/reactivate")

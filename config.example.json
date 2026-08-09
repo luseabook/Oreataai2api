@@ -51,7 +51,7 @@
     "maintain_target": 5,
     "valid_threshold_pct": 1.0,
     "maintain_check_interval": 3600,
-    "registration_concurrency": 3,
+    "registration_concurrency": 1,
     "auto_maintain_max_register": 5,
     "auto_checkin_enabled": true,
     "checkin_timezone": "Asia/Shanghai",

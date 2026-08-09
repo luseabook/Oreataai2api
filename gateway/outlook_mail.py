@@ -850,3 +850,6 @@ class MailRouter:
         if self._provider() != "outlook":
             return
         self.outlook.finish_mailbox(token, status, error)
+
+    def extract_verify_code(self, message: Dict[str, Any]) -> str:
+        return self.yyds.extract_verify_code(message)
