@@ -8,7 +8,9 @@
     "host": "127.0.0.1",
     "port": 8890,
     "admin_username": "admin",
-    "admin_password": "CHANGE_ME"
+    "admin_password": "CHANGE_ME",
+    "encryption_key": "",
+    "admin_session_ttl_hours": 12
   },
   "deployment": {
     "allow_public_bind": false,
@@ -28,12 +30,16 @@
     "default_video_duration": 5,
     "default_video_resolution": "480",
     "default_video_ratio": "16:9",
+    "video_stream_wait_seconds": 60,
+    "video_stream_read_timeout_seconds": 20,
+    "video_hydration_timeout_seconds": 600,
+    "video_hydration_poll_interval_seconds": 10,
     "browser_worker_enabled": false,
     "browser_worker_node": "node",
     "browser_worker_timeout_seconds": 150,
     "browser_worker_readiness_timeout_seconds": 60,
-    "browser_worker_node_modules": "/var/lib/oreateai/browser-worker/node_modules",
-    "chromium_executable": "/usr/bin/chromium-browser"
+    "browser_worker_node_modules": "",
+    "chromium_executable": ""
   },
   "mail": {
     "provider": "yyds",
@@ -89,8 +95,17 @@
     "upload_read_chunk_bytes": 1048576,
     "sync_wait_seconds": 0,
     "sync_wait_max_seconds": 120,
+    "retention_days": 0,
+    "enable_background_worker": true,
+    "task_worker_poll_interval_seconds": 1,
     "worker_shutdown_timeout_seconds": 30,
     "running_task_stale_seconds": 300,
+    "task_hydration_attempt_timeout_seconds": 0,
+    "submitted_task_retry_interval_seconds": 10,
+    "hydrating_task_retry_interval_seconds": 10,
+    "submitted_task_expire_seconds": 600,
+    "hydrating_task_expire_seconds": 600,
+    "model_policies": {},
     "scene_policies": {
       "text_or_image": {
         "enabled": true,
@@ -128,6 +143,9 @@
       "https://canvas.best"
     ],
     "asset_host_allowlist": [
+      "cdn.oreateai.com"
+    ],
+    "asset_insecure_tls_fallback_hosts": [
       "cdn.oreateai.com"
     ]
   }

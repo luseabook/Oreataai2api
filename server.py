@@ -5,10 +5,12 @@ import copy
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import math
 import os
 import secrets
+import socket
 import sqlite3
 import shutil
 import subprocess
@@ -137,7 +139,22 @@ MEDIA_ADMIN_KINDS = {"image", "video"}
 TASK_LIST_STATUSES = {"queued", "running", "submitted", "hydrating", "completed", "failed", "cancelled", "expired"}
 MAX_LIST_LIMIT = 200
 MAX_LIST_OFFSET = 10000
-UNSAFE_ADMIN_PASSWORDS = {"", "admin123", "CHANGE_ME", "changeme", "password"}
+UNSAFE_ADMIN_PASSWORDS = {
+    "",
+    "admin",
+    "admin123",
+    "admin888",
+    "admin999",
+    "admin123456",
+    "CHANGE_ME",
+    "changeme",
+    "password",
+    "password123",
+    "123456",
+    "12345678",
+    "qwerty",
+    "oreateai",
+}
 MAX_CLEAN_ASSET_BYTES = 30 * 1024 * 1024
 REGISTRATION_THREADS_LOCK = threading.Lock()
 REGISTRATION_THREADS: Dict[int, threading.Thread] = {}
@@ -237,6 +254,7 @@ DEFAULT_CONFIG = {
         "upload_read_chunk_bytes": 1048576,
         "sync_wait_seconds": 0,
         "sync_wait_max_seconds": 120,
+        "retention_days": 0,
         "enable_background_worker": True,
         "task_worker_poll_interval_seconds": 1,
         "worker_shutdown_timeout_seconds": 30,
@@ -924,11 +942,30 @@ def balance_snapshot_from_row(row: Optional[Any], prefix: str) -> Optional[Dict[
 def actual_point_cost_from_balance_snapshots(before: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]]) -> Optional[int]:
     if not before or not after:
         return None
-    before_rest = before.get("rest_point")
-    after_rest = after.get("rest_point")
-    if before_rest in (None, "") or after_rest in (None, ""):
+
+    def bucket_delta(key: str) -> Optional[int]:
+        before_value = before.get(key)
+        after_value = after.get(key)
+        if before_value in (None, "") or after_value in (None, ""):
+            return None
+        return max(0, int_or_default(before_value, 0) - int_or_default(after_value, 0))
+
+    rest_delta = bucket_delta("rest_point")
+    if rest_delta is not None:
+        return rest_delta
+    # rest_point is missing or unknown on this account; fall back to the
+    # remaining buckets. If any participating bucket is unknown the total
+    # spend cannot be trusted, so treat it as unknown rather than undercount.
+    daily_delta = bucket_delta("daily_point")
+    bonus_delta = bucket_delta("bonus_point")
+    if daily_delta is None and bonus_delta is None:
         return None
-    return max(0, int_or_default(before_rest, 0) - int_or_default(after_rest, 0))
+    total = 0
+    for value in (daily_delta, bonus_delta):
+        if value is None:
+            return None
+        total += value
+    return total
 
 
 def fetch_account_row(account_id: int) -> Optional[sqlite3.Row]:
@@ -971,6 +1008,84 @@ def extract_token_id_from_link(link: str) -> str:
         return str(token)
     match = re.search(r"[?&]tokenID=([^&#\s\"'<>]+)", cleaned, re.I)
     return unquote(match.group(1)) if match else ""
+
+
+def _link_host_allowed(host: str) -> bool:
+    """Whether a host may be visited by the gateway: no private/loopback/link-local
+    or reserved addresses (SSRF guardrail for email-embedded verification links)."""
+    host = str(host or "").strip().lower().rstrip(".")
+    if not host or host == "localhost":
+        return False
+    try:
+        parsed_host = ipaddress.ip_address(host)
+    except ValueError:
+        parsed_host = None
+    if parsed_host is not None:
+        return not (
+            parsed_host.is_private
+            or parsed_host.is_loopback
+            or parsed_host.is_link_local
+            or parsed_host.is_reserved
+            or parsed_host.is_multicast
+            or parsed_host.is_unspecified
+        )
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            return False
+    return True
+
+
+def visit_verification_link(link: str) -> Optional[int]:
+    """Visit an email verification link with SSRF guardrails.
+
+    Only https URLs with non-private, non-loopback hosts are followed; every
+    redirect hop is re-validated. Returns the final status code, or None when
+    the link is not visitable.
+    """
+    current = str(link or "").strip()
+    try:
+        for _ in range(4):
+            parsed = urlparse(current)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+            ):
+                return None
+            if not _link_host_allowed(parsed.hostname):
+                return None
+            response = requests.get(
+                current,
+                verify=tls_verify_enabled(),
+                timeout=10,
+                allow_redirects=False,
+            )
+            if response.status_code not in {301, 302, 303, 307, 308}:
+                return response.status_code
+            location = str(response.headers.get("location") or "").strip()
+            response.close()
+            if not location:
+                return None
+            current = urljoin(current, location)
+        return None
+    except requests.RequestException:
+        return None
 
 
 def is_unsafe_admin_password(password: str) -> bool:
@@ -1033,6 +1148,39 @@ def scene_policy_for(scene_id: str) -> Dict[str, Any]:
     return default_policy
 
 
+def point_cost_int(value: Any) -> Optional[int]:
+    """Return a non-negative integer point cost, or None when malformed."""
+    if value in (None, ""):
+        return None
+    try:
+        point = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    if point < 0:
+        return None
+    return point
+
+
+def normalize_point_cost_items(value: Any) -> List[Dict[str, Any]]:
+    """Sanitize upstream point-cost rows so billing only sees clean numeric costs.
+
+    Items that are not dicts or whose ``point`` is not a non-negative integer are
+    dropped.  Other keys (duration/resolution/audio/motDuration/refDuration/aiType)
+    are preserved for cost matching.  Both the public catalog and the execution
+    path consume the same normalized rows, so they cannot disagree.
+    """
+    if not isinstance(value, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        if point_cost_int(item.get("point")) is None:
+            continue
+        out.append(dict(item))
+    return out
+
+
 def normalize_image_models(image_info: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     models = []
     factories = (image_info or {}).get("data", {}).get("factory", [])
@@ -1056,7 +1204,7 @@ def normalize_image_models(image_info: Optional[Dict[str, Any]]) -> List[Dict[st
                 "icon": model.get("modelIcon") or factory.get("modelIcon") or "",
                 "resolutions": model.get("resolution") if isinstance(model.get("resolution"), list) else [],
                 "ratios": normalize_ratios(model.get("size")),
-                "point_cost": model.get("pointCost") if isinstance(model.get("pointCost"), list) else [],
+                "point_cost": normalize_point_cost_items(model.get("pointCost")),
                 "enabled": bool(policy.get("enabled", True)),
                 "experimental": bool(policy.get("experimental", False)),
                 "verification_status": str(policy.get("verification_status") or default_model_verification_status("image")),
@@ -1088,9 +1236,9 @@ def normalize_video_models(video_info: Optional[Dict[str, Any]]) -> List[Dict[st
             "ratios": normalize_ratios(model.get("videoSize")),
             "supports_audio": bool(model.get("supportAudio")),
             "supports_modify_size": bool(model.get("supportModifySize")),
-            "point_cost_image": model.get("pointCostImage") if isinstance(model.get("pointCostImage"), list) else [],
-            "point_cost_reference": model.get("pointCostReference") if isinstance(model.get("pointCostReference"), list) else [],
-            "point_cost_motion": model.get("pointCostMotion") if isinstance(model.get("pointCostMotion"), list) else [],
+            "point_cost_image": normalize_point_cost_items(model.get("pointCostImage")),
+            "point_cost_reference": normalize_point_cost_items(model.get("pointCostReference")),
+            "point_cost_motion": normalize_point_cost_items(model.get("pointCostMotion")),
             "enabled": bool(policy.get("enabled", True)),
             "experimental": bool(policy.get("experimental", False)),
             "verification_status": str(policy.get("verification_status") or default_model_verification_status("video")),
@@ -1214,6 +1362,21 @@ def scope_values_from_db(raw: Any, field: str) -> List[Any]:
 
 def migrate_plaintext_account_secrets(conn: sqlite3.Connection) -> None:
     if not active_encryption_key():
+        rows = conn.execute("SELECT id,password,ouid,ouss FROM accounts").fetchall()
+        plaintext = [
+            (row["id"], field)
+            for row in rows
+            for field in ACCOUNT_SECRET_FIELDS
+            if row[field] not in (None, "") and not is_encrypted_secret(row[field])
+        ]
+        if plaintext:
+            # Refuse to serve with plaintext credentials and no key: silently
+            # falling back would leave account passwords readable at rest
+            # (P2-15 fix).
+            raise RuntimeError(
+                "server encryption key is not configured but plaintext account secrets exist; "
+                "export OREATE_ENCRYPTION_KEY before starting"
+            )
         return
     rows = conn.execute("SELECT id,password,ouid,ouss FROM accounts").fetchall()
     for row in rows:
@@ -1408,9 +1571,9 @@ def estimate_point_cost(kind: str, options: Dict[str, Any], caps: Dict[str, Any]
         if not isinstance(item, dict):
             continue
         if kind == "image" and item.get("resolution") == options.get("resolution"):
-            return item.get("point")
+            return point_cost_int(item.get("point"))
         if kind == "video" and cost_item_matches_options(item, options):
-            return item.get("point")
+            return point_cost_int(item.get("point"))
     return None
 
 
@@ -1669,6 +1832,14 @@ def resolve_inline_attachment_references(options: Dict[str, Any], session: Any) 
                 "attachment reference contains invalid base64 data",
                 {"field": field},
             ) from exc
+        max_bytes = max(1, int_or_default(gateway_cfg().get("upload_max_bytes"), 104857600))
+        if len(data) > max_bytes:
+            raise GatewayAPIError(
+                413,
+                "UPLOAD_TOO_LARGE",
+                "inline attachment exceeds the configured size limit",
+                {"field": field, "max_bytes": max_bytes},
+            )
         extension = {
             "image/png": "png",
             "image/jpeg": "jpg",
@@ -1741,6 +1912,13 @@ def find_idempotency_record(api_key_id: int, idempotency_key: str) -> Optional[s
     return row
 
 
+# A reserved (status_code=0) idempotency record is only valid for the lifetime
+# of the admitting request. If the process dies after reserve but before
+# save/release, the stale reservation must expire so the client can retry the
+# same key instead of getting a permanent 409 (P2-5 fix).
+IDEMPOTENCY_RESERVATION_TIMEOUT_SECONDS = 60.0
+
+
 def reserve_idempotency_record(
     api_key_id: int,
     idempotency_key: str,
@@ -1762,12 +1940,16 @@ def reserve_idempotency_record(
         if row and (ttl_hours <= 0 or float_or_default(row["created_at"], 0) >= cutoff):
             record = dict(row)
             if record.get("request_hash") != request_hash:
-                state = "conflict"
-            elif int(record.get("status_code") or 0) > 0:
-                state = "replay"
-            else:
-                state = "pending"
-            return {"state": state, "record": record}
+                return {"state": "conflict", "record": record}
+            if int(record.get("status_code") or 0) > 0:
+                return {"state": "replay", "record": record}
+            if (
+                current - float_or_default(record.get("created_at"), current)
+                <= IDEMPOTENCY_RESERVATION_TIMEOUT_SECONDS
+            ):
+                return {"state": "pending", "record": record}
+            # Stale reservation from a crashed process: fall through and take
+            # it over inside the write transaction below.
 
         conn.execute("BEGIN IMMEDIATE")
         if ttl_hours > 0:
@@ -1785,6 +1967,32 @@ def reserve_idempotency_record(
                 state = "conflict"
             elif int(record.get("status_code") or 0) > 0:
                 state = "replay"
+            elif (
+                current - float_or_default(record.get("created_at"), current)
+                > IDEMPOTENCY_RESERVATION_TIMEOUT_SECONDS
+            ):
+                # Take over the stale reservation left by a crashed process.
+                conn.execute(
+                    """
+                    DELETE FROM idempotency_keys
+                    WHERE api_key_id=? AND idempotency_key=? AND request_hash=? AND status_code=0
+                    """,
+                    (api_key_id, idempotency_key, record.get("request_hash")),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO idempotency_keys(
+                        api_key_id,idempotency_key,request_hash,status_code,response_json,task_id,created_at
+                    ) VALUES(?,?,?,?,?,?,?)
+                    """,
+                    (api_key_id, idempotency_key, request_hash, 0, "{}", None, current),
+                )
+                row = conn.execute(
+                    "SELECT * FROM idempotency_keys WHERE api_key_id=? AND idempotency_key=?",
+                    (api_key_id, idempotency_key),
+                ).fetchone()
+                conn.commit()
+                return {"state": "reserved", "record": dict(row) if row else None}
             else:
                 state = "pending"
             conn.commit()
@@ -1896,6 +2104,95 @@ def request_uses_uploaded_media(options: Dict[str, Any]) -> bool:
     return False
 
 
+def validate_attachment_ownership(
+    body: Any,
+    api_key_id: int,
+    request_id: str,
+) -> None:
+    """Enforce tenant isolation for every object-path attachment on a request.
+
+    Mirrors the ownership check OpenAI ``input_reference`` already performs in
+    ``resolve_uploaded_input_reference``: every attachment object path must exist
+    in ``uploaded_media`` for this API key with status ``completed``, and all
+    attachments must originate from the same uploaded-media account. Inline data
+    URIs (``data:`` strings) are allowed and are size-bounded when the worker
+    resolves them; any other bare string is rejected here instead of reaching
+    the worker.
+    """
+    items: List[tuple[str, Dict[str, Any]]] = []
+    for field in INLINE_ATTACHMENT_SINGLE_FIELDS:
+        value = getattr(body, field, None)
+        if value is None:
+            continue
+        if isinstance(value, dict) and value:
+            items.append((field, value))
+        elif isinstance(value, str) and value.startswith("data:"):
+            continue
+        elif isinstance(value, str) and value:
+            raise GatewayAPIError(
+                422,
+                "INVALID_ATTACHMENT_REFERENCE",
+                "attachment reference must be a data URI or an uploaded object",
+                {"field": field},
+                request_id=request_id,
+            )
+    for field in INLINE_ATTACHMENT_LIST_FIELDS:
+        for value in getattr(body, field, None) or []:
+            if isinstance(value, dict) and value:
+                items.append((field, value))
+            elif isinstance(value, str) and value.startswith("data:"):
+                continue
+            else:
+                raise GatewayAPIError(
+                    422,
+                    "INVALID_ATTACHMENT_REFERENCE",
+                    f"{field} items must be data URIs or uploaded objects",
+                    {"field": field},
+                    request_id=request_id,
+                )
+    if not items:
+        return
+    account_ids: set[int] = set()
+    conn = db_conn()
+    try:
+        for field, item in items:
+            object_path = upload_object_value(item)
+            if object_path.startswith("data:"):
+                # Inline data URI wrapper (e.g. {"bosUrl": "data:..."} from the
+                # OpenAI input_reference mapping); size-bounded when resolved.
+                continue
+            if not object_path:
+                raise GatewayAPIError(
+                    422,
+                    "MISSING_VIDEO_ATTACHMENT",
+                    f"{field} must contain an uploaded object path",
+                    {"field": field},
+                    request_id=request_id,
+                )
+            row = conn.execute(
+                "SELECT account_id, status FROM uploaded_media WHERE api_key_id=? AND object_path=?",
+                (api_key_id, object_path),
+            ).fetchone()
+            if not row or str(row["status"] or "") != "completed":
+                raise GatewayAPIError(
+                    403,
+                    "UPLOAD_NOT_OWNED",
+                    f"{field} references an upload that does not belong to this API key",
+                    {"field": field},
+                    request_id=request_id,
+                )
+            account_ids.add(int(row["account_id"]))
+    finally:
+        conn.close()
+    if account_ids and len(account_ids) != 1:
+        raise GatewayAPIError(
+            422,
+            "ATTACHMENT_ACCOUNT_MISMATCH",
+            "attachments must originate from the same uploaded-media account",
+            request_id=request_id,
+        )
+
+
 def enforce_api_key_scope(policy: Dict[str, Any], kind: str, options: Dict[str, Any], caps: Dict[str, Any], request_id: str) -> None:
     allowed_kinds = policy.get("allowed_kinds") or []
     if allowed_kinds and kind not in allowed_kinds:
@@ -1935,13 +2232,35 @@ def enforce_api_key_scope(policy: Dict[str, Any], kind: str, options: Dict[str, 
             raise GatewayAPIError(403, "API_KEY_EXPERIMENTAL_FORBIDDEN", "API key is not allowed to use experimental scenes", {"field": "scene_id", "value": scene.get("scene_id")}, request_id=request_id)
 
 
+def _rate_bucket_after_window(api_key_id: int, now: float) -> List[Tuple[Optional[str], float]]:
+    """Active-window bucket entries (token, timestamp) for a key.
+
+    Returns the raw entries so callers can re-append and store them unchanged;
+    converting to bare timestamps here would mix floats and tuples in the
+    bucket. Caller must hold RATE_BUCKETS_LOCK.
+    """
+    window_start = now - 60
+    return [entry for entry in RATE_BUCKETS.get(api_key_id, []) if entry[1] >= window_start]
+
+
+def _prune_rate_state(now: float) -> None:
+    """Drop reservations that fell out of the 60s window. Caller must hold RATE_BUCKETS_LOCK."""
+    window_start = now - 60
+    for token in [
+        token
+        for token, (_api_key_id, reserved_at) in RATE_RESERVATIONS.items()
+        if reserved_at < window_start
+    ]:
+        RATE_RESERVATIONS.pop(token, None)
+
+
 def check_rate_limit(api_key_id: int, policy: Dict[str, int], now: float, request_id: str) -> None:
     limit = policy.get("rate_limit_per_minute") or 0
     if limit <= 0:
         return
     with RATE_BUCKETS_LOCK:
-        window_start = now - 60
-        bucket = [t for t in RATE_BUCKETS.get(api_key_id, []) if t >= window_start]
+        _prune_rate_state(now)
+        bucket = _rate_bucket_after_window(api_key_id, now)
         if len(bucket) >= limit:
             RATE_BUCKETS[api_key_id] = bucket
             raise GatewayAPIError(
@@ -1951,8 +2270,103 @@ def check_rate_limit(api_key_id: int, policy: Dict[str, int], now: float, reques
                 {"rate_limit_per_minute": limit},
                 request_id=request_id,
             )
-        bucket.append(now)
+        bucket.append((None, now))
         RATE_BUCKETS[api_key_id] = bucket
+
+
+def reserve_rate_limit(api_key_id: int, policy: Dict[str, int], now: float, request_id: str) -> Optional[str]:
+    """Atomically reserve one rate-limit slot before an upstream upload.
+
+    Reuses the same 60s window logic as check_rate_limit(): when a slot is
+    available one timestamp is appended and a reservation token is returned.
+    Raises GatewayAPIError(429, "RATE_LIMITED") when no slot is available, and
+    returns None when rate limiting is disabled for the key. The caller must
+    pair the token with consume_rate_limit_for_request() at admission, or
+    release_rate_limit_for_request() on failure.
+    """
+    limit = policy.get("rate_limit_per_minute") or 0
+    if limit <= 0:
+        return None
+    with RATE_BUCKETS_LOCK:
+        _prune_rate_state(now)
+        bucket = _rate_bucket_after_window(api_key_id, now)
+        if len(bucket) >= limit:
+            RATE_BUCKETS[api_key_id] = bucket
+            raise GatewayAPIError(
+                429,
+                "RATE_LIMITED",
+                "API key rate limit exceeded",
+                {"rate_limit_per_minute": limit},
+                request_id=request_id,
+            )
+        token = "rate_" + secrets.token_hex(16)
+        bucket.append((token, now))
+        RATE_BUCKETS[api_key_id] = bucket
+        RATE_RESERVATIONS[token] = (api_key_id, now)
+        return token
+
+
+RATE_RESERVATION_STATE_ATTR = "_rate_reservation_token"
+
+
+def reserve_rate_limit_for_request(
+    request: Request,
+    api_key_id: int,
+    policy: Dict[str, int],
+    now: float,
+    request_id: str,
+) -> Optional[str]:
+    """Reserve a rate slot and pin it to this request so admission can consume it."""
+    token = reserve_rate_limit(api_key_id, policy, now, request_id)
+    if token is not None:
+        setattr(request.state, RATE_RESERVATION_STATE_ATTR, token)
+    return token
+
+
+def consume_rate_limit_for_request(request: Request, api_key_id: int, request_id: str) -> bool:
+    """Consume a previously reserved rate slot at admission without re-counting.
+
+    Returns True when a valid reservation was consumed. Returns False when there
+    is no reservation (or it was already released, or pruned after aging out of
+    the 60s window), so the caller falls back to check_rate_limit().
+    """
+    token = getattr(request.state, RATE_RESERVATION_STATE_ATTR, None)
+    if not token:
+        return False
+    delattr(request.state, RATE_RESERVATION_STATE_ATTR)
+    with RATE_BUCKETS_LOCK:
+        reservation = RATE_RESERVATIONS.pop(token, None)
+    if reservation is None:
+        return False
+    reserved_api_key_id, _reserved_at = reservation
+    return reserved_api_key_id == api_key_id
+
+
+def release_rate_limit_for_request(request: Request) -> None:
+    """Release an unconsumed reservation and drop its timestamp from the bucket.
+
+    Removes exactly one timestamp equal to the reservation's, so duplicate
+    timestamps in the bucket are handled correctly. No-op when the reservation
+    was already consumed at admission or never made.
+    """
+    token = getattr(request.state, RATE_RESERVATION_STATE_ATTR, None)
+    if not token:
+        return
+    delattr(request.state, RATE_RESERVATION_STATE_ATTR)
+    with RATE_BUCKETS_LOCK:
+        reservation = RATE_RESERVATIONS.pop(token, None)
+        if reservation is None:
+            return
+        reserved_api_key_id, _reserved_at = reservation
+        # Bucket entries are (reservation_token, timestamp) pairs; delete the
+        # exact entry for this token so a duplicate timestamp from another
+        # reservation is never removed (P3 rate-release fix).
+        bucket = [
+            entry
+            for entry in RATE_BUCKETS.get(reserved_api_key_id, [])
+            if entry[0] != token
+        ]
+        RATE_BUCKETS[reserved_api_key_id] = bucket
 
 
 def day_start_timestamp(now: float) -> float:
@@ -2094,6 +2508,7 @@ def select_generation_account(
     last_validation_error: Optional[GatewayAPIError] = None
     balance_misses: List[Dict[str, Any]] = []
     skipped_not_generate_ready = 0
+    unpriced_candidates = 0
     generate_ready_candidates = 0
     eligible: List[Tuple[int, int, int, sqlite3.Row, Dict[str, Any], Dict[str, Any], Optional[int]]] = []
     for candidate_index, account in enumerate(candidates):
@@ -2111,6 +2526,12 @@ def select_generation_account(
             last_validation_error = exc
             continue
         estimated_point_cost = estimate_point_cost(body.kind, options, caps)
+        if estimated_point_cost is None:
+            # A supported capability combination without a matching cost row must
+            # never be admitted as a zero-cost task: skip this account's cached
+            # capabilities and fail the request if nothing can be priced.
+            unpriced_candidates += 1
+            continue
         if not account_has_sufficient_balance(account, estimated_point_cost):
             balance_misses.append(
                 {
@@ -2135,8 +2556,30 @@ def select_generation_account(
         "candidate_accounts": len(candidates),
         "generate_ready_candidates": generate_ready_candidates,
         "skipped_not_generate_ready": skipped_not_generate_ready,
+        "unpriced_candidates": unpriced_candidates,
         "balance_misses": len(balance_misses),
     }
+    if unpriced_candidates and not balance_misses:
+        # All usable candidates advertise the capability but lack a matching
+        # cost row. Refuse to queue a task whose spend cannot be determined.
+        try:
+            options = effective_generation_options(body, capabilities_from_account(candidates[0]))
+        except Exception:
+            options = {}
+        raise GatewayAPIError(
+            503,
+            "POINT_COST_UNAVAILABLE",
+            "point cost is unavailable for the requested model and parameter combination",
+            {
+                **selection_details,
+                "model_name": options.get("model_name"),
+                "kind": body.kind,
+                "scene_id": options.get("scene_id") if body.kind == "video" else "",
+                "resolution": options.get("resolution"),
+                "duration": options.get("duration") if body.kind == "video" else None,
+            },
+            request_id=request_id,
+        )
     if last_validation_error is not None and not balance_misses and generate_ready_candidates:
         if request_id:
             last_validation_error.request_id = request_id
@@ -2231,50 +2674,59 @@ def mark_account_failure(account_id: int, error: Exception) -> None:
     code = upstream_error_code(error)
     last_error = account_failure_message(error, code)[:500]
     conn = db_conn()
-    row = conn.execute("SELECT COALESCE(failure_count, 0) as failure_count FROM accounts WHERE id=?", (account_id,)).fetchone()
-    if code == "110012" or code in GATEWAY_ENVIRONMENT_ERROR_CODES:
+    try:
+        # Atomic read-modify-write: concurrent failures must not lose counts
+        # (P2-6 fix).
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT COALESCE(failure_count, 0) as failure_count FROM accounts WHERE id=?", (account_id,)).fetchone()
+        if code == "110012" or code in GATEWAY_ENVIRONMENT_ERROR_CODES:
+            conn.execute(
+                "UPDATE accounts SET last_error=?, updated_at=? WHERE id=?",
+                (last_error, now, account_id),
+            )
+            conn.commit()
+            return
+        next_failure_count = (row["failure_count"] if row else 0) + 1
+        if code == "200001":
+            conn.execute(
+                "UPDATE accounts SET status='invalid', failure_count=?, cooldown_until=NULL, last_error=?, updated_at=? WHERE id=?",
+                (next_failure_count, last_error, now, account_id),
+            )
+            conn.commit()
+            return
+        if code in account_failover_error_codes():
+            cooldown_seconds = max(
+                1,
+                int_or_default(
+                    gateway_cfg().get("account_risk_quarantine_seconds"),
+                    3600,
+                ),
+            )
+        else:
+            cooldown_seconds = max(
+                1,
+                int_or_default(gateway_cfg().get("account_cooldown_seconds"), 300),
+            ) * min(next_failure_count, 6)
         conn.execute(
-            "UPDATE accounts SET last_error=?, updated_at=? WHERE id=?",
-            (last_error, now, account_id),
+            "UPDATE accounts SET failure_count=?, cooldown_until=?, last_error=?, updated_at=? WHERE id=?",
+            (next_failure_count, now + cooldown_seconds, last_error, now, account_id),
         )
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-        return
-    next_failure_count = (row["failure_count"] if row else 0) + 1
-    if code == "200001":
-        conn.execute(
-            "UPDATE accounts SET status='invalid', failure_count=?, cooldown_until=NULL, last_error=?, updated_at=? WHERE id=?",
-            (next_failure_count, last_error, now, account_id),
-        )
-        conn.commit()
-        conn.close()
-        return
-    if code in account_failover_error_codes():
-        cooldown_seconds = max(
-            1,
-            int_or_default(
-                gateway_cfg().get("account_risk_quarantine_seconds"),
-                3600,
-            ),
-        )
-    else:
-        cooldown_seconds = max(
-            1,
-            int_or_default(gateway_cfg().get("account_cooldown_seconds"), 300),
-        ) * min(next_failure_count, 6)
-    conn.execute(
-        "UPDATE accounts SET failure_count=?, cooldown_until=?, last_error=?, updated_at=? WHERE id=?",
-        (next_failure_count, now + cooldown_seconds, last_error, now, account_id),
-    )
-    conn.commit()
-    conn.close()
 
 
 CFG = load_config()
 ADMIN_TOKENS: Dict[str, str] = {}
-WS_CLIENTS: List[WebSocket] = []
-RATE_BUCKETS: Dict[int, List[float]] = {}
+RATE_BUCKETS: Dict[int, List[Tuple[Optional[str], float]]] = {}
 RATE_BUCKETS_LOCK = threading.Lock()
+# Reservation token -> (api_key_id, reserved_at). Guards the window between a
+# multipart rate-limit reservation (before upstream upload) and its consumption
+# at task admission; entries age out with the 60s bucket window.
+RATE_RESERVATIONS: Dict[str, Tuple[int, float]] = {}
 REQUEST_ADMISSION_LOCK = threading.Lock()
 TASK_WORKER_LOCK = threading.Lock()
 TASK_WORKER_THREAD: Optional[threading.Thread] = None
@@ -2282,6 +2734,11 @@ TASK_WORKER_STOP = threading.Event()
 TASK_WORKER_WAKE = threading.Event()
 APPLICATION_WORKER_LOCK: Optional[SingleWorkerLock] = None
 APP_LIFECYCLE_STARTED = False
+# Admin login brute-force protection (single-worker in-memory state).
+ADMIN_LOGIN_MAX_FAILURES = 5
+ADMIN_LOGIN_LOCKOUT_SECONDS = 900.0
+ADMIN_LOGIN_FAILURES: Dict[str, List[float]] = {}
+ADMIN_LOGIN_LOCK = threading.Lock()
 
 
 def db_conn():
@@ -2774,26 +3231,14 @@ def restore_gateway_risk_misclassified_accounts() -> int:
         conn.close()
 
 
-async def broadcast(msg: Dict[str, Any]):
-    dead = []
-    for ws in WS_CLIENTS:
-        try:
-            await ws.send_json(msg)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        try:
-            WS_CLIENTS.remove(ws)
-        except ValueError:
-            pass
-
-
 def emit_log(level: str, message: str):
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(broadcast({"type": "log", "time": time.strftime("%H:%M:%S"), "level": level, "message": message}))
-    except RuntimeError:
-        pass
+    """Emit an operational log line.
+
+    The unauthenticated /ws broadcast channel was removed; this stays a plain
+    stdout logger (collected by the process manager) so background-thread call
+    sites never lose events.
+    """
+    print(f"[{level}] {message}", flush=True)
 
 
 class ServerSettingsIn(BaseModel):
@@ -2956,6 +3401,46 @@ class AccountReserveTargetIn(BaseModel):
 
 class AccountZombiePurgeIn(BaseModel):
     confirm: bool = False
+
+
+class HistoricalPruneIn(BaseModel):
+    days: Optional[float] = Field(default=None, ge=0, le=3650)
+
+
+def prune_historical_records(days: float, now: Optional[float] = None) -> Dict[str, Any]:
+    """Delete terminal tasks (and their attempts/usage rows) older than ``days``.
+
+    Conservative by design: only terminal tasks are eligible, uploaded media and
+    idempotency records are left untouched, and a retention of 0 disables
+    pruning entirely. Callers decide the retention window.
+    """
+    cutoff = (time.time() if now is None else float(now)) - max(0.0, float(days)) * 86400
+    conn = db_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        task_ids = [
+            int(row[0])
+            for row in conn.execute(
+                """
+                SELECT id FROM tasks
+                WHERE status IN ('completed', 'failed', 'cancelled', 'expired')
+                  AND COALESCE(finished_at, updated_at) < ?
+                """,
+                (cutoff,),
+            ).fetchall()
+        ]
+        if task_ids:
+            placeholders = ", ".join("?" for _ in task_ids)
+            conn.execute(f"DELETE FROM task_attempts WHERE task_id IN ({placeholders})", task_ids)
+            conn.execute(f"DELETE FROM usage_log WHERE task_id IN ({placeholders})", task_ids)
+            conn.execute(f"DELETE FROM tasks WHERE id IN ({placeholders})", task_ids)
+        conn.commit()
+        return {"ok": True, "deleted_tasks": len(task_ids)}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 configure_oreate_client_defaults(
@@ -4129,7 +4614,11 @@ def recover_stale_running_tasks(
                 """
                 UPDATE usage_log
                 SET status='expired', response_summary=?, error_code='WORKER_LOST', status_code=503
-                WHERE task_id=?
+                WHERE id=(
+                    SELECT id FROM usage_log
+                    WHERE task_id=?
+                    ORDER BY id DESC LIMIT 1
+                )
                 """,
                 (message[:200], task_id),
             )
@@ -4412,31 +4901,50 @@ def cancel_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "t
 
 def expire_task_attempt(task: Dict[str, Any], attempt_id: int, message: str = "task expired while waiting for upstream assets") -> None:
     now = time.time()
-    update_task_attempt(
-        attempt_id,
-        status="expired",
-        error_code="TASK_EXPIRED",
-        error_message=message,
-        assets_json=[],
-        finished_at=now,
-    )
-    update_task_record(
-        task["id"],
-        status="expired",
-        error_code="TASK_EXPIRED",
-        error_message=message,
-        finished_at=now,
-        next_attempt_at=None,
-    )
-    if task.get("api_key_id"):
-        update_usage_log_for_task(
-            task["id"],
-            task.get("api_key_id"),
-            status="expired",
-            response_summary=message,
-            error_code="TASK_EXPIRED",
-            status_code=504,
+    conn = db_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        # CAS: never let expiry overwrite a cancellation that committed between
+        # the worker's expiry check and this update.
+        task_update = conn.execute(
+            """
+            UPDATE tasks
+            SET status='expired', error_code='TASK_EXPIRED', error_message=?,
+                finished_at=?, next_attempt_at=NULL, updated_at=?
+            WHERE id=? AND status IN ('submitted', 'hydrating') AND cancel_requested_at IS NULL
+            """,
+            (message, now, now, task["id"]),
         )
+        if task_update.rowcount != 1:
+            conn.rollback()
+            return
+        attempt_update = conn.execute(
+            """
+            UPDATE task_attempts
+            SET status='expired', error_code='TASK_EXPIRED', error_message=?, assets_json=?, finished_at=?
+            WHERE id=? AND task_id=? AND status='running'
+            """,
+            (message, encode_json_value([]), now, attempt_id, task["id"]),
+        )
+        if attempt_update.rowcount != 1:
+            conn.rollback()
+            return
+        if task.get("api_key_id"):
+            conn.execute(
+                """
+                UPDATE usage_log
+                SET status='expired', response_summary=?, error_code='TASK_EXPIRED', status_code=504
+                WHERE id=(
+                    SELECT id FROM usage_log
+                    WHERE task_id=? AND api_key_id=?
+                    ORDER BY id DESC LIMIT 1
+                )
+                """,
+                (message[:200], task["id"], task.get("api_key_id")),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def run_generation_attempt(task: sqlite3.Row, attempt_id: int) -> Dict[str, Any]:
@@ -4553,12 +5061,18 @@ def finalize_task_attempt(task: sqlite3.Row, attempt_id: int, phase: str, result
     if expected_status is None:
         raise ValueError(f"unsupported task attempt phase: {phase}")
     task_id = int(task["id"])
+    # Failure finalization must not erase a persisted upstream response: keep
+    # the stored value when the attempt result carries none (e.g. a failed
+    # attempt that already received an upstream response before erroring).
+    response_json = result.get("response_json")
+    if response_json is None:
+        response_json = json_value_from_db(task.get("response_json")) or {}
     task_fields = {
         "status": status,
         "account_id": result.get("account_id", task.get("account_id")),
         "chat_id": result.get("chat_id", task.get("chat_id") or ""),
         "focus_id": result.get("focus_id", task.get("focus_id") or ""),
-        "response_json": result.get("response_json"),
+        "response_json": response_json,
         "assets_json": result.get("assets") or [],
         "error_code": result.get("error_code") or "",
         "error_message": result.get("error_message") or "",
@@ -4709,10 +5223,9 @@ def schedule_task_account_failover(
             SET status='queued', account_id=?, model_name=?, scene_id=?, resolution=?, ratio=?,
                 duration=?, estimated_point_cost=?, response_json=?, assets_json=?,
                 chat_id='', focus_id='', error_code='', error_message='',
-                balance_before_json=NULL, balance_after_json=NULL,
-                balance_before_rest_point=NULL, balance_before_daily_point=NULL,
-                balance_before_bonus_point=NULL, balance_after_rest_point=NULL,
-                balance_after_daily_point=NULL, balance_after_bonus_point=NULL,
+                balance_after_json=NULL,
+                balance_after_rest_point=NULL, balance_after_daily_point=NULL,
+                balance_after_bonus_point=NULL,
                 actual_point_cost=NULL, next_attempt_at=NULL, finished_at=NULL, updated_at=?
             WHERE id=? AND status='running' AND cancel_requested_at IS NULL
             """,
@@ -4752,11 +5265,22 @@ def schedule_task_account_failover(
             conn.rollback()
             return False
         if task.get("api_key_id"):
+            # Preserve the first account's spend on the original usage row instead
+            # of overwriting it: each retry is a separate billable attempt. The new
+            # attempt gets its own usage row so finalization only touches that row.
+            original_account_id = task.get("account_id")
+            before_snapshot = balance_snapshot_from_row(task, "balance_before") or {}
+            after_snapshot = None
+            if original_account_id:
+                original_account = fetch_account_row(int(original_account_id))
+                if original_account:
+                    after_snapshot = capture_account_balance_snapshot(original_account)
+            actual_spend = actual_point_cost_from_balance_snapshots(before_snapshot, after_snapshot)
             conn.execute(
                 """
                 UPDATE usage_log
-                SET account_id=?, status='queued', response_summary=?,
-                    error_code='', estimated_point_cost=?, actual_point_cost=NULL, status_code=202
+                SET status='failed', response_summary=?, error_code=?,
+                    actual_point_cost=?, status_code=503
                 WHERE id=(
                     SELECT id FROM usage_log
                     WHERE task_id=? AND api_key_id=?
@@ -4764,12 +5288,30 @@ def schedule_task_account_failover(
                 )
                 """,
                 (
-                    account["id"],
-                    f"账号异常，正在切换账号重试（上游错误 {code}）"[:200],
-                    estimated_point_cost,
+                    f"账号异常，切换账号重试（上游错误 {code}）"[:200],
+                    code,
+                    actual_spend,
                     task_id,
                     task.get("api_key_id"),
                 ),
+            )
+            insert_usage_log(
+                conn,
+                task.get("api_key_id"),
+                str(task.get("kind") or ""),
+                account["id"],
+                str(task.get("prompt") or ""),
+                "queued",
+                "failover attempt on a different account",
+                task_id=task_id,
+                request_id=str(task.get("request_id") or ""),
+                model_name=str(task.get("model_name") or ""),
+                scene_id=str(task.get("scene_id") or ""),
+                resolution=str(task.get("resolution") or ""),
+                ratio=str(task.get("ratio") or ""),
+                duration=task.get("duration"),
+                estimated_point_cost=estimated_point_cost,
+                status_code=202,
             )
         conn.commit()
         TASK_WORKER_WAKE.set()
@@ -4783,8 +5325,8 @@ def schedule_task_account_failover(
 
 def execute_task(task: sqlite3.Row) -> bool:
     phase = "generation" if task.get("status") == "running" else "hydration"
-    attempt_id = create_task_attempt(task, phase, status="running")
     try:
+        attempt_id = create_task_attempt(task, phase, status="running")
         if task_cancel_requested(task["id"]):
             raise TaskCancelledError("task cancelled")
         if phase == "hydration" and task_expired(task):
@@ -4816,8 +5358,9 @@ def execute_task(task: sqlite3.Row) -> bool:
             result_payload.update(balance_snapshot_fields(balance_after, "balance_after"))
             if status == "completed":
                 mark_account_success(result["account_id"])
-            else:
-                mark_account_success(result["account_id"])
+            # 'submitted' means the upstream accepted the generation but assets
+            # are not final yet: keep the account health state untouched until
+            # hydration confirms completion (P2-7 fix).
             finalize_task_attempt(task, attempt_id, phase, result_payload, status)
             return True
 
@@ -4838,7 +5381,8 @@ def execute_task(task: sqlite3.Row) -> bool:
         }
         result_payload.update(balance_snapshot_fields(hydration_result.get("balance_before"), "balance_before"))
         result_payload.update(balance_snapshot_fields(hydration_result.get("balance_after"), "balance_after"))
-        mark_account_success(result_payload["account_id"])
+        if status == "completed":
+            mark_account_success(result_payload["account_id"])
         finalize_task_attempt(task, attempt_id, phase, result_payload, status)
         return True
     except TaskCancelledError as exc:
@@ -4889,34 +5433,64 @@ def execute_task(task: sqlite3.Row) -> bool:
 
 def process_task_queue(limit: int = 1) -> int:
     processed = 0
-    with TASK_WORKER_LOCK:
-        while processed < max(1, int(limit)):
+    while processed < max(1, int(limit)):
+        with TASK_WORKER_LOCK:
             task = claim_next_task()
             if not task:
                 break
-            execute_task(task)
-            processed += 1
+        # Execute outside the queue lock: claim is atomic (BEGIN IMMEDIATE) and
+        # finalization is CAS-guarded, so concurrent sync-wait callers or the
+        # worker never double-execute a task. Keeping the lock only around the
+        # claim prevents long upstream hydration from blocking every other
+        # queue admission (P2-14 fix).
+        execute_task(task)
+        processed += 1
     return processed
 
 
+TASK_WORKER_RECOVER_INTERVAL_SECONDS = 60.0
+
+
+def task_worker_recover_interval() -> float:
+    return TASK_WORKER_RECOVER_INTERVAL_SECONDS
+
+
 def task_worker_loop() -> None:
+    last_recover_at = 0.0
     while not TASK_WORKER_STOP.is_set():
-        processed = process_task_queue(limit=1)
-        if processed:
-            continue
-        TASK_WORKER_WAKE.wait(task_worker_poll_interval())
-        TASK_WORKER_WAKE.clear()
+        try:
+            processed = process_task_queue(limit=1)
+            if processed:
+                continue
+            now = time.time()
+            if now - last_recover_at >= task_worker_recover_interval():
+                try:
+                    recovered = recover_stale_running_tasks()
+                    if recovered:
+                        emit_log("info", f"recovered {recovered} stale running tasks")
+                except Exception:
+                    emit_log("error", "stale running task recovery failed")
+                last_recover_at = now
+            TASK_WORKER_WAKE.wait(task_worker_poll_interval())
+            TASK_WORKER_WAKE.clear()
+        except Exception as exc:
+            # Never let a single bad iteration kill the worker thread: log and
+            # keep polling so the queue keeps draining (P1-4 fix).
+            emit_log("error", f"task worker iteration failed: {exc}")
+            TASK_WORKER_WAKE.wait(1.0)
+            TASK_WORKER_WAKE.clear()
 
 
 def ensure_task_worker_started() -> None:
     global TASK_WORKER_THREAD
     if not task_worker_enabled():
         return
-    if TASK_WORKER_THREAD and TASK_WORKER_THREAD.is_alive():
-        return
-    TASK_WORKER_STOP.clear()
-    TASK_WORKER_THREAD = threading.Thread(target=task_worker_loop, name="task-worker", daemon=True)
-    TASK_WORKER_THREAD.start()
+    with TASK_WORKER_LOCK:
+        if TASK_WORKER_THREAD and TASK_WORKER_THREAD.is_alive():
+            return
+        TASK_WORKER_STOP.clear()
+        TASK_WORKER_THREAD = threading.Thread(target=task_worker_loop, name="task-worker", daemon=True)
+        TASK_WORKER_THREAD.start()
 
 
 def stop_task_worker(timeout: float) -> bool:
@@ -4925,20 +5499,21 @@ def stop_task_worker(timeout: float) -> bool:
     global TASK_WORKER_THREAD
     TASK_WORKER_STOP.set()
     TASK_WORKER_WAKE.set()
-    worker = TASK_WORKER_THREAD
-    if worker is None or not worker.is_alive():
+    with TASK_WORKER_LOCK:
+        worker = TASK_WORKER_THREAD
+        if worker is None or not worker.is_alive():
+            TASK_WORKER_THREAD = None
+            return True
+
+        join_timeout = float_or_default(timeout, 0.0)
+        if not math.isfinite(join_timeout):
+            join_timeout = 0.0
+        worker.join(timeout=max(0.0, join_timeout))
+        if worker.is_alive():
+            return False
+
         TASK_WORKER_THREAD = None
         return True
-
-    join_timeout = float_or_default(timeout, 0.0)
-    if not math.isfinite(join_timeout):
-        join_timeout = 0.0
-    worker.join(timeout=max(0.0, join_timeout))
-    if worker.is_alive():
-        return False
-
-    TASK_WORKER_THREAD = None
-    return True
 
 
 def pick_account_for_task(kind: str) -> Optional[sqlite3.Row]:
@@ -5927,6 +6502,8 @@ def checkin_account_by_login(account_id: int) -> Dict[str, Any]:
     email = str(account["email"] or "")
     refreshed_session = CLIENT.login(email, password)
     session = CLIENT.session_from_cookie_dict(refreshed_session.cookies)
+    # Trigger getuserinfo to ensure daily point grant (欢迎奖励/每日刷新) is credited.
+    CLIENT.fetch_user_mirror_metadata(session, account)
     model_info = json_value_from_db(account["model_info_json"])
     video_info = json_value_from_db(account["video_info_json"])
     save_account(
@@ -6142,8 +6719,8 @@ def register_one_account(
                         token_id = extract_token_id_from_link(link)
                         trace.append({"step": "extract_token_from_link", "tokenID": token_id, "link": link})
                         try:
-                            vr = requests.get(link, verify=tls_verify_enabled(), timeout=10, allow_redirects=True)
-                            trace.append({"step": "visit_verification_link", "status": vr.status_code})
+                            vr_status = visit_verification_link(link)
+                            trace.append({"step": "visit_verification_link", "status": vr_status})
                         except Exception as e:
                             trace.append({"step": "visit_verification_link", "error": str(e)})
 
@@ -7528,6 +8105,19 @@ def gateway_error_response(request_id: str, status_code: int, code: str, message
     )
 
 
+def sanitized_admin_error_message(exc: Exception) -> str:
+    """Map an unexpected admin-operation failure to a safe client message.
+
+    Upstream error codes (5-6 digit numbers) are safe to surface for
+    troubleshooting; free-form exception text is withheld from the client
+    because it may contain internal paths or upstream response bodies.
+    """
+    code = upstream_error_code(exc)
+    if code:
+        return f"上游服务返回错误码 {code}，详情请查看服务日志"
+    return "操作失败，详情请查看服务日志"
+
+
 @app.exception_handler(GatewayAPIError)
 def handle_gateway_api_error(request: Request, exc: GatewayAPIError):
     if is_openai_compat_path(request.url.path):
@@ -7609,6 +8199,19 @@ def handle_request_validation_error(request: Request, exc: RequestValidationErro
             {"field": field, "errors": errors},
         )
     return JSONResponse(status_code=422, content={"detail": errors})
+
+
+@app.exception_handler(Exception)
+def handle_unexpected_exception(request: Request, exc: Exception):
+    """Catch-all: never leak exception internals to the client (P1-6 fix)."""
+    request_id = gateway_request_id(request)
+    try:
+        emit_log("error", f"unhandled error on {request.method} {request.url.path}: {exc}")
+    except Exception:
+        pass
+    if request.url.path.startswith("/v1/"):
+        return gateway_error_response(request_id, 500, "INTERNAL_ERROR", "internal server error")
+    return JSONResponse(status_code=500, content={"detail": "internal server error", "request_id": request_id})
 
 # === API Key Auth ===
 security = HTTPBearer(auto_error=False)
@@ -8090,13 +8693,50 @@ def build_backup_zip_bytes() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("accounts.db", db_bytes)
-        archive.writestr("config.json", json.dumps(CFG, ensure_ascii=False, indent=2))
+        # Secrets (admin password, encryption key, mail API key) never enter the
+        # backup archive: redacted placeholders are written instead, matching the
+        # README requirement that the encryption key stays separate from backups.
+        archive.writestr("config.json", json.dumps(public_config(CFG), ensure_ascii=False, indent=2))
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
     return buffer.getvalue()
 
 
+RESTORE_MAX_BACKUP_BYTES = 1024 * 1024 * 1024  # uploaded archive cap (1 GiB)
+RESTORE_MAX_MEMBERS = 128
+RESTORE_MAX_MEMBER_BYTES = 512 * 1024 * 1024  # per-member extracted cap (512 MiB)
+
+
+def _read_zip_member_limited(archive: zipfile.ZipFile, name: str) -> bytes:
+    """Read one archive member while enforcing the real extracted-size cap.
+
+    The declared ``file_size`` in a zip entry is untrusted; counting actual
+    decompressed bytes prevents zip-bomb amplification (P3 fix).
+    """
+    chunks: List[bytes] = []
+    total = 0
+    with archive.open(name) as member:
+        while True:
+            chunk = member.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > RESTORE_MAX_MEMBER_BYTES:
+                raise HTTPException(400, f"backup member is too large: {name}")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def restore_backup_zip_bytes(payload: bytes) -> Dict[str, Any]:
+    global CFG
+    if len(payload) > RESTORE_MAX_BACKUP_BYTES:
+        raise HTTPException(413, "backup archive is too large")
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        infos = archive.infolist()
+        if len(infos) > RESTORE_MAX_MEMBERS:
+            raise HTTPException(400, "backup archive contains too many members")
+        for info in infos:
+            if info.file_size > RESTORE_MAX_MEMBER_BYTES:
+                raise HTTPException(400, f"backup member is too large: {info.filename}")
         names = set(archive.namelist())
         if "accounts.db" not in names or "config.json" not in names:
             raise HTTPException(400, "backup archive missing required files")
@@ -8104,21 +8744,67 @@ def restore_backup_zip_bytes(payload: bytes) -> Dict[str, Any]:
         try:
             db_path = temp_dir / "accounts.db"
             config_path = temp_dir / "config.json"
-            db_path.write_bytes(archive.read("accounts.db"))
-            config_path.write_bytes(archive.read("config.json"))
+            db_path.write_bytes(_read_zip_member_limited(archive, "accounts.db"))
+            config_path.write_bytes(_read_zip_member_limited(archive, "config.json"))
             restored_cfg = json.loads(config_path.read_text(encoding="utf-8"))
             if not isinstance(restored_cfg, dict):
                 raise HTTPException(400, "backup config is invalid")
-            global CFG
-            with CONFIG_LOCK:
-                restored_candidate = deep_merge(DEFAULT_CONFIG, restored_cfg)
-                save_config(restored_candidate)
-                CFG = restored_candidate
-            if DB_PATH.exists():
-                DB_PATH.unlink()
-            shutil.copyfile(db_path, DB_PATH)
-            init_db()
-            revoke_all_admin_sessions("backup_restored")
+            # Secrets from a backup never overwrite live values: a backup may be
+            # unredacted (older format) or influenced by an attacker, so the
+            # current admin password / encryption key / mail API key must
+            # survive restore (P2-16 fix).
+            current_cfg = json.loads(json.dumps(CFG))
+            restored_server = restored_cfg.setdefault("server", {})
+            if not isinstance(restored_server, dict):
+                raise HTTPException(400, "backup config server section is invalid")
+            restored_server["admin_password"] = (current_cfg.get("server") or {}).get("admin_password")
+            restored_server["encryption_key"] = (current_cfg.get("server") or {}).get("encryption_key")
+            restored_mail = restored_cfg.setdefault("mail", {})
+            if not isinstance(restored_mail, dict):
+                raise HTTPException(400, "backup config mail section is invalid")
+            restored_mail["api_key"] = (current_cfg.get("mail") or {}).get("api_key")
+            # Validate the database file before touching the live database.
+            probe = sqlite3.connect(db_path)
+            try:
+                probe.execute("PRAGMA integrity_check")
+            finally:
+                probe.close()
+            original_cfg = CFG
+            backup_db_path: Optional[Path] = None
+            try:
+                with CONFIG_LOCK:
+                    restored_candidate = deep_merge(DEFAULT_CONFIG, restored_cfg)
+                    save_config(restored_candidate)
+                    CFG = restored_candidate
+                if DB_PATH.exists():
+                    backup_db_path = DB_PATH.with_suffix(DB_PATH.suffix + ".pre-restore")
+                    shutil.copyfile(DB_PATH, backup_db_path)
+                shutil.copyfile(db_path, DB_PATH)
+                try:
+                    init_db()
+                except Exception:
+                    # Roll the database back to the pre-restore file so a failed
+                    # restore never leaves a missing or half-initialized DB.
+                    if backup_db_path is not None and backup_db_path.exists():
+                        shutil.copyfile(backup_db_path, DB_PATH)
+                        init_db()
+                    raise
+                revoke_all_admin_sessions("backup_restored")
+            except Exception:
+                # Roll the config back to the pre-restore value.
+                try:
+                    with CONFIG_LOCK:
+                        save_config(original_cfg)
+                        CFG = original_cfg
+                except Exception:
+                    pass
+                raise
+            finally:
+                if backup_db_path is not None:
+                    try:
+                        backup_db_path.unlink()
+                    except FileNotFoundError:
+                        pass
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
     return {"ok": True, "restored": True, "requires_relogin": True, "message": "恢复完成，请重新登录。"}
@@ -9055,9 +9741,13 @@ def gateway_generate(body: GatewayGenerateIn, request: Request, api_key_id: int 
         with REQUEST_ADMISSION_LOCK:
             policy = resolve_api_key_policy(get_api_key_record(api_key_id))
             now = time.time()
-            check_rate_limit(api_key_id, policy, now, request_id)
+            # Consume a rate slot reserved before an upstream upload (multipart
+            # OpenAI paths) without double-counting; otherwise check normally.
+            if not consume_rate_limit_for_request(request, api_key_id, request_id):
+                check_rate_limit(api_key_id, policy, now, request_id)
             if body.kind not in ("image", "video"):
                 raise GatewayAPIError(400, "UNSUPPORTED_KIND", f"unsupported kind: {body.kind}", {"field": "kind"}, request_id=request_id)
+            validate_attachment_ownership(body, api_key_id, request_id)
             task_id, account, caps, options, estimated_point_cost = admit_generation_task(
                 api_key_id,
                 request_id,
@@ -9213,11 +9903,17 @@ def execute_openai_image_request(
 
     assets = content.get("assets") if isinstance(content.get("assets"), list) else []
     if native_response.status_code == 202 or content.get("status") != "completed":
-        return openai_error_response(
-            504,
+        payload = openai_error_payload(
             "image generation did not complete before the compatibility timeout",
+            error_type="api_error",
             code="image_generation_timeout",
         )
+        # Keep the native task id recoverable through the native task API even
+        # though the OpenAI envelope cannot carry it as a first-class field.
+        task_id_hint = content.get("task_id")
+        if task_id_hint not in (None, ""):
+            payload["error"]["details"] = {"task_id": int(task_id_hint)}
+        return JSONResponse(status_code=504, content=payload)
     if not assets:
         return openai_error_response(
             502,
@@ -9436,29 +10132,43 @@ async def gateway_openai_image_edit(
                 "API key is not allowed to upload files",
                 request_id=request_id,
             )
-        account, caps, options, _ = select_generation_account(preflight_body, request_id=request_id)
+        account, caps, options, estimated_point_cost = select_generation_account(preflight_body, request_id=request_id)
         enforce_api_key_scope(policy, "image", options, caps, request_id)
-        reference_images, reference_videos = await upload_openai_input_reference_files(
-            image_files,
-            api_key_id,
-            account,
-            request_id,
-            allowed_extensions=IMAGE_UPLOAD_EXTENSIONS,
-            error_param="image",
-            error_code="invalid_image",
-        )
-        if reference_videos or not reference_images:
-            raise OpenAICompatError(
-                "image must contain a supported image file",
-                param="image",
-                code="invalid_image",
+        # Quota preflight before uploading: a quota-exhausted request must not
+        # consume upstream upload/storage resources. The authoritative rate and
+        # quota accounting still happens once, at task admission.
+        check_daily_quota(api_key_id, estimated_point_cost, policy, time.time(), request_id)
+        # Rate-limit reservation before uploading: an over-limit request must be
+        # rejected before it consumes upstream upload/storage resources, and the
+        # reserved slot is consumed exactly once at task admission.
+        reserve_rate_limit_for_request(request, api_key_id, policy, time.time(), request_id)
+        try:
+            reference_images, reference_videos = await upload_openai_input_reference_files(
+                image_files,
+                api_key_id,
+                account,
+                request_id,
+                allowed_extensions=IMAGE_UPLOAD_EXTENSIONS,
+                error_param="image",
+                error_code="invalid_image",
             )
-        native_body = openai_image_body_from_request(
-            body,
-            reference_images=reference_images,
-            account_id=int(account["id"]),
-        )
-        return execute_openai_image_request(body, native_body, request, api_key_id, response_format)
+            if reference_videos or not reference_images:
+                raise OpenAICompatError(
+                    "image must contain a supported image file",
+                    param="image",
+                    code="invalid_image",
+                )
+            native_body = openai_image_body_from_request(
+                body,
+                reference_images=reference_images,
+                account_id=int(account["id"]),
+            )
+            return execute_openai_image_request(body, native_body, request, api_key_id, response_format)
+        except Exception:
+            # Release the reservation if admission never consumed it; a no-op
+            # once gateway_generate() already consumed the slot.
+            release_rate_limit_for_request(request)
+            raise
 
 
 def openai_video_body_from_request(
@@ -9565,15 +10275,38 @@ async def gateway_openai_video_generation(
                         "API key is not allowed to upload files",
                         request_id=gateway_request_id(request),
                     )
+                request_id = gateway_request_id(request)
+                # Quota preflight before uploading: a quota-exhausted request
+                # must not consume upstream upload/storage resources. The
+                # authoritative accounting still happens once, at admission.
+                preflight_body = openai_video_body_from_request(body)
+                try:
+                    _preflight_account, _caps, _options, preflight_cost = select_generation_account(
+                        preflight_body,
+                        request_id=request_id,
+                    )
+                except GatewayAPIError:
+                    raise
+                check_daily_quota(api_key_id, preflight_cost, policy, time.time(), request_id)
                 account = pick_account_for_generation("video") or pick_account_for_generation("image")
                 if not account:
-                    raise GatewayAPIError(503, "NO_ACCOUNT_AVAILABLE", "no verified account available", request_id=gateway_request_id(request))
-                reference_images, reference_videos = await upload_openai_input_reference_files(
-                    multipart_references,
-                    api_key_id,
-                    account,
-                    gateway_request_id(request),
-                )
+                    raise GatewayAPIError(503, "NO_ACCOUNT_AVAILABLE", "no verified account available", request_id=request_id)
+                # Rate-limit reservation before uploading: an over-limit request
+                # must not consume upstream upload/storage resources, and the
+                # reserved slot is consumed exactly once at task admission.
+                reserve_rate_limit_for_request(request, api_key_id, policy, time.time(), request_id)
+                try:
+                    reference_images, reference_videos = await upload_openai_input_reference_files(
+                        multipart_references,
+                        api_key_id,
+                        account,
+                        request_id,
+                    )
+                except Exception:
+                    # Release the reservation when the upload never completed;
+                    # a no-op once gateway_generate() already consumed the slot.
+                    release_rate_limit_for_request(request)
+                    raise
             native_body = openai_video_body_from_request(
                 body,
                 reference_images=reference_images,
@@ -9835,7 +10568,28 @@ def gateway_account_status(api_key_id: int = Depends(require_api_key)):
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "status": "ok"}
+    """Shallow liveness probe: process alive, config loaded, database reachable.
+
+    Deliberately does not check the account pool, worker thread, or deployment
+    acknowledgements; those belong to /readyz so a deployment health check is
+    not held hostage by transient pool or upstream risk-control conditions.
+    """
+    try:
+        conn = db_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.rollback()
+        conn.close()
+    except Exception:
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "status": "unavailable", "db": False},
+        )
+    if not isinstance(CFG, dict):
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "status": "unavailable", "config": False},
+        )
+    return {"ok": True, "status": "ok", "db": True}
 
 
 def validate_account_secret_storage_readiness() -> None:
@@ -9934,7 +10688,9 @@ def readyz():
 
 
 @app.get("/metrics")
-def metrics():
+def metrics(_=Depends(require_admin)):
+    """Operational metrics. Admin-only: exposes pool health, task errors, and
+    usage/cost summaries that must not be visible to anonymous callers."""
     rows = list_accounts()
     account_summary = account_pool_summary(rows)
     conn = db_conn()
@@ -10002,6 +10758,9 @@ def gateway_task_detail_payload(task_id: int, api_key_id: Optional[int] = None) 
     task["duration"] = task.get("duration") or (usage_row["duration"] if usage_row else None) or payload.get("duration")
     task["scene_id"] = task.get("scene_id") or (usage_row["scene_id"] if usage_row else "") or payload.get("scene_id") or payload.get("sceneId") or ""
     task["estimated_point_cost"] = task.get("estimated_point_cost") or (usage_row["estimated_point_cost"] if usage_row else None)
+    task["actual_point_cost"] = task.get("actual_point_cost") or (usage_row["actual_point_cost"] if usage_row else None)
+    task["balance_before"] = balance_snapshot_from_row(row, "balance_before")
+    task["balance_after"] = balance_snapshot_from_row(row, "balance_after")
     task["request_id"] = task.get("request_id") or (usage_row["request_id"] if usage_row else "")
     task["idempotency_key"] = usage_row["idempotency_key"] if usage_row else ""
     task["error_code"] = task.get("error_code") or (usage_row["error_code"] if usage_row else "")
@@ -10121,10 +10880,12 @@ def retry_task_record(
                     "",
                     202,
                 )
-            conn.execute(
-                "UPDATE idempotency_keys SET status_code=202, response_json=? WHERE task_id=?",
-                (json.dumps(queued_response, ensure_ascii=False), task_id),
-            )
+            # Idempotency records are immutable: a retry must never rewrite the
+            # response stored for the original request's key, otherwise a replay
+            # of that key would return the retry's response instead of the
+            # original one (breaking idempotency semantics). Clients replaying
+            # the original key keep getting the original 202 with the same
+            # task_id and can query the task for the latest state.
             conn.commit()
         except Exception:
             if conn.in_transaction:
@@ -10269,15 +11030,30 @@ def hydrate_task_record(task_id: int, api_key_id: Optional[int] = None) -> Dict[
     task = dict(row)
     if not task_hydratable_status(task.get("status") or ""):
         raise GatewayAPIError(409, "TASK_NOT_HYDRATABLE", "only submitted tasks can be rehydrated")
-    update_task_record(
-        task_id,
-        status="hydrating",
-        error_code="",
-        error_message="",
-        cancel_requested_at=None,
-        next_attempt_at=time.time(),
-        finished_at=None,
-    )
+    # CAS transition: refuse to hydrate a task that was cancelled or changed
+    # between the read above and this update, so a cancellation can never be
+    # resurrected by a concurrent hydrate request.
+    now = time.time()
+    conn = db_conn()
+    try:
+        result = conn.execute(
+            """
+            UPDATE tasks
+            SET status='hydrating', error_code='', error_message='',
+                cancel_requested_at=NULL, next_attempt_at=?, finished_at=NULL, updated_at=?
+            WHERE id=? AND status=? AND cancel_requested_at IS NULL
+            """,
+            (now, now, task_id, task.get("status")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    if result.rowcount != 1:
+        raise GatewayAPIError(
+            409,
+            "TASK_NOT_HYDRATABLE",
+            "task state changed before hydration could be reserved",
+        )
     if task.get("api_key_id"):
         update_usage_log_for_task(
             task_id,
@@ -10391,6 +11167,14 @@ def on_startup():
             )
         if not CONFIG_PATH.exists():
             save_config(CFG)
+        if not str(os.environ.get("OREATE_ENCRYPTION_KEY") or "").strip() and str(
+            (CFG.get("server") or {}).get("encryption_key") or ""
+        ):
+            print(
+                "[warn] server encryption key is stored in config.json; "
+                "production should export OREATE_ENCRYPTION_KEY instead",
+                flush=True,
+            )
         recover_stale_running_tasks(stale_after_seconds=0.0)
         recover_interrupted_registration_jobs()
         recover_interrupted_pool_maintenance_jobs()
@@ -10433,9 +11217,38 @@ def root():
     return {
         "ok": True,
         "service": "oreateai",
-        "cwd": str(BASE_DIR),
-        "accounts": len(list_accounts()),
+        "admin": "/admin",
+        "docs": "/docs",
     }
+
+
+def admin_login_lockout_remaining(client_ip: str, now: float) -> float:
+    """Seconds remaining in the lockout window for an admin login origin."""
+    if not client_ip:
+        return 0.0
+    with ADMIN_LOGIN_LOCK:
+        failures = ADMIN_LOGIN_FAILURES.get(client_ip) or []
+        if len(failures) < ADMIN_LOGIN_MAX_FAILURES:
+            return 0.0
+        window_start = failures[0]
+        return max(0.0, ADMIN_LOGIN_LOCKOUT_SECONDS - (now - window_start))
+
+
+def record_admin_login_failure(client_ip: str, now: float) -> None:
+    if not client_ip:
+        return
+    with ADMIN_LOGIN_LOCK:
+        cutoff = now - ADMIN_LOGIN_LOCKOUT_SECONDS
+        failures = [ts for ts in (ADMIN_LOGIN_FAILURES.get(client_ip) or []) if ts >= cutoff]
+        failures.append(now)
+        ADMIN_LOGIN_FAILURES[client_ip] = failures
+
+
+def clear_admin_login_failures(client_ip: str) -> None:
+    if not client_ip:
+        return
+    with ADMIN_LOGIN_LOCK:
+        ADMIN_LOGIN_FAILURES.pop(client_ip, None)
 
 
 @app.post("/api/admin/login")
@@ -10444,8 +11257,32 @@ def admin_login(body: LoginIn, request: Request):
     expected_password = str(CFG["server"].get("admin_password") or "")
     if is_unsafe_admin_password(expected_password):
         raise HTTPException(500, "admin password must be changed before login")
+    client_ip = request.client.host if request.client else ""
+    now = time.time()
+    lockout_remaining = admin_login_lockout_remaining(client_ip, now)
+    if lockout_remaining > 0:
+        write_admin_audit(
+            "login_blocked",
+            body.username,
+            request,
+            status_code=429,
+            details={"username": body.username, "reason": "too many failed attempts"},
+        )
+        raise HTTPException(
+            429,
+            f"too many failed login attempts; try again in {int(math.ceil(lockout_remaining))}s",
+        )
     if not secrets.compare_digest(body.username, expected_user) or not secrets.compare_digest(body.password, expected_password):
+        record_admin_login_failure(client_ip, now)
+        write_admin_audit(
+            "login_failed",
+            body.username,
+            request,
+            status_code=401,
+            details={"username": body.username},
+        )
         raise HTTPException(401, "invalid admin credentials")
+    clear_admin_login_failures(client_ip)
     token = secrets.token_hex(24)
     create_admin_session(token, body.username, request)
     write_admin_audit("login", body.username, request, status_code=200, details={"username": body.username})
@@ -10504,7 +11341,14 @@ def upload_admin_restore(
 ):
     if not confirm:
         raise HTTPException(400, "restore confirmation is required")
-    payload = file.file.read()
+    payload = b""
+    while True:
+        chunk = file.file.read(1024 * 1024)
+        if not chunk:
+            break
+        payload += chunk
+        if len(payload) > RESTORE_MAX_BACKUP_BYTES:
+            raise HTTPException(413, "backup archive is too large")
     if not payload:
         raise HTTPException(400, "backup file is empty")
     return restore_backup_zip_bytes(payload)
@@ -10578,8 +11422,12 @@ def pool_model_availability(
 
 @app.get("/api/public/model-availability")
 def public_model_availability(include_disabled: bool = False):
-    """User-facing catalog: costs + abstract availability, no account/pool counts."""
-    return build_model_availability_catalog(include_disabled=bool(include_disabled), public=True)
+    """User-facing catalog: costs + abstract availability, no account/pool counts.
+
+    ``include_disabled`` is intentionally ignored on the public endpoint so
+    disabled models cannot be enumerated by unauthenticated callers (P2-13).
+    """
+    return build_model_availability_catalog(include_disabled=False, public=True)
 
 
 @app.put("/api/accounts/{account_id}/reserve-target")
@@ -10636,7 +11484,7 @@ def refresh_account_balance(account_id: int, _=Depends(require_admin)):
         session = CLIENT.session_from_account(account)
         detail = CLIENT.fetch_account_point_detail(session, account)
     except Exception as exc:
-        raise HTTPException(503, str(exc))
+        raise HTTPException(503, sanitized_admin_error_message(exc))
     row = update_account_balance_snapshot(account_id, detail)
     return {"ok": True, "item": public_account(row)}
 
@@ -10650,9 +11498,9 @@ def activate_account_endpoint(account_id: int, _=Depends(require_admin)):
     try:
         return activate_account_login(account_id)
     except RuntimeError as exc:
-        raise HTTPException(503, str(exc)) from exc
+        raise HTTPException(503, sanitized_admin_error_message(exc)) from exc
     except Exception as exc:
-        raise HTTPException(503, str(exc)) from exc
+        raise HTTPException(503, sanitized_admin_error_message(exc)) from exc
 
 
 @app.post("/api/accounts/{account_id}/reactivate")
@@ -10666,9 +11514,9 @@ def reactivate_account_endpoint(account_id: int, _=Depends(require_admin)):
         message = str(exc)
         if "does not need reactivation" in message:
             raise HTTPException(409, message) from exc
-        raise HTTPException(503, message) from exc
+        raise HTTPException(503, sanitized_admin_error_message(exc)) from exc
     except Exception as exc:
-        raise HTTPException(503, str(exc)) from exc
+        raise HTTPException(503, sanitized_admin_error_message(exc)) from exc
 
 
 @app.post("/api/accounts/purge-zombies")
@@ -10676,6 +11524,24 @@ def purge_zombie_accounts_endpoint(body: AccountZombiePurgeIn, _admin: str = Dep
     if not body.confirm:
         raise HTTPException(400, "请确认清理僵尸号（confirm=true）")
     return purge_zombie_accounts()
+
+
+@app.post("/api/admin/prune")
+def admin_prune_historical(body: HistoricalPruneIn, _=Depends(require_admin)):
+    """Delete terminal tasks older than the retention window.
+
+    ``days`` defaults to ``gateway.retention_days`` (0 disables pruning).
+    Only terminal tasks and their attempts/usage rows are removed; uploaded
+    media and idempotency records are never touched by this endpoint.
+    """
+    days = (
+        body.days
+        if body.days is not None
+        else float_or_default(gateway_cfg().get("retention_days"), 0)
+    )
+    if days <= 0:
+        return {"ok": True, "deleted_tasks": 0, "message": "retention disabled"}
+    return prune_historical_records(days)
 
 
 @app.get("/api/models/capabilities")
@@ -11170,32 +12036,18 @@ def pool_maintain(body: MaintainIn, _=Depends(require_admin)):
     }
 
 
-@app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket):
-    await ws.accept()
-    WS_CLIENTS.append(ws)
-    try:
-        while True:
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        pass
-    finally:
-        try:
-            WS_CLIENTS.remove(ws)
-        except ValueError:
-            pass
-
-
-
-def _html_security_headers() -> Dict[str, str]:
+def _html_security_headers(nonce: str = "") -> Dict[str, str]:
+    script_src = "'self'"
+    if nonce:
+        script_src = f"'self' 'nonce-{nonce}'"
     return {
         "Content-Security-Policy": (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline'; "
+            f"script-src {script_src}; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: https://cdn.oreateai.com; "
             "media-src 'self' https://cdn.oreateai.com; "
-            "connect-src 'self' ws: wss:; "
+            "connect-src 'self'; "
             "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
         ),
         "X-Content-Type-Options": "nosniff",
@@ -11205,14 +12057,34 @@ def _html_security_headers() -> Dict[str, str]:
     }
 
 
+def _inject_script_nonces(html_text: str, nonce: str) -> str:
+    """Add a per-response nonce to every inline <script> start tag so CSP can
+    drop 'unsafe-inline' for scripts while the pages stay fully inline."""
+    return re.sub(
+        r"(?i)(<script\b)([^>]*?)(>)",
+        lambda m: f"{m.group(1)}{m.group(2)} nonce=\"{nonce}\"{m.group(3)}",
+        html_text,
+    )
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
-    return HTMLResponse(ADMIN_HTML, headers=_html_security_headers())
+    nonce = secrets.token_urlsafe(16)
+    return HTMLResponse(
+        _inject_script_nonces(ADMIN_HTML, nonce),
+        headers=_html_security_headers(nonce),
+    )
 
 
 @app.get("/models", response_class=HTMLResponse)
 def models_public_page():
-    return HTMLResponse(MODELS_PUBLIC_HTML, headers=_html_security_headers())
+    nonce = secrets.token_urlsafe(16)
+    return HTMLResponse(
+        _inject_script_nonces(MODELS_PUBLIC_HTML, nonce),
+        headers=_html_security_headers(nonce),
+    )
+
+
 
 
 if __name__ == "__main__":

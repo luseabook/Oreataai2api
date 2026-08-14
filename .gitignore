@@ -60,3 +60,27 @@ Thumbs.db
 
 # SpectrAI worktree isolation
 .spectrai-worktrees/
+
+# Node / packaging
+node_modules/
+package.json
+package-lock.json
+
+# Auxiliary subprojects with real credentials
+vyceai/
+conol2api/
+
+# Temp scripts, logs and summaries
+_tmp_*.py
+_tmp_*.json
+register_*.py
+run_register_*.py
+*_summary.json
+*_domain_scan.json
+*.log
+
+# Agent/IDE state
+.omx/
+.omc/
+.gstack/
+.reasonix/

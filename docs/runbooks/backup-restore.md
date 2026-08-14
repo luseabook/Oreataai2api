@@ -87,7 +87,7 @@ Required restore verification:
 ```bash
 curl http://127.0.0.1:8890/healthz
 curl http://127.0.0.1:8890/readyz
-python -m unittest tests.security_regression_tests.SecurityRegressionTests.test_admin_backup_restore_revokes_existing_sessions -v
+python -m unittest tests.security_regression_tests.SecurityRegressionTests.test_admin_restore_revokes_existing_sessions_and_requires_relogin -v
 python -m unittest tests.security_regression_tests.SecurityRegressionTests.test_account_sensitive_fields_are_encrypted_at_rest -v
 ```
 

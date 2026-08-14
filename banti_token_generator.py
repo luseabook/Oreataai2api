@@ -52,8 +52,10 @@ def A0(data_dict, salt="31$"):
 
 
 def is_coded_jt_token(jt) -> bool:
-    """Current Oreate signup/login accepts helper tokens with the CODED wrapper."""
-    return isinstance(jt, str) and jt.startswith("31$CODED--")
+    """Current Oreate signup/login accepts helper tokens with the CODED wrapper or raw 31$ prefix."""
+    if not isinstance(jt, str):
+        return False
+    return jt.startswith("31$") and len(jt) > 10
 
 
 def generate_banti_artifacts_from_helper(timeout_sec=10):

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repo-documented setup and run commands
 
-- Runtime requirements: Python 3.11+ and Node.js 18+. The Python service calls the local Node helper `banti_jt_helper.js` during generation traffic; there is no checked-in `package.json` or separate frontend build.
+- Runtime requirements: Python 3.11+ and Node.js 18+. The Python service calls the local Node helper `banti_jt_helper.js` during generation traffic; there is no checked-in `package.json` or separate frontend build (an untracked local `package.json` exists only for optional browser-worker tooling).
 - Install runtime dependencies:
   ```bash
   pip install -r requirements.txt
@@ -87,7 +87,7 @@ There is no separate lint or build command checked into this repo; the main vali
 
 ### Data model and persistence
 
-- SQLite is the only persistence layer. Base tables are created in `server.py:init_db()`, while `migrations/001_operational_indexes.sql` adds scheduler and lookup indexes.
+- SQLite is the only persistence layer. Base tables are created in `server.py:init_db()`, while `migrations/001_operational_indexes.sql` adds scheduler and lookup indexes and `migrations/002_point_capacity_scheduler.sql` adds point-capacity scheduler views (all `NNN_*.sql` files are applied by `apply_sql_migrations`).
 - Important table groups:
   - `accounts`: upstream Oreate credentials, cookies, cached model/video capabilities, and point-balance snapshots
   - `tasks` + `task_attempts`: queued work, retry state, hydration state, and per-attempt execution details

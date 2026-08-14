@@ -30,6 +30,14 @@ class DeploymentReleaseTests(unittest.TestCase):
         self.assertIn('ln -sfn "$previous_release" "$current_link"', self.source)
         self.assertIn('systemctl restart "$service_name"', self.source)
 
+    def test_default_health_url_matches_server_default_port(self):
+        # The gateway binds 8890 by default (server.py config). A mismatched
+        # probe port would roll back every release even when the service is up.
+        self.assertIn(
+            'OREATE_HEALTH_URL:-http://127.0.0.1:8890/healthz',
+            self.source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,7 @@ from banti_token_generator import (
     generate_jt_token,
     is_coded_jt_token,
 )
+from gateway.http_retry import mount_get_retry
 from gateway.media_utils import (
     IMAGE_UPLOAD_EXTENSIONS,
     VIDEO_UPLOAD_EXTENSIONS,
@@ -162,6 +163,7 @@ class OreateClient:
     def new_session(self) -> requests.Session:
         s = requests.Session()
         s.verify = self._tls_verify()
+        mount_get_retry(s)
         s.get(self.base + "/", headers=self.headers, timeout=self.timeout)
         return s
 

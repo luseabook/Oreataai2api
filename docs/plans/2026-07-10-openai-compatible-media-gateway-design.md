@@ -23,7 +23,7 @@ This separation keeps the first migration small while creating a seam for future
 
 ### Images
 
-`POST /v1/images/generations` accepts `model`, `prompt`, `n`, `size`, `quality`, `response_format`, and optional gateway extensions `ratio`, `resolution`, and `timeout`. Only `n=1` and URL responses are initially supported; unsupported values return OpenAI-shaped `invalid_request_error` responses. The route queues the existing image task and waits up to a bounded server-controlled timeout. Success returns:
+`POST /v1/images/generations` accepts `model`, `prompt`, `n`, `size`, `quality`, `response_format`, and optional gateway extensions `ratio`, `resolution`, and `timeout`. Only `n=1` is supported; unsupported values return OpenAI-shaped `invalid_request_error` responses. `response_format` supports `url` and `b64_json`; `b64_json` returns the cleaned image bytes equivalent to the URL asset. `quality`, `output_format`, and `user` are accepted but currently ignored. The route queues the existing image task and waits up to a bounded server-controlled timeout. Success returns:
 
 ```json
 {"created": 1710000000, "data": [{"url": "https://...", "revised_prompt": "..."}]}

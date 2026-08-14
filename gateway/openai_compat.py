@@ -342,9 +342,11 @@ def task_to_video_object(
         "size": str(requested_size or _size_from_task(task)),
     }
     if public_status == "failed":
+        # Keep the message short and free of internal details (paths, upstream
+        # response bodies) that may have leaked into the task error text.
         result["error"] = {
             "code": str(task.get("error_code") or "video_generation_failed"),
-            "message": str(task.get("error_message") or "video generation failed"),
+            "message": str(task.get("error_message") or "video generation failed")[:200],
         }
     return result
 

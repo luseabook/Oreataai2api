@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 
+from gateway.http_retry import mount_get_retry
 from gateway.yyds_mail import YydsClient
 
 MailConfigFn = Callable[[], Mapping[str, Any]]
@@ -51,6 +52,7 @@ def _mail_session() -> requests.Session:
     session = requests.Session()
     # Local HTTP_PROXY can break shop-card hosts / Graph; talk to endpoints directly.
     session.trust_env = False
+    mount_get_retry(session)
     return session
 
 
@@ -628,7 +630,9 @@ class OutlookMailClient:
     def _message_received_ts(message: Mapping[str, Any]) -> float:
         raw = str(message.get("receivedDateTime") or "").strip()
         if not raw:
-            return 0.0
+            # Sentinel far below any plausible min_ts: a message with an unknown
+            # received time must never pass the freshness filter (P2-4 fix).
+            return -1.0
         try:
             normalized = raw.replace("Z", "+00:00")
             dt = datetime.fromisoformat(normalized)
@@ -636,7 +640,7 @@ class OutlookMailClient:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.timestamp()
         except Exception:
-            return 0.0
+            return -1.0
 
     def _int_cfg(self, key: str, default: int) -> int:
         try:

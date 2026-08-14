@@ -127,6 +127,11 @@ def account_risk_status(row: Any) -> str:
     status = str(_get(row, "status") or "")
     if status == "invalid":
         return "invalid"
+    if status == "risk_control":
+        # Accounts can be placed in this status by upstream risk-control
+        # detection; the branch must be reachable so pool maintenance isolates
+        # them instead of scheduling them blindly (P2-2 fix).
+        return "risk_control"
     return "clean"
 
 
@@ -225,6 +230,7 @@ def account_pool_summary(
         "cooling": 0,
         "low_balance": 0,
         "invalid": 0,
+        "disabled": 0,
         "risk_control": 0,
         "balance_known": 0,
         "auth_ready": 0,

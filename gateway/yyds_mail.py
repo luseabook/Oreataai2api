@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Mapping
 
 import requests
 
+from gateway.http_retry import mount_get_retry
 from gateway.mail_identity import (
     generate_mailbox_local_part,
     rank_mail_domains,
@@ -18,6 +19,12 @@ from gateway.mail_identity import (
 )
 
 MailConfigFn = Callable[[], Mapping[str, Any]]
+
+
+def _session() -> requests.Session:
+    session = requests.Session()
+    mount_get_retry(session)
+    return session
 
 
 class YydsClient:
@@ -41,7 +48,7 @@ class YydsClient:
         return {"X-API-Key": self.api_key}
 
     def list_domains(self) -> List[str]:
-        r = requests.get(f"{self.base}/domains", timeout=20)
+        r = _session().get(f"{self.base}/domains", timeout=20)
         r.raise_for_status()
         data = r.json().get("data", [])
         out = []
@@ -84,7 +91,7 @@ class YydsClient:
 
     def fetch_messages(self, address: str, token: str) -> List[Dict[str, Any]]:
         headers = {"Authorization": f"Bearer {token}"}
-        r = requests.get(f"{self.base}/messages", headers=headers, params={"address": address}, timeout=30)
+        r = _session().get(f"{self.base}/messages", headers=headers, params={"address": address}, timeout=30)
         r.raise_for_status()
         data = r.json().get("data", {})
         if isinstance(data, dict):
@@ -95,7 +102,7 @@ class YydsClient:
 
     def fetch_message_detail(self, address: str, token: str, message_id: str) -> Dict[str, Any]:
         headers = {"Authorization": f"Bearer {token}"}
-        r = requests.get(f"{self.base}/messages/{message_id}", headers=headers, params={"address": address}, timeout=30)
+        r = _session().get(f"{self.base}/messages/{message_id}", headers=headers, params={"address": address}, timeout=30)
         r.raise_for_status()
         return r.json().get("data", {})
 

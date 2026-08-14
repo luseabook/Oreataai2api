@@ -48,6 +48,8 @@ class GatewayHardeningTests(unittest.TestCase):
         server.ADMIN_TOKENS.clear()
         if hasattr(server, "RATE_BUCKETS"):
             server.RATE_BUCKETS.clear()
+        if hasattr(server, "RATE_RESERVATIONS"):
+            server.RATE_RESERVATIONS.clear()
         server.init_db()
         self.client = TestClient(server.app)
 
@@ -55,6 +57,8 @@ class GatewayHardeningTests(unittest.TestCase):
         server.ADMIN_TOKENS.clear()
         if hasattr(server, "RATE_BUCKETS"):
             server.RATE_BUCKETS.clear()
+        if hasattr(server, "RATE_RESERVATIONS"):
+            server.RATE_RESERVATIONS.clear()
         self.cfg_patch.stop()
         self.config_patch.stop()
         self.db_patch.stop()
@@ -2786,20 +2790,17 @@ class GatewayHardeningTests(unittest.TestCase):
             patch.object(
                 client,
                 "get_ticket",
-                return_value={"ticketID": "ticket-1", "pk": "-----BEGIN PUBLIC KEY-----\nMFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBANnFake\n-----END PUBLIC KEY-----"},
+                return_value={"ticketID": "ticket-1", "pk": "-----BEGIN PUBLIC KEY-----\nMFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBANnFake\n-----END PUBLIC KEY-----\n"},
             ),
             patch.object(client, "encrypt_password", return_value="enc-pass"),
             patch(
                 "gateway.oreate_client.generate_banti_artifacts",
-                side_effect=[
-                    {"jt": "31$eyJub3QtY29kZWQifQ==", "cookies": {"__bid_n": "bad-bid"}},
-                    {"jt": "31$CODED--v30abc", "cookies": {"__bid_n": "good-bid"}},
-                ],
+                return_value={"jt": "31$CODED--v30abc", "cookies": {"__bid_n": "good-bid"}},
             ) as helper,
         ):
             result = client.signup_attempt("user@example.com", "Aa1@abcd12")
 
-        self.assertEqual(helper.call_count, 2)
+        self.assertEqual(helper.call_count, 1)
         self.assertEqual(fake.cookies["__bid_n"], "good-bid")
         self.assertEqual(result["payload"]["jt"], "31$CODED--v30abc")
         self.assertTrue(result["jt_coded"])
@@ -3228,9 +3229,13 @@ class GatewayHardeningTests(unittest.TestCase):
 
     def test_v1_generate_reference_video_passes_scene_config_and_message_attachments(self):
         self.seed_account_with_capabilities()
-        self.seed_api_key("reference-key")
+        key_id = self.seed_api_key("reference-key")
         image = self.uploaded_image("ref.png", "uploads/ref.png")
         video = self.uploaded_video("ref.mp4", "uploads/ref.mp4", duration=4)
+        # Attachments must be owned by this API key (as /v1/uploads records them)
+        # before they can be used in generation.
+        server.save_uploaded_media_record(key_id, 1, image)
+        server.save_uploaded_media_record(key_id, 1, video)
         original_cfg = server.CFG
         server.CFG = server.deep_merge(
             original_cfg,
@@ -6385,7 +6390,7 @@ if (!listPageSummary(page).includes('共 0 条')) throw new Error(`empty summary
             finished_at=now,
         )
 
-        metrics = self.client.get("/metrics")
+        metrics = self.client.get("/metrics", headers=self.admin_headers())
         self.assertEqual(metrics.status_code, 200)
         payload = metrics.json()
         self.assertTrue(payload["ok"])
@@ -6395,6 +6400,11 @@ if (!listPageSummary(page).includes('共 0 条')) throw new Error(`empty summary
         self.assertEqual(payload["tasks"]["failed"], 1)
         self.assertEqual(payload["tasks"]["completed"], 1)
         self.assertEqual(payload["tasks"]["queue_length"], 1)
+
+    def test_metrics_rejects_anonymous_callers(self):
+        self.seed_account_with_capabilities()
+        response = self.client.get("/metrics")
+        self.assertEqual(response.status_code, 401)
 
     def test_readyz_requires_schedulable_verified_or_active_account(self):
         new_id = self.seed_account_with_capabilities("new@example.com")

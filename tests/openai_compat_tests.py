@@ -169,12 +169,14 @@ class OpenAICompatEndpointTests(unittest.TestCase):
         )
         self.cfg_patch.start()
         server.RATE_BUCKETS.clear()
+        server.RATE_RESERVATIONS.clear()
         server.init_db()
         self.client = TestClient(server.app)
         self.seed_account_and_scoped_key()
 
     def tearDown(self):
         server.RATE_BUCKETS.clear()
+        server.RATE_RESERVATIONS.clear()
         self.cfg_patch.stop()
         self.config_patch.stop()
         self.db_patch.stop()
@@ -223,6 +225,8 @@ class OpenAICompatEndpointTests(unittest.TestCase):
                             "videoResolution": ["720"],
                             "videoSize": [{"ratio": "16:9"}],
                             "pointCostImage": [{"duration": 5, "resolution": "720", "point": 10}],
+                            "pointCostReference": [{"duration": 5, "resolution": "720", "point": 15}],
+                            "pointCostMotion": [],
                         }
                     ]
                 }
@@ -746,6 +750,185 @@ class OpenAICompatEndpointTests(unittest.TestCase):
         conn.close()
         self.assertEqual(task_count, 0)
         self.assertEqual(upload_count, 0)
+
+    def test_image_edits_rate_limit_rejects_before_upload(self):
+        key_id = self.api_key_id("openai-image-upload-key")
+        conn = server.db_conn()
+        conn.execute("UPDATE api_keys SET rate_limit_per_minute=1 WHERE id=?", (key_id,))
+        conn.commit()
+        conn.close()
+        server.RATE_BUCKETS[key_id] = [(None, time.time())]
+        with patch.object(server.CLIENT, "upload_file_bytes") as upload_file:
+            response = self.client.post(
+                "/v1/images/edits",
+                headers={"Authorization": "Bearer openai-image-upload-key"},
+                data={
+                    "model": "gpt-image-1",
+                    "prompt": "rate limited edit",
+                    "size": "1024x1024",
+                    "n": "1",
+                    "response_format": "url",
+                },
+                files={"image": ("reference.png", b"pngdata", "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json()["error"]["code"], "rate_limited")
+        upload_file.assert_not_called()
+        self.assertEqual(server.RATE_RESERVATIONS, {})
+
+    def test_image_edits_successful_upload_counts_rate_once(self):
+        key_id = self.api_key_id("openai-image-upload-key")
+        uploaded = {
+            "object": "uploads/reference.png",
+            "fileName": "reference.png",
+            "fileExt": "png",
+            "contentType": "image/png",
+            "originSize": 7,
+        }
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "upload_file_bytes", return_value=uploaded) as upload_file,
+            patch.object(server.CLIENT, "create_chat_session", return_value={"chatId": "chat-edit-rate", "focusId": "focus-edit-rate"}),
+            patch.object(
+                server.CLIENT,
+                "stream_generation",
+                return_value={"events": [{"event": "end"}], "error": None, "status": "streamed"},
+            ),
+            patch.object(
+                server.CLIENT,
+                "hydrate_generation_result",
+                return_value={"raw": {}, "assets": ["https://cdn.oreateai.com/aiimage/edited.png"]},
+            ),
+        ):
+            response = self.client.post(
+                "/v1/images/edits",
+                headers={"Authorization": "Bearer openai-image-upload-key"},
+                data={
+                    "model": "gpt-image-1",
+                    "prompt": "counted once",
+                    "size": "1024x1024",
+                    "n": "1",
+                    "response_format": "url",
+                },
+                files={"image": ("reference.png", b"pngdata", "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        upload_file.assert_called_once()
+        # One reserved slot consumed at admission, never double-counted.
+        self.assertEqual(len(server.RATE_BUCKETS.get(key_id, [])), 1)
+        self.assertEqual(server.RATE_RESERVATIONS, {})
+
+    def test_image_edits_upload_failure_releases_rate_reservation(self):
+        key_id = self.api_key_id("openai-image-upload-key")
+        with (
+            patch.object(server.CLIENT, "session_from_account", return_value=object()),
+            patch.object(server.CLIENT, "upload_file_bytes", side_effect=RuntimeError("upstream upload failed")),
+        ):
+            response = self.client.post(
+                "/v1/images/edits",
+                headers={"Authorization": "Bearer openai-image-upload-key"},
+                data={
+                    "model": "gpt-image-1",
+                    "prompt": "broken upload",
+                    "size": "1024x1024",
+                    "n": "1",
+                    "response_format": "url",
+                },
+                files={"image": ("reference.png", b"pngdata", "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "upload_failed")
+        self.assertEqual(server.RATE_RESERVATIONS, {})
+        self.assertEqual(server.RATE_BUCKETS.get(key_id, []), [])
+
+    def test_video_multipart_rate_limit_rejects_before_upload(self):
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "gateway": {
+                    "scene_policies": {
+                        "reference": {
+                            "enabled": True,
+                            "experimental": False,
+                            "verification_status": "live_verified",
+                            "risk_level": "low",
+                        }
+                    }
+                }
+            },
+        )
+        key_id = self.api_key_id("openai-video-upload-key")
+        conn = server.db_conn()
+        conn.execute("UPDATE api_keys SET rate_limit_per_minute=1 WHERE id=?", (key_id,))
+        conn.commit()
+        conn.close()
+        server.RATE_BUCKETS[key_id] = [(None, time.time())]
+        try:
+            with patch.object(server.CLIENT, "upload_file_bytes") as upload_file:
+                response = self.client.post(
+                    "/v1/videos",
+                    headers={"Authorization": "Bearer openai-video-upload-key"},
+                    data={
+                        "model": "sora-2",
+                        "prompt": "multipart references",
+                        "seconds": "5",
+                        "size": "1280x720",
+                    },
+                    files=[("input_reference", ("ref-image.png", b"pngdata", "image/png"))],
+                )
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json()["error"]["code"], "rate_limited")
+        upload_file.assert_not_called()
+        self.assertEqual(server.RATE_RESERVATIONS, {})
+
+    def test_video_multipart_upload_failure_releases_rate_reservation(self):
+        original_cfg = server.CFG
+        server.CFG = server.deep_merge(
+            original_cfg,
+            {
+                "gateway": {
+                    "scene_policies": {
+                        "reference": {
+                            "enabled": True,
+                            "experimental": False,
+                            "verification_status": "live_verified",
+                            "risk_level": "low",
+                        }
+                    }
+                }
+            },
+        )
+        key_id = self.api_key_id("openai-video-upload-key")
+        try:
+            with (
+                patch.object(server.CLIENT, "session_from_account", return_value=object()),
+                patch.object(server.CLIENT, "upload_file_bytes", side_effect=RuntimeError("upstream upload failed")),
+            ):
+                response = self.client.post(
+                    "/v1/videos",
+                    headers={"Authorization": "Bearer openai-video-upload-key"},
+                    data={
+                        "model": "sora-2",
+                        "prompt": "multipart references",
+                        "seconds": "5",
+                        "size": "1280x720",
+                    },
+                    files=[("input_reference", ("ref-image.png", b"pngdata", "image/png"))],
+                )
+        finally:
+            server.CFG = original_cfg
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "upload_failed")
+        self.assertEqual(server.RATE_RESERVATIONS, {})
+        self.assertEqual(server.RATE_BUCKETS.get(key_id, []), [])
 
     def test_admin_docs_explain_new_api_and_sub2api_base_url_rules(self):
         html = server.ADMIN_HTML

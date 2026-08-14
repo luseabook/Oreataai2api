@@ -121,6 +121,10 @@ select.chip{
 const state={kind:'all', onlyAvailable:true, showExperimental:false, payload:null};
 const STATUS_LABEL={available:'可用', tight:'紧张', unavailable:'暂不可用'};
 
+function escapeHtml(value){
+  return String(value??'').replace(/[&<>"']/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
 function setKind(kind){
   state.kind=kind;
   document.querySelectorAll('.chip[data-kind]').forEach(el=>el.classList.toggle('active', el.dataset.kind===kind));
@@ -138,8 +142,8 @@ function toggleExperimental(){
 }
 function formatParams(item){
   const parts=[];
-  if(item.resolution) parts.push(String(item.resolution));
-  if(item.duration!=null) parts.push(item.duration+'秒');
+  if(item.resolution) parts.push(escapeHtml(String(item.resolution)));
+  if(item.duration!=null) parts.push(escapeHtml(String(item.duration))+'秒');
   if(item.is_audio===true) parts.push('有音频');
   if(item.is_audio===false) parts.push('无音频');
   return parts.join(' · ') || '默认参数';
@@ -164,7 +168,7 @@ function fillScenes(){
   }
   const current=select.value;
   select.innerHTML='<option value=\"\">全部场景</option>'+
-    [...scenes.entries()].map(([id,name])=>`<option value="${id}">${name}</option>`).join('');
+    [...scenes.entries()].map(([id,name])=>`<option value="${escapeHtml(id)}">${escapeHtml(name)}</option>`).join('');
   if([...scenes.keys()].includes(current)) select.value=current;
 }
 function render(){
@@ -191,14 +195,14 @@ function render(){
     ].filter(Boolean).join('');
     const rows=group.combos.map(item=>`
       <div class="row">
-        <div>${item.kind==='video'?(item.scene_name||item.scene_id||'视频'):'图片'}</div>
+        <div>${escapeHtml(item.kind==='video'?(item.scene_name||item.scene_id||'视频'):'图片')}</div>
         <div class="params">${formatParams({...item, scene_name:'', scene_id:''})}</div>
-        <div class="point">${item.point_cost} 积分</div>
-        <div><span class="pill ${item.status}">${STATUS_LABEL[item.status]||item.status}</span></div>
+        <div class="point">${escapeHtml(item.point_cost)} 积分</div>
+        <div><span class="pill ${escapeHtml(item.status)}">${escapeHtml(STATUS_LABEL[item.status]||item.status)}</span></div>
       </div>`).join('');
     return `<section class="group ${index===0?'open':''}">
       <div class="group-head" onclick="this.parentElement.classList.toggle('open')">
-        <div class="group-title"><span>${group.model_name}</span>${tags}</div>
+        <div class="group-title"><span>${escapeHtml(group.model_name)}</span>${tags}</div>
         <div class="meta">${available} / ${group.combos.length} 个组合可用</div>
       </div>
       <div class="combos">${rows}</div>
@@ -214,7 +218,7 @@ async function load(){
     document.getElementById('only-available').classList.toggle('active', state.onlyAvailable);
     render();
   }catch(err){
-    document.getElementById('catalog').innerHTML=`<div class="error">加载失败：${err.message||err}</div>`;
+    document.getElementById('catalog').innerHTML=`<div class="error">加载失败：${escapeHtml(err.message||err)}</div>`;
   }
 }
 load();

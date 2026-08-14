@@ -45,7 +45,7 @@ Windows PowerShell 示例：
 $env:OREATE_ENCRYPTION_KEY = "<上一步生成的密钥>"
 ```
 
-密钥必须和数据库备份分开保存；丢失密钥将无法解密账号凭据。
+密钥必须和数据库备份分开保存；丢失密钥将无法解密账号凭据。管理后台导出的备份 zip 中 `config.json` 为脱敏版本（管理员密码、加密密钥、邮件 API Key 以 `__redacted__` 占位），恢复此类备份时网关会保留当前运行配置中的密钥，不会写入占位符。
 
 ```bash
 pip install -r requirements.txt
@@ -187,7 +187,15 @@ Authorization: Bearer <API Key>
 - **new-api**：渠道类型选 OpenAI，基础地址填写站点根地址，例如 `https://example.com`。new-api 会自行请求 `/v1/models` 和媒体路径；渠道测试请选择“图片生成”，不要使用默认聊天测试。
 - **sub2api**：OpenAI API Key 上游的 `base_url` 填写到 `/v1`，例如 `https://example.com/v1`。sub2api 会在其后追加 `/images/generations`、`/images/edits` 或 `/videos/generations`。
 
-当前明确边界：图片接口仅支持 `n=1`，不支持 `stream=true`；图片编辑暂不支持 `mask` 蒙版。所有不支持的参数都会在创建任务或上传素材前返回 OpenAI 风格错误。
+当前明确边界：
+- 图片接口仅支持 `n=1`，不支持 `stream=true`；图片编辑暂不支持 `mask` 蒙版。所有不支持的参数都会在创建任务或上传素材前返回 OpenAI 风格错误。
+- `response_format` 支持 `url` 与 `b64_json`（`b64_json` 返回清洗后的图片字节，与原图 URL 内容一致）。
+- `quality`、`output_format`、`user` 字段被接受但当前忽略，不会改变生成结果；后续版本可能启用，调用方不应依赖其行为。
+- 图片同步等待有服务端上限（默认 120 秒）。超过上限返回 `504 image_generation_timeout`，错误对象中的 `error.details.task_id` 为原生任务 ID，可通过 `GET /v1/tasks/{task_id}` 继续查询，不会重复创建任务。
+- 模型别名：`gpt-image-1` 映射到配置的默认图片模型，`sora-2` 映射到默认视频模型；可通过 `openai_compat.image_model_aliases` / `openai_compat.video_model_aliases` 增加别名。也可以直接传 provider 模型名。
+- 视频接口为异步：创建返回 `video_<task_id>` 对象，`status` 映射为 `queued`（排队）、`in_progress`（执行/水合中，`progress` 25/65/75）、`completed`（100）、`failed` / `cancelled`。用 `GET /v1/videos/{video_id}` 轮询。
+- `GET /v1/videos/{video_id}/content` 仅在任务完成且资源域名在 `openai_compat.asset_host_allowlist` 白名单内时返回 307 重定向。
+- `DELETE /v1/videos/{video_id}` 是取消语义，不是删除资源；已完成/已失败等终态任务不可取消（409）。
 
 ### 网关生成
 `POST /v1/generate`
@@ -230,6 +238,8 @@ X-Request-ID: <可选，客户端请求 ID>
 
 网关会基于 `/v1/capabilities` 的能力目录校验模型、分辨率、比例、视频时长和场景；非法参数会在调用 Oreate 前返回 `422`，避免无效扣费。成功响应包含 `request_id`、`idempotent_replay`、`estimated_point_cost`、`assets` 和上游 `response` 摘要。
 
+成本规则：积分成本来自账号能力缓存中的模型成本表（图片按 `resolution`，视频按场景、时长、分辨率、音频等组合匹配）。如果请求的模型与参数组合在能力目录中**找不到匹配的成本行**，网关返回 `503 POINT_COST_UNAVAILABLE` 并拒绝创建任务，不会按零成本放行；畸形或非法的成本数据会在归一化时被丢弃，同样视为无匹配成本。`estimated_point_cost` 只用于预估与容量预留，实际扣费以账号余额变化（`actual_point_cost`）为准。
+
 `jt` 由本地 `banti_jt_helper.js` 恢复，Python 只负责 HTTP 协议、账号池、SSE 解析和结果水合；生产路径不依赖浏览器或浏览器配置文件。
 
 视频请求使用网页视频页 referer：`/home/vertical/aiVideo/zh`。当视频 SSE 只持续 ping 或读超时时，任务不会被误判为失败；网关会继续按 chatId 轮询历史消息，拿到视频 URL 后返回 `completed`，超时仍无资产则返回 `submitted`。
@@ -262,7 +272,7 @@ Content-Type: multipart/form-data
 - `GET /v1/tasks/{task_id}`：标准任务详情接口。
 - `GET /v1/task/{task_id}`：兼容旧接口。
 
-任务详情会合并审计字段：模型、分辨率、比例、视频时长、场景、估算点数、请求 ID、幂等 key、错误码和状态码。
+任务详情会合并审计字段：模型、分辨率、比例、视频时长、场景、估算点数、**实际点数（`actual_point_cost`）**、请求 ID、幂等 key、错误码和状态码，并附带 `balance_before` / `balance_after` 余额快照（生成前后）。自动换号时，每个账号的尝试都会保留独立的 usage 记录：首个账号失败的扣费不会被后续成功账号覆盖。
 
 ### 错误格式
 `/v1/*` 网关接口使用稳定错误 envelope：
@@ -347,6 +357,9 @@ Content-Type: multipart/form-data
 - 号池维护：支持批量积分检查、低成本真实图片生成探针、失效账号隔离和健康账号自动补充；遇到 `212361` 会立即停止批量探测并保留账号，避免把网关环境问题误判为账号问题；新注册账号通过真实生成验证后才会进入可调度号池
 - 每日签到 / 上游积分补给 API 尚未闭环；容量估算里的日增积分目前是配置假设
 - 网关结果：已支持任务排队、重试、取消与重新水合；可观测性仍以 `/healthz` `/readyz` 与 JSON `/metrics` 为主，尚未接 Prometheus
+- 数据保留：`gateway.retention_days`（默认 `0` = 不清理）与 `POST /api/admin/prune`（`{"days": N}`）可删除超过保留期的终态任务及其 attempts/usage 记录；上传素材与幂等记录不会被该接口删除
+
+健康检查语义：`/healthz` 是浅探（进程存活 + 配置加载 + 数据库可连接），供进程管理器与发布脚本使用，不受号池健康度影响；`/readyz` 是深度就绪检查（加密密钥、单 worker 锁、任务 worker、管理员凭据、号池健康账号），对外放流量前必须 200。发布脚本默认探测 `http://127.0.0.1:8890/healthz`，与服务默认端口一致。
 
 生产环境推荐在 `oreate` 配置中启用真实浏览器生成工作节点：
 

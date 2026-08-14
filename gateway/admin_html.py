@@ -2202,8 +2202,8 @@ function toggleAvailIncludeDisabled(){
 }
 function availParams(item){
   const parts=[];
-  if(item.resolution) parts.push(String(item.resolution));
-  if(item.duration!=null) parts.push(item.duration+'s');
+  if(item.resolution) parts.push(escapeHtml(String(item.resolution)));
+  if(item.duration!=null) parts.push(escapeHtml(String(item.duration))+'s');
   if(item.is_audio===true) parts.push('音频');
   if(item.is_audio===false) parts.push('无音频');
   return parts.join(' · ') || '-';
@@ -2226,7 +2226,7 @@ function fillAvailScenes(){
     if(item.kind==='video' && item.scene_id) scenes.set(item.scene_id, item.scene_name||item.scene_id);
   }
   const current=select.value;
-  select.innerHTML='<option value="">全部场景</option>'+[...scenes.entries()].map(([id,name])=>`<option value="${id}">${name}</option>`).join('');
+  select.innerHTML='<option value="">全部场景</option>'+[...scenes.entries()].map(([id,name])=>`<option value="${escapeHtml(id)}">${escapeHtml(name)}</option>`).join('');
   if([...scenes.keys()].includes(current)) select.value=current;
 }
 function renderModelAvailability(){
@@ -2257,16 +2257,16 @@ function renderModelAvailability(){
       group.experimental?'<span class="avail-tag">实验性</span>':'',
     ].filter(Boolean).join('');
     const rows=group.combos.map(item=>`<div class="avail-row">
-      <div>${item.kind==='video'?(item.scene_name||item.scene_id||'-'):'图片'}</div>
+      <div>${escapeHtml(item.kind==='video'?(item.scene_name||item.scene_id||'-'):'图片')}</div>
       <div>${availParams(item)}</div>
-      <div>${item.point_cost}</div>
-      <div>${item.ready_accounts}</div>
-      <div>${item.task_capacity}</div>
-      <div><span class="avail-pill ${item.status}">${AVAIL_STATUS[item.status]||item.status}</span></div>
+      <div>${escapeHtml(item.point_cost)}</div>
+      <div>${escapeHtml(item.ready_accounts)}</div>
+      <div>${escapeHtml(item.task_capacity)}</div>
+      <div><span class="avail-pill ${escapeHtml(item.status)}">${escapeHtml(AVAIL_STATUS[item.status]||item.status)}</span></div>
     </div>`).join('');
     return `<section class="avail-group ${index===0?'open':''}">
       <div class="avail-group-head" onclick="this.parentElement.classList.toggle('open')">
-        <div class="avail-group-title"><span>${group.model_name}</span>${tags}</div>
+        <div class="avail-group-title"><span>${escapeHtml(group.model_name)}</span>${tags}</div>
         <div class="avail-meta">可用 ${ok} / 共 ${group.combos.length} 组合</div>
       </div>
       <div class="avail-combos">
@@ -2288,7 +2288,7 @@ async function loadModelAvailability(){
     fillAvailScenes();
     renderModelAvailability();
   }catch(e){
-    if(host) host.innerHTML=`<div class="reg-console-hint">加载失败：${e.message||e}</div>`;
+    if(host) host.innerHTML=`<div class="reg-console-hint">加载失败：${escapeHtml(e.message||e)}</div>`;
   }
 }
 
@@ -2562,7 +2562,7 @@ function renderTasks(){
 }
 function safeAssetUrl(asset){
   const raw=String(asset || '').trim();
-  if(/^data:image\/(?:png|jpeg|jpg|gif|webp|svg\+xml);base64,[a-z0-9+/=]+$/i.test(raw)) return raw;
+  if(/^data:image\/(?:png|jpeg|jpg|gif|webp);base64,[a-z0-9+/=]+$/i.test(raw)) return raw;
   try{
     const parsed=new URL(raw,BASE);
     if(parsed.origin===BASE || parsed.protocol==='https:') return parsed.href;
